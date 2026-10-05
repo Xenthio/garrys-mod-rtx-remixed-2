@@ -6,8 +6,15 @@ if host_machine.cpu_family() != 'x86_64'
   error('the shaderapidx9 proxy targets Garry\'s Mod x64')
 endif
 
+remix_inc = get_option('openremix_include')
+if remix_inc == ''
+  error('set -Dopenremix_include=<openremix>/public/include')
+endif
+
 shared_library('shaderapidx9',
-  'src/main.cpp', 'src/vtable_proxy.cpp',
+  'src/main.cpp', 'src/vtable_proxy.cpp', 'src/d3d_hooks.cpp', 'src/remix_output.cpp', 'src/texture_formats.cpp',
+  'src/dxvk_hash.cpp', 'src/texture_categories.cpp', 'src/source_fs.cpp', 'src/bsp_world.cpp',
+  include_directories: include_directories(remix_inc, 'deps/xxhash'),
   name_prefix: '',
   vs_module_defs: 'shaderapidx9.def',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'],

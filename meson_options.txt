@@ -1,0 +1,2 @@
+option('openremix_include', type: 'string', value: '',
+       description: 'Path to <openremix>/public/include (headers are not vendored)')

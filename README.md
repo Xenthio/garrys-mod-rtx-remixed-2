@@ -13,6 +13,16 @@ wraps `ShaderDeviceMgr001`, `ShaderApi030`, `ShaderDevice001`,
 `VBAllocTracker001` and the material system's `VShaderUtil001`
 (`RestoreShaderObjects`, slot 12), with per-slot call statistics.
 
+Phase 2: D3D9 hooks and Remix output ported from l4d2-rtx (`d3d_hooks`,
+`remix_output`, texture formats/hashes, Source filesystem, BSP world code).
+OpenRemix runs in process: `bin/win64/openremix/remix.dll` with its
+dependencies, loaded with its own directory searched first. Model lights
+come from `IShaderAPI::SetLight` (slot 127, one `LightDesc_t` per call);
+`GetMatrix` 12, `GetCurrentNumBones` 34, `SetPIXMarker` 216. The BSP world
+needs the l4d2-rtx client markers and stays inactive. Launch with `-nod3d9ex`:
+SDK 2013 otherwise takes `Direct3DCreate9Ex` through GetProcAddress, past the
+import the proxy patches.
+
 ## x64 notes
 
 - Wrapper thunks swap RCX (`this`) and jump through the real vtable; typed

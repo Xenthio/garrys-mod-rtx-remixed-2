@@ -7,8 +7,8 @@ PROTON="$HOME/.local/share/Steam/compatibilitytools.d/proton-cachyos-11.0-202607
 export STEAM_COMPAT_DATA_PATH="$DEV/compatdata"
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam"
 export PROTON_ENABLE_NVAPI=1
-export SteamAppId=4000 SteamGameId=4000
+export SteamAppId=4000 SteamGameId=4000 OPENREMIX_PROXY_BACKEND=${OPENREMIX_PROXY_BACKEND:-pathtrace}
 mkdir -p "$STEAM_COMPAT_DATA_PATH"
 cd "$DEV/game"
-exec "$PROTON" run ./gmod_win64.exe -game garrysmod -insecure -steam -novid -condebug -netconport 27998 -multirun \
+exec "$PROTON" run ./gmod_win64.exe -game garrysmod -insecure -steam -novid -nod3d9ex -condebug -netconport 27998 -multirun \
   -windowed -noborder -w 1920 -h 1080 +sv_cheats 1 "$@"

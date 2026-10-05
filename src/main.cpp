@@ -1,6 +1,8 @@
 // shaderapidx9.dll proxy for Garry's Mod (x64): loads the original as
 // shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
+#include "d3d_hooks.h"
+#include "remix_output.h"
 #include "vtable_proxy.h"
 
 #include <tlhelp32.h>
@@ -76,6 +78,8 @@ bool loadOriginal() {
     return false;
   }
   g_origCreateInterface = reinterpret_cast<CreateInterfaceFn>(GetProcAddress(g_orig, "CreateInterface"));
+  if (!proxy::d3d::install(g_orig))
+    log("proxy: d3d9!Direct3DCreate9 import not found; D3D hooks inactive");
   log("proxy: loaded original at %p", static_cast<void *>(g_orig));
   return g_origCreateInterface != nullptr;
 }
@@ -142,6 +146,24 @@ void shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateInterfaceFn fact
   proxy::original<Fn>(self, 12)(self->real, factory ? restoreFactory : nullptr, flags);
 }
 
+// IShaderAPI (ShaderApi030) slot 127: void SetLight(int lightNum,
+// const LightDesc_t &desc) (copies 88 bytes into its light array). SDK 2013
+// sets the model lights one at a time (L4D2 passes an array).
+void shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
+  using Fn = void (*)(void *, int, const void *);
+  proxy::remix::onSetLights(1, desc);
+  proxy::original<Fn>(self, 127)(self->real, index, desc);
+}
+
+// IShaderAPI slot 216: void SetPIXMarker(unsigned long color, const char *name)
+// (an empty stub in release builds). Markers "openremix:..." are ours.
+void shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
+  using Fn = void (*)(void *, unsigned long, const char *);
+  if (proxy::remix::onMarker(name))
+    return;
+  proxy::original<Fn>(self, 216)(self->real, color, name);
+}
+
 struct KnownInterface {
   const char *name;
   void (*setup)(proxy::Kind *);
@@ -154,7 +176,11 @@ const KnownInterface kKnown[] = {
        proxy::setHook(k, 2, reinterpret_cast<void *>(&deviceMgrQueryInterface));
        proxy::setHook(k, 12, reinterpret_cast<void *>(&deviceMgrSetMode));
      }},
-    {"ShaderApi030", nullptr},
+    {"ShaderApi030",
+     [](proxy::Kind *k) {
+       proxy::setHook(k, 127, reinterpret_cast<void *>(&shaderApiSetLight));
+       proxy::setHook(k, 216, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
+     }},
     {"ShaderDevice001", nullptr},
     {"ShaderShadow010", nullptr},
     {"DebugTextureInfo001", nullptr},
@@ -181,6 +207,8 @@ void *wrapInterface(const char *name, void *real) {
     if (created && k.setup)
       k.setup(kind);
     void *w = proxy::wrap(kind, real);
+    if (std::strcmp(name, "ShaderApi030") == 0)
+      proxy::remix::setShaderApi(real);
     log("proxy: %s real %p (vtable %p, %u slots) -> wrapper %p", name, real, static_cast<const void *>(vtbl),
         kind->slotCount, w);
     return w;
@@ -287,6 +315,7 @@ DWORD WINAPI statisticsThread(void *) {
       scanForRealPointers();
     FILE *f = _wfopen((g_dir + L"\\shaderapi_proxy_slots.txt").c_str(), L"w");
     if (f) {
+      proxy::d3d::dumpStatistics(f);
       proxy::dumpStatistics(f);
       fclose(f);
     }
