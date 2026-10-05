@@ -248,10 +248,23 @@ void scanForRealPointers() {
 }
 
 // Dev aid: `shaderapi_proxy_profile.request` next to the DLL samples every
-// thread's instruction pointer for 5 s into shaderapi_proxy_profile.txt as
-// "<samples> <thread> <module>+<offset>", offsets rounded to 16 bytes.
+// thread for 5 s into shaderapi_proxy_profile.txt as
+// "<samples> <thread> <ip> [< [rsp] <code address at the stack top>]".
+std::string symbolAt(DWORD64 pc) {
+  HMODULE module = nullptr;
+  char name[MAX_PATH] = "?";
+  if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                         reinterpret_cast<LPCSTR>(uintptr_t(pc)), &module))
+    GetModuleFileNameA(module, name, MAX_PATH);
+  const char *base = std::strrchr(name, '\\');
+  char out[MAX_PATH + 32];
+  std::snprintf(out, sizeof(out), "%s+0x%llx", base ? base + 1 : name,
+                static_cast<unsigned long long>(module ? pc - uintptr_t(module) : pc));
+  return out;
+}
+
 void sampleThreads() {
-  std::map<std::tuple<DWORD, std::string, uint32_t>, unsigned> counts;
+  std::map<std::pair<DWORD, std::string>, unsigned> counts;
   const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
   std::vector<std::pair<DWORD, HANDLE>> threads;
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -267,22 +280,34 @@ void sampleThreads() {
     for (auto [id, thread] : threads) {
       CONTEXT context = {};
       context.ContextFlags = CONTEXT_CONTROL;
-      bool sampled = false;
-      if (SuspendThread(thread) != DWORD(-1)) {
-        sampled = GetThreadContext(thread, &context);
-        ResumeThread(thread);
-      }
-      if (!sampled)
+      if (SuspendThread(thread) == DWORD(-1))
         continue;
-      HMODULE module = nullptr;
-      char name[MAX_PATH] = "?";
-      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                             reinterpret_cast<LPCSTR>(uintptr_t(context.Rip)), &module))
-        GetModuleFileNameA(module, name, MAX_PATH);
-      const char *base = std::strrchr(name, '\\');
-      const uint32_t offset =
-          module ? uint32_t(context.Rip - uintptr_t(module)) & ~15u : uint32_t(context.Rip);
-      ++counts[{id, base ? base + 1 : name, offset}];
+      // While suspended: no allocation, no locks (the thread may hold the
+      // heap or loader lock). Instruction pointer and the qword at RSP: the
+      // return address when the thread is in a leaf function (memcpy).
+      DWORD64 pc = 0, top[8] = {};
+      if (GetThreadContext(thread, &context)) {
+        pc = context.Rip;
+        MEMORY_BASIC_INFORMATION stack = {};
+        if (VirtualQuery(reinterpret_cast<void *>(context.Rsp), &stack, sizeof(stack)) && stack.State == MEM_COMMIT &&
+            context.Rsp + sizeof(top) <= uintptr_t(stack.BaseAddress) + stack.RegionSize)
+          std::memcpy(top, reinterpret_cast<void *>(context.Rsp), sizeof(top));
+      }
+      ResumeThread(thread);
+      if (!pc)
+        continue;
+      // Caller: the first code address in another module among the top stack
+      // slots (leaf functions that saved registers keep it a few slots up).
+      std::string chain = symbolAt(pc);
+      const auto own = codeRangeOf(reinterpret_cast<void *>(pc));
+      for (DWORD64 v : top) {
+        const auto range = codeRangeOf(reinterpret_cast<void *>(v));
+        if (range.first && range != own) {
+          chain += " < " + symbolAt(v);
+          break;
+        }
+      }
+      ++counts[{id, chain}];
     }
     Sleep(1);
   }
@@ -292,7 +317,7 @@ void sampleThreads() {
   if (!f)
     return;
   for (const auto &[key, count] : counts)
-    fprintf(f, "%u %lu %s+0x%x\n", count, std::get<0>(key), std::get<1>(key).c_str(), std::get<2>(key));
+    fprintf(f, "%u %lu %s\n", count, key.first, key.second.c_str());
   fclose(f);
 }
 

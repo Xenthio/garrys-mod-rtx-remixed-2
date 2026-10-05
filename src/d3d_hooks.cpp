@@ -92,6 +92,7 @@ struct Stats {
   std::atomic<uint32_t> frames{0}, dip{0}, dp{0}, dipUP{0}, dpUP{0}, depthDraws{0}, occlusionQueries{0}, occluderDraws{0}, queriesVisible{0}, queriesHidden{0}, rtChanges{0}, textureBinds{0};
   std::atomic<uint32_t> vsConstCalls{0}, streamSets{0}, partialTextureLocks{0};
   std::atomic<uint64_t> dipPrims{0};
+  std::atomic<uint64_t> shadowBytes{0}, shadowCopies{0}, wholeLocks{0}, usShadow{0};
 } g_stats;
 
 // --- Buffer shadows -------------------------------------------------------
@@ -120,16 +121,26 @@ void forget(const void *buffer) {
   g_shadows.erase(buffer);
 }
 
-void noteLock(void *buffer, UINT offset, UINT size, void *ptr, DWORD flags) {
+// Locked buffer memory is GPU memory mapped write-combined (DXVK): writes are
+// fast, reads crawl (~5 MB/s). A writable lock therefore hands the game its
+// range of the shadow, which holds the buffer's current contents, and Unlock
+// writes that range to the real mapping. Read-only locks get the real memory.
+// Returns the pointer to give the caller.
+void *noteLock(void *buffer, UINT offset, UINT size, void *ptr, DWORD flags) {
   std::lock_guard<std::mutex> lock(g_shadowLock);
   auto it = g_shadows.find(buffer);
   if (it == g_shadows.end())
-    return;
+    return ptr;
   auto &s = it->second;
   s.lockPtr = static_cast<uint8_t *>(ptr);
   s.lockOffset = offset;
   s.lockSize = size ? size : uint32_t(s.data.size()) - offset;
+  if (!size)
+    ++g_stats.wholeLocks;
   s.lockReadOnly = (flags & D3DLOCK_READONLY) != 0;
+  if (s.lockReadOnly || offset >= s.data.size() || s.lockSize > s.data.size() - offset)
+    return ptr;
+  return s.data.data() + offset;
 }
 
 void noteUnlock(void *buffer) {
@@ -138,9 +149,12 @@ void noteUnlock(void *buffer) {
   if (it == g_shadows.end())
     return;
   auto &s = it->second;
-  if (s.lockPtr && !s.lockReadOnly && s.lockOffset < s.data.size()) {
-    const uint32_t n = std::min<uint32_t>(s.lockSize, uint32_t(s.data.size()) - s.lockOffset);
-    std::memcpy(s.data.data() + s.lockOffset, s.lockPtr, n);
+  if (s.lockPtr && !s.lockReadOnly && s.lockOffset < s.data.size() && s.lockSize <= s.data.size() - s.lockOffset) {
+    const uint64_t t0 = nowUs();
+    std::memcpy(s.lockPtr, s.data.data() + s.lockOffset, s.lockSize);
+    g_stats.usShadow += nowUs() - t0;
+    g_stats.shadowBytes += s.lockSize;
+    ++g_stats.shadowCopies;
     ++s.version;
   }
   s.lockPtr = nullptr;
@@ -163,7 +177,7 @@ HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data
   const HRESULT hr = g_vbLock(self, offset, size, data, flags);
   g_stats.usLock += nowUs() - t0;
   if (SUCCEEDED(hr) && data)
-    noteLock(self, offset, size, *data, flags);
+    *data = noteLock(self, offset, size, *data, flags);
   return hr;
 }
 HRESULT STDMETHODCALLTYPE ibLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
@@ -171,7 +185,7 @@ HRESULT STDMETHODCALLTYPE ibLock(void *self, UINT offset, UINT size, void **data
   const HRESULT hr = g_ibLock(self, offset, size, data, flags);
   g_stats.usLock += nowUs() - t0;
   if (SUCCEEDED(hr) && data)
-    noteLock(self, offset, size, *data, flags);
+    *data = noteLock(self, offset, size, *data, flags);
   return hr;
 }
 HRESULT STDMETHODCALLTYPE vbUnlock(void *self) {
@@ -920,6 +934,9 @@ void dumpStatistics(FILE *out) {
           g_stats.queriesVisible.exchange(0) / f, g_stats.queriesHidden.exchange(0) / f, g_stats.occluderDraws.exchange(0) / f);
   fprintf(out, "   ms/frame in D3D9: Present %.2f, buffer Lock %.2f\n", g_stats.usPresent.exchange(0) / f / 1000,
           g_stats.usLock.exchange(0) / f / 1000);
+  fprintf(out, "   buffer shadow copies per frame: %.1f (%.2f MiB, %.2f ms), whole-buffer locks %.1f\n",
+          g_stats.shadowCopies.exchange(0) / f, g_stats.shadowBytes.exchange(0) / f / 1048576.0,
+          g_stats.usShadow.exchange(0) / f / 1000, g_stats.wholeLocks.exchange(0) / f);
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
           g_stats.vsConstCalls.exchange(0) / f);
