@@ -1,0 +1,5 @@
+LIBRARY shaderapidx9.dll
+EXPORTS
+  CreateInterface
+  openremix_shaderapi_proxy DATA
+  cvar = shaderapidx9_orig.cvar DATA
