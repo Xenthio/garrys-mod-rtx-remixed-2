@@ -1309,11 +1309,55 @@ void onDeviceCreated(IDirect3DDevice9 *) {
   g_ready = startRemix();
 }
 
+// Census of the draws that depend on what the proxy does not reproduce: a
+// stencil test or write, a render-target texture as input, or a render-target
+// texture as output. One row per distinct state, for the statistics file.
+struct CensusRow {
+  uint32_t draws = 0, primitives = 0;
+};
+std::map<std::string, CensusRow> g_census; // under g_transientSampleLock
+
+void census(const Draw &d) {
+  char key[320];
+  if (!d.stencil && !d.texture0Target) {
+    // Plain draws into a render-target texture: per target only.
+    std::snprintf(key, sizeof(key), "into RT %p %ux%u fmt %u: unmasked draws", d.target, d.targetWidth, d.targetHeight,
+                  d.targetFormat);
+  } else {
+    float projection[16];
+    getMatrix(kMatrixProjection, projection);
+    const bool perspective = std::fabs(std::fabs(projection[11]) - 1.0f) < 1e-3f && std::fabs(projection[15]) < 1e-3f;
+    char target[64] = "back buffer";
+    if (d.target)
+      std::snprintf(target, sizeof(target), "RT %p %ux%u fmt %u", d.target, d.targetWidth, d.targetHeight,
+                    d.targetFormat);
+    else if (!d.mainTarget)
+      std::snprintf(target, sizeof(target), "other surface");
+    char stencil[112] = "stencil off";
+    if (d.stencil)
+      std::snprintf(stencil, sizeof(stencil), "stencil func %u ref %u mask %X/%X pass %u fail %u zfail %u", d.stencilFunc,
+                    d.stencilRef, d.stencilMask & 0xff, d.stencilWriteMask & 0xff, d.stencilPass, d.stencilFail,
+                    d.stencilZFail);
+    std::snprintf(key, sizeof(key), "%s | %s P5 %.3f | tex0 %s%p | %s | cw %X z %d func %u write %d | blend %d %u/%u atest %d",
+                  target, perspective ? "3D" : "2D", projection[5], d.texture0Target ? "RT " : "", d.texture0, stencil,
+                  d.colorWrite, int(d.zEnable), d.zFunc, int(d.zWrite), int(d.blend), d.srcBlend, d.dstBlend,
+                  int(d.alphaTest));
+  }
+  std::lock_guard<std::mutex> lock(g_transientSampleLock);
+  if (g_census.size() >= 128 && !g_census.count(key))
+    return;
+  auto &row = g_census[key];
+  ++row.draws;
+  row.primitives += d.primCount;
+}
+
 void onDraw(const Draw &d) {
   Timer timer(g_usDraw);
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
     return;
+  if (d.stencil || d.texture0Target || d.target)
+    census(d);
   if (!d.mainTarget) {
     ++g_stats.offTarget;
     return;
@@ -2515,6 +2559,15 @@ void dumpStatistics(FILE *out) {
           g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
           g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f,
           g_stats.additiveBlack.exchange(0) / f);
+  {
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    if (!g_census.empty())
+      fprintf(out, "   stencil / render-target draws per frame (D3D compare: 1 never 2 less 3 equal 4 lessequal 5 greater "
+                   "6 notequal 7 gequal 8 always; stencil op: 1 keep 3 replace 4 incrsat 7 incr):\n");
+    for (const auto &[key, row] : g_census)
+      fprintf(out, "     %7.2f draws %8.1f prims  %s\n", row.draws / f, row.primitives / f, key.c_str());
+    g_census.clear();
+  }
   fprintf(out, "   halos per frame: %.2f groups, %.2f source instances\n", g_stats.haloGroups.exchange(0) / f,
           g_stats.haloSources.exchange(0) / f);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",

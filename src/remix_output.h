@@ -56,6 +56,15 @@ struct Draw {
   uint32_t stencilFunc = D3DCMP_ALWAYS; // D3DRS_STENCILFUNC
   uint32_t stencilPass = D3DSTENCILOP_KEEP; // D3DRS_STENCILPASS
   bool depthTest = true;                // D3DRS_ZENABLE and ZFUNC != ALWAYS
+  uint32_t stencilRef = 0, stencilMask = 0xffffffff, stencilWriteMask = 0xffffffff;
+  uint32_t stencilFail = D3DSTENCILOP_KEEP, stencilZFail = D3DSTENCILOP_KEEP;
+  uint32_t zFunc = D3DCMP_LESSEQUAL; // D3DRS_ZFUNC
+  bool zEnable = true, zWrite = true;
+  // Render target 0 when it is a render-target texture (nullptr: the back
+  // buffer or a plain surface), and whether sampler 0 holds such a texture.
+  const void *target = nullptr;
+  uint32_t targetWidth = 0, targetHeight = 0, targetFormat = 0;
+  bool texture0Target = false;
   uint32_t forkCategories = 0; // dxvk-remix fork InstanceCategories (render state 42, set by l4d2-rtx)
 };
 

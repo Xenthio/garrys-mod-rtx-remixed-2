@@ -234,8 +234,22 @@ ReleaseFn g_textureRelease = nullptr;
 TextureLockRectFn g_textureLockRect = nullptr;
 TextureUnlockRectFn g_textureUnlockRect = nullptr;
 
+// Render-target textures (CreateTexture with D3DUSAGE_RENDERTARGET) and the
+// one render target 0 currently belongs to.
+struct TargetTexture {
+  uint32_t width, height;
+  D3DFORMAT format;
+};
+std::unordered_map<const void *, TargetTexture> g_targetTextures;
+const void *g_renderTargetTexture = nullptr;
+
 ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
   const ULONG refs = g_textureRelease(self);
+  if (refs == 0) {
+    g_targetTextures.erase(self);
+    if (g_renderTargetTexture == self)
+      g_renderTargetTexture = nullptr;
+  }
   if (refs == 0)
     remix::onTextureReleased(self);
   return refs;
@@ -546,6 +560,8 @@ HRESULT STDMETHODCALLTYPE createIndexBuffer(IDirect3DDevice9 *dev, UINT length, 
 HRESULT STDMETHODCALLTYPE createTexture(IDirect3DDevice9 *dev, UINT width, UINT height, UINT levels, DWORD usage,
                                         D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9 **out, HANDLE *shared) {
   const HRESULT hr = g_createTexture(dev, width, height, levels, usage, format, pool, out, shared);
+  if (SUCCEEDED(hr) && out && *out && (usage & D3DUSAGE_RENDERTARGET))
+    g_targetTextures[*out] = {width, height, format};
   if (SUCCEEDED(hr) && out && *out && !g_textureLockRect) {
     void **vt = vtableOf(*out);
     hookSlot(vt, kRelease, &textureRelease, g_textureRelease);
@@ -573,8 +589,18 @@ HRESULT STDMETHODCALLTYPE updateTexture(IDirect3DDevice9 *dev, IDirect3DBaseText
 
 HRESULT STDMETHODCALLTYPE setRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDirect3DSurface9 *surface) {
   ++g_stats.rtChanges;
-  if (index == 0)
+  if (index == 0) {
     g_renderTarget0 = surface;
+    // The render-target texture this surface belongs to, if any.
+    g_renderTargetTexture = nullptr;
+    IDirect3DTexture9 *container = nullptr;
+    if (surface && surface != g_backBuffer && !g_targetTextures.empty() &&
+        SUCCEEDED(surface->GetContainer(IID_IDirect3DTexture9, reinterpret_cast<void **>(&container))) && container) {
+      container->Release();
+      if (g_targetTextures.count(container))
+        g_renderTargetTexture = container;
+    }
+  }
   return g_setRenderTarget(dev, index, surface);
 }
 
@@ -789,6 +815,22 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.stencilFunc = g_renderStates[D3DRS_STENCILFUNC];
   d.stencilPass = g_renderStates[D3DRS_STENCILPASS];
   d.depthTest = g_renderStates[D3DRS_ZENABLE] != D3DZB_FALSE && g_renderStates[D3DRS_ZFUNC] != D3DCMP_ALWAYS;
+  d.stencilRef = g_renderStates[D3DRS_STENCILREF];
+  d.stencilMask = g_renderStates[D3DRS_STENCILMASK];
+  d.stencilWriteMask = g_renderStates[D3DRS_STENCILWRITEMASK];
+  d.stencilFail = g_renderStates[D3DRS_STENCILFAIL];
+  d.stencilZFail = g_renderStates[D3DRS_STENCILZFAIL];
+  d.zFunc = g_renderStates[D3DRS_ZFUNC];
+  d.zEnable = g_renderStates[D3DRS_ZENABLE] != D3DZB_FALSE;
+  d.zWrite = g_renderStates[D3DRS_ZWRITEENABLE] != 0;
+  if (g_renderTargetTexture)
+    if (auto it = g_targetTextures.find(g_renderTargetTexture); it != g_targetTextures.end()) {
+      d.target = g_renderTargetTexture;
+      d.targetWidth = it->second.width;
+      d.targetHeight = it->second.height;
+      d.targetFormat = it->second.format;
+    }
+  d.texture0Target = g_texture0 && g_targetTextures.count(g_texture0) != 0;
   d.forkCategories = g_renderStates[42]; // unused by D3D9; dxvk-remix fork category tag
   d.elements = decl->second.data();
   d.declaration = g_decl;
@@ -1180,7 +1222,10 @@ HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
     refreshBackBuffer(*out);
     g_renderStates[D3DRS_COLORWRITEENABLE] = 0xf;
     g_renderStates[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
-    g_renderStates[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
+    g_renderStates[D3DRS_STENCILPASS] = g_renderStates[D3DRS_STENCILFAIL] = g_renderStates[D3DRS_STENCILZFAIL] =
+        D3DSTENCILOP_KEEP;
+    g_renderStates[D3DRS_STENCILMASK] = g_renderStates[D3DRS_STENCILWRITEMASK] = 0xffffffff;
+    g_renderStates[D3DRS_ZWRITEENABLE] = TRUE;
     g_renderStates[D3DRS_ZENABLE] = D3DZB_TRUE;
     g_renderStates[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
     g_renderStates[D3DRS_SRCBLEND] = D3DBLEND_ONE;
