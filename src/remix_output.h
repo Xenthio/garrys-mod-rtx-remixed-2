@@ -102,8 +102,12 @@ bool viewMatrices(float view[16], float projection[16]);
 bool isSkyDraw(const Draw &draw);
 
 // The 2D skybox as six BGRA faces (proxy::sky::faceBasis, kFaceSize square):
-// becomes the dome light (environment and background).
-void setSkyFaces(const uint8_t *const faces[6]);
+// becomes the dome light (environment and background). Returns whether the
+// faces differed from the dome's (false: nothing was resampled or uploaded).
+bool setSkyFaces(const uint8_t *const faces[6]);
+// Counts the times the dome was dropped (a new map): faces captured before
+// belong to another sky.
+uint32_t skyEpoch();
 
 void dumpStatistics(FILE *out);
 

@@ -6,7 +6,13 @@
 // capture (D3D9) and the equirectangular resampling (Remix dome).
 namespace proxy::sky {
 
-constexpr unsigned kFaceSize = 256;
+// Sizes: the runtime samples the dome linearly (OpenRemix domeMaterial), so
+// about three screen pixels per texel suffice for a sky's soft gradients
+// (1080p at 90 degrees is 960 pixels per radian, 6000 around). A face needs
+// the dome width / 4 texels to match it along the horizon. Each capture
+// reads the six faces back (6 MiB at 512), over Thunderbolt on an eGPU.
+constexpr unsigned kFaceSize = 512;
+constexpr unsigned kDomeWidth = 2048, kDomeHeight = 1024;
 
 inline void faceBasis(int face, float right[3], float up[3], float forward[3]) {
   static const float kForward[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};

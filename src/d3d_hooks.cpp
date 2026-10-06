@@ -95,6 +95,8 @@ struct Stats {
   std::atomic<uint32_t> vsConstCalls{0}, streamSets{0}, partialTextureLocks{0};
   std::atomic<uint64_t> dipPrims{0};
   std::atomic<uint64_t> shadowBytes{0}, shadowCopies{0}, wholeLocks{0}, usShadow{0};
+  std::atomic<uint32_t> skyDraws{0}, skyCaptures{0}, skyUpdates{0}, skyFailures{0};
+  std::atomic<uint64_t> usSky{0}, usSkyReadback{0};
 } g_stats;
 
 // --- Buffer shadows -------------------------------------------------------
@@ -812,20 +814,35 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
 }
 
 // --- 2D skybox capture -----------------------------------------------------
-// GMod's 2D skybox (painted or textured) is drawn by its own shaders. Once
-// every kSkyInterval frames its draws (dynamic-buffer draws inside
-// DrawWorldLists, remix::isSkyDraw) are rasterized again into six
-// world-aligned cube faces around the camera, with the game's shaders and
-// constants and only the matrix registers replaced; the faces are read back
-// at Present and become the Remix dome (remix::setSkyFaces).
+// GMod's 2D skybox (painted or textured) is drawn by its own shaders. Now
+// and then (due) its draws (dynamic-buffer draws inside DrawWorldLists,
+// remix::isSkyDraw) are rasterized again into six world-aligned cube faces
+// around the camera, with the game's shaders and constants and only the
+// matrix registers replaced; the faces are read back at Present and become
+// the Remix dome (remix::setSkyFaces).
+// The faces accumulate: they are cleared for a new map only, so a face the
+// engine does not draw in some frame (it may skip those behind the camera)
+// keeps what an earlier capture put there.
+// A capture reads 6 * kFaceSize^2 * 4 bytes back (24 MiB) and, when the sky
+// changed, resamples and uploads the dome, so captures are spaced: from
+// kSkyInterval frames, doubling up to kSkyMaxInterval while the sky stays the
+// same, and never costing more than 1 / kSkyCostFactor of the time. A sky
+// texture not seen since the map began (a face coming into view) captures
+// kSkyFreshInterval frames after the last capture; only the first
+// kSkyFreshTextures count (a sky that binds no texture of its own would
+// show whatever the draw before it left bound).
 namespace skycap {
-constexpr uint64_t kSkyInterval = 30;
+constexpr uint64_t kSkyInterval = 30, kSkyMaxInterval = 240, kSkyCostFactor = 50, kSkyFreshInterval = 4;
+constexpr size_t kSkyFreshTextures = 12;
 struct Faces {
   IDirect3DDevice9 *device = nullptr;
   IDirect3DSurface9 *targets[6] = {}, *readback[6] = {};
   bool failed = false, captured = false;
-  uint64_t clearedFrame = ~0ull, lastCapture = 0;
-  bool anyCapture = false;
+  bool reset = true;                // the targets hold nothing of this map's sky
+  uint32_t epoch = 0;               // remix::skyEpoch() the faces belong to
+  uint64_t captureFrame = ~0ull, lastCapture = 0, interval = kSkyInterval, notBeforeUs = 0;
+  std::unordered_set<const void *> seen; // base textures captured since the reset
+  std::vector<uint8_t> pixels[6];
 } g;
 
 void release() {
@@ -838,6 +855,7 @@ void release() {
   }
   g.device = nullptr;
   g.captured = false;
+  g.reset = true; // new targets start undefined
 }
 
 bool ready(IDirect3DDevice9 *dev) {
@@ -902,6 +920,11 @@ bool invert(const float *m, float *out) {
 }
 
 // Right-handed D3DX view * projection for a face around `eye` (90 degrees).
+// D3D9 samples a pixel at its top-left corner in these terms: the half-pixel
+// shift (x - w / size, y + w / size; w = -z) puts texel centres at
+// half-integers, as the resampling assumes, so adjacent faces meet. Nothing
+// is depth-tested: the planes only have to contain the sky geometry (a box
+// of half-width zFar / sqrt(3) around the eye).
 void faceViewProjection(int face, const float eye[3], float *out) {
   float right[3], up[3], forward[3];
   sky::faceBasis(face, right, up, forward);
@@ -914,8 +937,8 @@ void faceViewProjection(int face, const float eye[3], float *out) {
   for (int c = 0; c < 3; ++c)
     view[12 + c] = -(eye[0] * view[c] + eye[1] * view[4 + c] + eye[2] * view[8 + c]);
   view[15] = 1;
-  constexpr float n = 4, f = 1e6f;
-  const float projection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, f / (n - f), -1, 0, 0, n * f / (n - f), 0};
+  constexpr float n = 0.5f, f = 1e6f, h = 1.0f / sky::kFaceSize;
+  const float projection[16] = {1, 0, 0, 0, 0, 1, 0, 0, h, -h, f / (n - f), -1, 0, 0, n * f / (n - f), 0};
   multiply(view, projection, out);
 }
 
@@ -931,11 +954,26 @@ void toRegisters(const float *m, float *regs) {
       regs[k * 4 + j] = m[j * 4 + k];
 }
 
-bool due() { return !g.anyCapture || g_d3dFrame - g.lastCapture >= kSkyInterval || g.clearedFrame == g_d3dFrame; }
+// `fresh`: the draw's base texture was not captured since the reset.
+bool due(bool fresh) {
+  if (g.captureFrame == g_d3dFrame || g.reset)
+    return true; // the frame's other sky draws; a new map
+  if (fresh && g_d3dFrame - g.lastCapture >= kSkyFreshInterval)
+    return true; // a new face
+  return g_d3dFrame - g.lastCapture >= g.interval && nowUs() >= g.notBeforeUs;
+}
 
 void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numVertices,
              UINT startIndex, UINT primCount) {
-  if (!due() || !ready(dev))
+  ++g_stats.skyDraws;
+  if (g.epoch != remix::skyEpoch()) {
+    // Another map: its sky starts from cleared faces, captured at once.
+    g.epoch = remix::skyEpoch();
+    g.reset = true;
+    g.captured = false;
+  }
+  const bool fresh = g.seen.size() < kSkyFreshTextures && !g.seen.count(g_texture0);
+  if (!due(fresh) || !ready(dev))
     return;
   float view[16], projection[16];
   if (!remix::viewMatrices(view, projection))
@@ -957,17 +995,20 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
   dev->GetDepthStencilSurface(&oldDepth);
   D3DVIEWPORT9 oldViewport;
   dev->GetViewport(&oldViewport);
+  // The view's clip planes (water, 3D skybox) do not apply to the faces.
   const DWORD zEnable = g_renderStates[D3DRS_ZENABLE], zWrite = g_renderStates[D3DRS_ZWRITEENABLE],
-              scissor = g_renderStates[D3DRS_SCISSORTESTENABLE];
+              scissor = g_renderStates[D3DRS_SCISSORTESTENABLE], clipPlanes = g_renderStates[D3DRS_CLIPPLANEENABLE];
   dev->SetDepthStencilSurface(nullptr);
   g_setRenderState(dev, D3DRS_ZENABLE, FALSE);
   g_setRenderState(dev, D3DRS_ZWRITEENABLE, FALSE);
   g_setRenderState(dev, D3DRS_SCISSORTESTENABLE, FALSE);
+  if (clipPlanes)
+    g_setRenderState(dev, D3DRS_CLIPPLANEENABLE, 0);
   const D3DVIEWPORT9 faceViewport = {0, 0, sky::kFaceSize, sky::kFaceSize, 0, 1};
   for (int face = 0; face < 6; ++face) {
     g_setRenderTarget(dev, 0, g.targets[face]);
     dev->SetViewport(&faceViewport);
-    if (g.clearedFrame != g_d3dFrame)
+    if (g.reset)
       dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1, 0);
     float vp[16], m[16], regs[8 * 4];
     faceViewProjection(face, eye, vp);
@@ -977,7 +1018,12 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
     g_setVertexShaderConstantF(dev, 4, regs, 8);
     g_drawIndexedPrimitive(dev, type, baseVertex, minIndex, numVertices, startIndex, primCount);
   }
-  g.clearedFrame = g_d3dFrame;
+  if (g.reset)
+    g.seen.clear();
+  g.reset = false;
+  if (g.seen.size() < kSkyFreshTextures)
+    g.seen.insert(g_texture0);
+  g.captureFrame = g_d3dFrame;
   g.captured = true;
   g_setVertexShaderConstantF(dev, 4, saved, 8);
   g_setRenderTarget(dev, 0, oldTarget);
@@ -986,6 +1032,8 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
   g_setRenderState(dev, D3DRS_ZENABLE, zEnable);
   g_setRenderState(dev, D3DRS_ZWRITEENABLE, zWrite);
   g_setRenderState(dev, D3DRS_SCISSORTESTENABLE, scissor);
+  if (clipPlanes)
+    g_setRenderState(dev, D3DRS_CLIPPLANEENABLE, clipPlanes);
   if (oldTarget)
     oldTarget->Release();
   if (oldDepth)
@@ -994,26 +1042,43 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
 
 // At Present: read this frame's faces back and hand them to the dome.
 void finish(IDirect3DDevice9 *dev) {
+  if (g.captured && g.epoch != remix::skyEpoch())
+    g.captured = false; // captured before the map changed
   if (!g.captured || g.device != dev)
     return;
   g.captured = false;
-  g.anyCapture = true;
   g.lastCapture = g_d3dFrame;
-  std::vector<uint8_t> faces[6];
+  ++g_stats.skyCaptures;
+  const uint64_t t0 = nowUs();
   const uint8_t *pointers[6];
-  for (int f = 0; f < 6; ++f) {
+  bool read = true;
+  for (int f = 0; f < 6 && read; ++f) {
+    // One sequential copy out of the locked surface; the dome reads the copy.
     D3DLOCKED_RECT locked;
-    if (FAILED(dev->GetRenderTargetData(g.targets[f], g.readback[f])) ||
-        FAILED(g.readback[f]->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
-      return;
-    faces[f].resize(sky::kFaceSize * sky::kFaceSize * 4);
+    read = SUCCEEDED(dev->GetRenderTargetData(g.targets[f], g.readback[f])) &&
+           SUCCEEDED(g.readback[f]->LockRect(&locked, nullptr, D3DLOCK_READONLY));
+    if (!read)
+      break;
+    g.pixels[f].resize(size_t(sky::kFaceSize) * sky::kFaceSize * 4);
     for (UINT y = 0; y < sky::kFaceSize; ++y)
-      std::memcpy(faces[f].data() + y * sky::kFaceSize * 4, static_cast<uint8_t *>(locked.pBits) + y * locked.Pitch,
-                  sky::kFaceSize * 4);
+      std::memcpy(g.pixels[f].data() + size_t(y) * sky::kFaceSize * 4,
+                  static_cast<uint8_t *>(locked.pBits) + size_t(y) * locked.Pitch, sky::kFaceSize * 4);
     g.readback[f]->UnlockRect();
-    pointers[f] = faces[f].data();
+    pointers[f] = g.pixels[f].data();
   }
-  remix::setSkyFaces(pointers);
+  const uint64_t t1 = nowUs();
+  g_stats.usSkyReadback += t1 - t0;
+  bool changed = false;
+  if (!read)
+    ++g_stats.skyFailures;
+  else if ((changed = remix::setSkyFaces(pointers)))
+    ++g_stats.skyUpdates;
+  // An unchanged sky is looked at less and less often; a changing one as
+  // often as its cost allows.
+  g.interval = changed ? kSkyInterval : std::min(g.interval * 2, kSkyMaxInterval);
+  const uint64_t t2 = nowUs();
+  g_stats.usSky += t2 - t0;
+  g.notBeforeUs = t2 + (t2 - t0) * kSkyCostFactor;
 }
 } // namespace skycap
 
@@ -1183,6 +1248,15 @@ void dumpStatistics(FILE *out) {
               unsigned(key >> 32), unsigned((key >> 24) & 0xff), unsigned(key & 0xffffff), c.copies / f,
               c.bytes / f / 1048576.0, c.us / f / 1000, c.us ? c.bytes / double(c.us) : 0.0);
     g_copyClasses.clear();
+  }
+  {
+    // The 2D sky capture (skycap), over the interval: no draws = the engine
+    // drew no 2D sky (or its draws are not recognized: remix::isSkyDraw).
+    const uint32_t captures = g_stats.skyCaptures.exchange(0);
+    const double c = captures ? captures : 1;
+    fprintf(out, "   2D sky: draws %.2f per frame; captures %u (dome updates %u, failed readbacks %u), %.1f ms each (readback of %u^2 x 6: %.1f ms)\n",
+            g_stats.skyDraws.exchange(0) / f, captures, g_stats.skyUpdates.exchange(0), g_stats.skyFailures.exchange(0),
+            g_stats.usSky.exchange(0) / c / 1000, sky::kFaceSize, g_stats.usSkyReadback.exchange(0) / c / 1000);
   }
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
