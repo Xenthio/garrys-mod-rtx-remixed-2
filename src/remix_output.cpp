@@ -1387,6 +1387,14 @@ struct CensusRow {
 };
 std::map<std::string, CensusRow> g_census; // under g_transientSampleLock
 
+bool drawIsPerspective() {
+  if (!g_ready || !g_shaderApi)
+    return true;
+  float projection[16];
+  getMatrix(kMatrixProjection, projection);
+  return std::fabs(std::fabs(projection[11]) - 1.0f) < 1e-3f && std::fabs(projection[15]) < 1e-3f;
+}
+
 void census(const Draw &d) {
   char key[320];
   if (!d.stencil && !d.texture0Target) {
@@ -1650,6 +1658,8 @@ void onDraw(const Draw &d) {
   Instance inst;
   inst.mesh = mesh;
   inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+  if (d.texture0Target)
+    d3d::requestTargetContents(d.texture0);
   inst.blend = blendState(d);
   // Experiment (OPENREMIX_PROXY_CULL_BLENDED=1): blended surfaces keep D3D's
   // culling (single-sided instances). Off by default: the runtime's front-face
@@ -1680,9 +1690,9 @@ void onDraw(const Draw &d) {
     inst.depthTest = d.depthTest;
     if (d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
       inst.stencilGroup = stencilWriter(written);
-      // A render-target texture has no contents here (a scope's lens disc
-      // showing its vignette): such a writer only marks.
-      inst.stencilRole = d.texture0Target ? kStencilSourceOnly : kStencilSource;
+      // A render-target texture without contents (not read back, see
+      // d3d::requestTargetContents): such a writer only marks.
+      inst.stencilRole = d.texture0Target && !inst.material ? kStencilSourceOnly : kStencilSource;
       g_stencilGroups[inst.stencilGroup].ignoreZ |= !d.depthTest;
     } else if (d.stencilFunc == D3DCMP_NEVER) {
       if (d.stencilFail != D3DSTENCILOP_REPLACE)
@@ -1776,6 +1786,8 @@ void shutdown() {
   remix_ui::uninstall();
   g_api.Shutdown();
 }
+
+void applyTargetPixels();
 
 void onPresent() {
   sampleGpuPasses();
@@ -2374,6 +2386,7 @@ void onPresent() {
   g_uiCommands.clear();
   g_uiCommandMasks.clear();
 
+  applyTargetPixels();
   serviceScreenshotRequest();
   {
     Timer present(g_usPresent);
@@ -2544,6 +2557,48 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
     return;
   cpu->touch(changedX0 * unit, changedY0 * unit, changedX1 * unit, changedY1 * unit);
   ++cpu->version;
+}
+
+struct TargetPixels {
+  const void *texture;
+  uint32_t width, height;
+  D3DFORMAT format;
+  std::vector<uint8_t> pixels;
+};
+std::vector<TargetPixels> g_targetPixels;
+
+void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
+                    uint32_t pitch) {
+  if (!g_ready || !data)
+    return;
+  TargetPixels t = {texture, width, height, format, {}};
+  t.pixels.resize(size_t(width) * height * 4);
+  for (uint32_t y = 0; y < height; ++y)
+    std::memcpy(t.pixels.data() + size_t(y) * width * 4, data + size_t(y) * pitch, width * 4);
+  for (auto &queued : g_targetPixels)
+    if (queued.texture == texture) {
+      queued = std::move(t);
+      return;
+    }
+  g_targetPixels.push_back(std::move(t));
+}
+
+// After Present: this frame's instances held the previous image's material.
+void applyTargetPixels() {
+  for (auto &t : g_targetPixels) {
+    uint64_t previous = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_textureLock);
+      if (auto it = g_textures.find(t.texture); it != g_textures.end())
+        previous = it->second->hash;
+    }
+    onTextureUpload(t.texture, t.width, t.height, t.format, t.pixels.data(), t.width * 4, 1);
+    // The image changes while the view moves: no trail of dead records.
+    std::lock_guard<std::mutex> lock(g_textureLock);
+    if (auto it = g_texturesByHash.find(previous); it != g_texturesByHash.end() && it->second.expired())
+      g_texturesByHash.erase(it);
+  }
+  g_targetPixels.clear();
 }
 
 void onTextureCopy(const void *source, const void *destination) {

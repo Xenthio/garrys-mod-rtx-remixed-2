@@ -243,9 +243,41 @@ struct TargetTexture {
 std::unordered_map<const void *, TargetTexture> g_targetTextures;
 const void *g_renderTargetTexture = nullptr;
 
+// Render-target textures the scene samples (requestTargetContents). D3D
+// rasterizes nothing else: their 2D draws are let through, and when the
+// target is left its image is read back, reduced to at most kReadSize a side
+// (a readback costs about 1.3 ms per MiB here, and the upload more).
+// A target that receives 3D or depth-tested draws is a scene view (water
+// reflection, shadows) and is left alone for good.
+namespace targetread {
+constexpr uint32_t kReadSize = 256, kMaxSize = 1024, kWantedFrames = 30;
+struct Live {
+  bool scene = false, dirty = false;
+  uint64_t wanted = 0; // g_d3dFrame of the last request
+};
+std::unordered_map<const void *, Live> g_live;
+IDirect3DSurface9 *g_small = nullptr, *g_system = nullptr;
+uint32_t g_width = 0, g_height = 0;
+D3DFORMAT g_format = D3DFMT_UNKNOWN;
+std::atomic<uint32_t> g_draws{0}, g_reads{0}, g_failures{0};
+std::atomic<uint64_t> g_us{0};
+
+void release() {
+  if (g_small)
+    g_small->Release();
+  if (g_system)
+    g_system->Release();
+  g_small = g_system = nullptr;
+  g_width = g_height = 0;
+}
+bool draw();
+void leave(IDirect3DDevice9 *dev, IDirect3DSurface9 *surface);
+} // namespace targetread
+
 ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
   const ULONG refs = g_textureRelease(self);
   if (refs == 0) {
+    targetread::g_live.erase(self);
     g_targetTextures.erase(self);
     if (g_renderTargetTexture == self)
       g_renderTargetTexture = nullptr;
@@ -509,6 +541,7 @@ HRESULT STDMETHODCALLTYPE present(IDirect3DDevice9 *dev, const RECT *src, const 
 
 HRESULT STDMETHODCALLTYPE reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
   skycap::release(); // D3DPOOL_DEFAULT targets must go before Reset
+  targetread::release();
   remix::onCreateDevice(nullptr, pp);
   const HRESULT hr = g_reset(dev, pp);
   if (SUCCEEDED(hr))
@@ -590,6 +623,8 @@ HRESULT STDMETHODCALLTYPE updateTexture(IDirect3DDevice9 *dev, IDirect3DBaseText
 HRESULT STDMETHODCALLTYPE setRenderTarget(IDirect3DDevice9 *dev, DWORD index, IDirect3DSurface9 *surface) {
   ++g_stats.rtChanges;
   if (index == 0) {
+    if (g_renderTargetTexture && surface != g_renderTarget0)
+      targetread::leave(dev, g_renderTarget0);
     g_renderTarget0 = surface;
     // The render-target texture this surface belongs to, if any.
     g_renderTargetTexture = nullptr;
@@ -1128,6 +1163,80 @@ void finish(IDirect3DDevice9 *dev) {
 }
 } // namespace skycap
 
+namespace targetread {
+// The draw into the bound render-target texture is to be rasterized.
+bool draw() {
+  auto it = g_live.find(g_renderTargetTexture);
+  if (it == g_live.end() || it->second.scene || g_d3dFrame - it->second.wanted > kWantedFrames)
+    return false;
+  if (g_renderStates[D3DRS_ZENABLE] || remix::drawIsPerspective()) {
+    it->second.scene = true;
+    return false;
+  }
+  it->second.dirty = true;
+  ++g_draws;
+  return true;
+}
+
+// Render target 0 is about to leave `surface` (level 0 of the bound texture).
+void leave(IDirect3DDevice9 *dev, IDirect3DSurface9 *surface) {
+  auto it = g_live.find(g_renderTargetTexture);
+  if (it == g_live.end() || !it->second.dirty || !surface)
+    return;
+  it->second.dirty = false;
+  if (it->second.scene)
+    return;
+  const TargetTexture &target = g_targetTextures[g_renderTargetTexture];
+  const uint32_t width = std::min(target.width, kReadSize), height = std::min(target.height, kReadSize);
+  const uint64_t t0 = nowUs();
+  if (width != g_width || height != g_height || target.format != g_format) {
+    release();
+    if (FAILED(dev->CreateRenderTarget(width, height, target.format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_small,
+                                       nullptr)) ||
+        FAILED(dev->CreateOffscreenPlainSurface(width, height, target.format, D3DPOOL_SYSTEMMEM, &g_system, nullptr))) {
+      release();
+      ++g_failures;
+      return;
+    }
+    g_width = width, g_height = height, g_format = target.format;
+  }
+  IDirect3DSurface9 *source = surface;
+  if (width != target.width || height != target.height) {
+    if (FAILED(dev->StretchRect(surface, nullptr, g_small, nullptr, D3DTEXF_LINEAR))) {
+      ++g_failures;
+      return;
+    }
+    source = g_small;
+  }
+  D3DLOCKED_RECT locked;
+  if (FAILED(dev->GetRenderTargetData(source, g_system)) ||
+      FAILED(g_system->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+    ++g_failures;
+    return;
+  }
+  remix::onTargetPixels(g_renderTargetTexture, width, height, target.format,
+                        static_cast<const uint8_t *>(locked.pBits), uint32_t(locked.Pitch));
+  g_system->UnlockRect();
+  ++g_reads;
+  g_us += nowUs() - t0;
+}
+} // namespace targetread
+
+void wantTargetContents(const void *texture) {
+  auto target = g_targetTextures.find(texture);
+  if (target == g_targetTextures.end() || target->second.width > targetread::kMaxSize ||
+      target->second.height > targetread::kMaxSize ||
+      (target->second.format != D3DFMT_A8R8G8B8 && target->second.format != D3DFMT_X8R8G8B8))
+    return;
+  auto it = targetread::g_live.find(texture);
+  if (it == targetread::g_live.end()) {
+    if (targetread::g_live.size() >= 16)
+      return;
+    it = targetread::g_live.emplace(texture, targetread::Live{}).first;
+  }
+  it->second.wanted = g_d3dFrame;
+}
+
 HRESULT STDMETHODCALLTYPE drawIndexedPrimitive(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex,
                                                UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount) {
   ++g_stats.dip;
@@ -1141,6 +1250,8 @@ HRESULT STDMETHODCALLTYPE drawIndexedPrimitive(IDirect3DDevice9 *dev, D3DPRIMITI
       char v[8] = {};
       return GetEnvironmentVariableA("OPENREMIX_PROXY_D3D_DRAWS", v, sizeof(v)) && v[0] == '1';
     }();
+    if (!keep && g_renderTargetTexture && targetread::draw())
+      return g_drawIndexedPrimitive(dev, type, baseVertex, minIndex, numVertices, startIndex, primCount);
     if (!keep) {
       // D3D9 keeps only depth, for the game's occlusion queries (sun glow
       // pixel visibility): depth-writing opaque draws and the query draws
@@ -1283,6 +1394,7 @@ bool install(HMODULE module) {
 }
 
 bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+void requestTargetContents(const void *texture) { wantTargetContents(texture); }
 
 void dumpStatistics(FILE *out) {
   const uint32_t frames = g_stats.frames.exchange(0);
@@ -1312,6 +1424,16 @@ void dumpStatistics(FILE *out) {
     fprintf(out, "   2D sky: draws %.2f per frame; captures %u (dome updates %u, failed readbacks %u), %.1f ms each (readback of %u^2 x 6: %.1f ms)\n",
             g_stats.skyDraws.exchange(0) / f, captures, g_stats.skyUpdates.exchange(0), g_stats.skyFailures.exchange(0),
             g_stats.usSky.exchange(0) / c / 1000, sky::kFaceSize, g_stats.usSkyReadback.exchange(0) / c / 1000);
+  }
+  {
+    const uint32_t reads = targetread::g_reads.exchange(0);
+    size_t scene = 0;
+    for (const auto &[texture, live] : targetread::g_live)
+      scene += live.scene;
+    fprintf(out, "   render-target contents: %zu textures sampled by the scene (%zu scene views, left alone); 2D draws "
+                 "rasterized %.2f per frame, readbacks %.2f per frame, %.2f ms each, failed %u\n",
+            targetread::g_live.size(), scene, targetread::g_draws.exchange(0) / f, reads / f,
+            targetread::g_us.exchange(0) / (reads ? reads : 1) / 1000.0, targetread::g_failures.exchange(0));
   }
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,

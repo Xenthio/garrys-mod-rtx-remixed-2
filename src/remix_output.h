@@ -86,6 +86,12 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
 // UpdateTexture(src, dst): dst now shows src's contents.
 void onTextureCopy(const void *source, const void *destination);
 void onTextureReleased(const void *texture);
+// Contents read back from a render-target texture the scene samples (32-bit,
+// B8G8R8A8 rows); it becomes the texture's image after this frame's Present.
+void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
+                    uint32_t pitch);
+// The draw being captured has a perspective projection (not 2D).
+bool drawIsPerspective();
 void onPresent();
 // The game is shutting its renderer down: stop OpenRemix while every thread
 // is alive (exit-time teardown after ExitProcess hung on its workers).
