@@ -134,14 +134,24 @@ public:
     if (!ok || data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0)
       return false;
     std::memcpy(&version, data.data() + 4, 4);
-    return version == 21;
+    if (version < 19 || version > 21)
+      return false;
+    // lump_t is {fileofs, filelen, version, fourCC} up to v20 (GMod maps).
+    // Left 4 Dead 2's v21 puts the version first; other v21 maps (TF2, CS:GO
+    // era) keep the standard order. As NikNaks: a first field of at most 8
+    // in lump 0 (planes) is a version, not a file offset.
+    int32_t first;
+    std::memcpy(&first, data.data() + 8, 4);
+    versionFirst = version == 21 && first >= 0 && first <= 8;
+    return true;
   }
-  // Left 4 Dead 2 lump_t: {version, fileofs, filelen, fourCC}.
+  bool versionFirst = false;
   template <typename T> std::pair<const T *, size_t> lump(int index) const {
     int32_t header[4];
     std::memcpy(header, data.data() + 8 + index * 16, 16);
-    const size_t offset = size_t(header[1]), length = size_t(header[2]);
-    if (header[1] < 0 || header[2] < 0 || offset + length > data.size() || length % sizeof(T))
+    const int32_t ofs = versionFirst ? header[1] : header[0], len = versionFirst ? header[2] : header[1];
+    const size_t offset = size_t(ofs), length = size_t(len);
+    if (ofs < 0 || len < 0 || offset + length > data.size() || length % sizeof(T))
       return {nullptr, 0};
     // Compressed lumps ("LZMA") are not supported (PC maps are uncompressed).
     if (length >= 4 && std::memcmp(data.data() + offset, "LZMA", 4) == 0)
@@ -150,7 +160,7 @@ public:
   }
   int32_t lumpVersion(int index) const {
     int32_t v;
-    std::memcpy(&v, data.data() + 8 + index * 16, 4);
+    std::memcpy(&v, data.data() + 8 + index * 16 + (versionFirst ? 0 : 8), 4);
     return v;
   }
 };
@@ -874,7 +884,8 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
       break;
     }
   }
-  if (!length || version < 9)
+  // sprp v4 (HL2-era) .. v12: origin 0, angles 12, model 24, skin 32 in all.
+  if (!length || version < 4)
     return;
   const std::vector<uint8_t> lump(file.begin() + start, file.begin() + start + length);
   const int32_t names = i32(lump, 0);
@@ -886,7 +897,7 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
   if (names <= 0 || props <= 0 || at > lump.size())
     return;
   const size_t stride = (lump.size() - at) / size_t(props);
-  if (stride < 72)
+  if (stride < 56) // v4 records are 56 bytes (GMod's gm_construct: v6, 64)
     return;
   for (int32_t p = 0; p < props; ++p) {
     const size_t rec = at + size_t(p) * stride;
@@ -1136,7 +1147,15 @@ template <typename InSky> void loadOverlays(const Bsp &bsp, const InSky &inSky) 
   }
 }
 
-// dworldlight_t, lump version 1 (with shadow_cast_offset).
+// dworldlight_t, lump version 0 (88 bytes; HL2/GMod maps) and version 1
+// (L4D2: shadow_cast_offset, 100 bytes).
+struct WorldLightV0 {
+  float origin[3], intensity[3], normal[3];
+  int32_t cluster, type, style;
+  float stopdot, stopdot2, exponent, radius, constantAttn, linearAttn, quadraticAttn;
+  int32_t flags, texinfo, owner;
+};
+static_assert(sizeof(WorldLightV0) == 88);
 struct WorldLight {
   float origin[3], intensity[3], normal[3], shadowCastOffset[3];
   int32_t cluster, type, style;
@@ -1158,21 +1177,32 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
   if (!enabled)
     return;
   int index = kWorldLightsHdr;
-  auto found = bsp.lump<WorldLight>(index);
-  if (!found.second) {
+  if (!bsp.lump<uint8_t>(index).second)
     index = kWorldLights;
-    found = bsp.lump<WorldLight>(index);
+  std::vector<WorldLight> lights;
+  if (bsp.lumpVersion(index) == 1) {
+    const auto [v1, n] = bsp.lump<WorldLight>(index);
+    if (v1)
+      lights.assign(v1, v1 + n);
+  } else if (bsp.lumpVersion(index) == 0) {
+    const auto [v0, n] = bsp.lump<WorldLightV0>(index);
+    for (size_t i = 0; v0 && i < n; ++i) {
+      WorldLight w = {};
+      std::memcpy(w.origin, v0[i].origin, 36);
+      std::memcpy(&w.cluster, &v0[i].cluster, sizeof(WorldLightV0) - 36);
+      lights.push_back(w);
+    }
   }
-  const auto [lights, count] = found;
-  if (!lights || bsp.lumpVersion(index) != 1)
-    return;
+  const size_t count = lights.size();
   for (size_t i = 0; i < count; ++i) {
     const WorldLight &w = lights[i];
     if (w.type != kEmitPoint && w.type != kEmitSpot && w.type != kEmitSky) {
       ++g_world.otherLights; // surface, Quake and sky ambient lights
       continue;
     }
-    if (w.style != 0) {
+    // The sun keeps its light (GMod's light_environment often has a style,
+    // e.g. 33 on gm_construct, for day/night control).
+    if (w.style != 0 && w.type != kEmitSky) {
       ++g_world.styledLights;
       continue;
     }
@@ -1196,6 +1226,21 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
   }
 }
 
+// Leafs as lump version 1 records: version 0 (HL2-era v19 maps) adds a
+// 24-byte ambient cube per leaf after the same first 30 bytes.
+std::vector<Leaf> leafsOf(const Bsp &bsp) {
+  std::vector<Leaf> out;
+  const int32_t version = bsp.lumpVersion(kLeafs);
+  const size_t stride = version == 0 ? 56 : version == 1 ? sizeof(Leaf) : 0;
+  const auto [bytes, size] = bsp.lump<uint8_t>(kLeafs);
+  if (!stride || !bytes || size % stride)
+    return out;
+  out.resize(size / stride);
+  for (size_t i = 0; i < out.size(); ++i)
+    std::memcpy(&out[i], bytes + i * stride, std::min<size_t>(30, sizeof(Leaf)));
+  return out;
+}
+
 bool build(const Bsp &bsp) {
   const auto [planes, planeCount] = bsp.lump<Plane>(kPlanes);
   const auto [vertexes, vertexCount] = bsp.lump<std::array<float, 3>>(kVertexes);
@@ -1207,11 +1252,13 @@ bool build(const Bsp &bsp) {
   const auto [strings, stringsLength] = bsp.lump<char>(kTexDataStringData);
   const auto [faces, faceCount] = bsp.lump<Face>(kFaces);
   const auto [models, modelCount] = bsp.lump<Model>(kModels);
-  const auto [leafs, leafCount] = bsp.lump<Leaf>(kLeafs);
+  const std::vector<Leaf> leafStore = leafsOf(bsp);
+  const Leaf *leafs = leafStore.empty() ? nullptr : leafStore.data();
+  const size_t leafCount = leafStore.size();
   const auto [dispInfos, dispInfoCount] = bsp.lump<DispInfo>(kDispInfo);
   const auto [dispVerts, dispVertCount] = bsp.lump<DispVert>(kDispVerts);
   if (!planes || !vertexes || !edges || !surfEdges || !texInfos || !texDatas || !stringTable || !strings || !faces ||
-      !models || !modelCount || bsp.lumpVersion(kFaces) != 1 || bsp.lumpVersion(kLeafs) != 1)
+      !models || !modelCount || bsp.lumpVersion(kFaces) > 1 || !leafs)
     return false;
 
   // The 3D skybox is a sealed room: its own BSP area (Leaf::areaFlags low 9
@@ -1462,9 +1509,11 @@ void sendPartition(const Bsp *bsp) {
   }
   const auto [nodes, nodeCount] = bsp->lump<Node>(kNodes);
   const auto [planes, planeCount] = bsp->lump<Plane>(kPlanes);
-  const auto [leafs, leafCount] = bsp->lump<Leaf>(kLeafs);
+  const std::vector<Leaf> leafStore = leafsOf(*bsp);
+  const Leaf *leafs = leafStore.empty() ? nullptr : leafStore.data();
+  const size_t leafCount = leafStore.size();
   const auto [vis, visBytes] = bsp->lump<uint8_t>(kVisibility);
-  if (!nodes || !planes || !leafs || !vis || visBytes < 4 || bsp->lumpVersion(kLeafs) != 1) {
+  if (!nodes || !planes || !leafs || !vis || visBytes < 4) {
     g_partition.result = set(nullptr);
     return;
   }

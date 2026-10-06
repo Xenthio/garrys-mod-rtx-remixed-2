@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
 
 namespace proxy::engine {
 namespace {
@@ -30,6 +31,9 @@ void *patch(void **vtable, unsigned slot, void *hook) {
 // GMod's materialsystem.dll: IMaterialSystem::GetRenderContext 98 (no AddRef),
 // IMatRenderContext::SetPIXMarker 140 (jumps to IShaderAPI slot 216).
 void *g_materials = nullptr;
+// IVEngineClient (VEngineClient013) slot 51: GetLevelName ("maps/x.bsp").
+void *g_engineClient = nullptr;
+char g_level[256] = {};
 } // namespace
 void marker(const char *text) {
   if (!g_materials)
@@ -40,9 +44,20 @@ void marker(const char *text) {
   if (context)
     reinterpret_cast<SetPIXMarkerFn>((*static_cast<void ***>(context))[140])(context, 0, text);
 }
-namespace {
-
-} // namespace
+// Announces the map ("openremix:map <maps/x.bsp>", loads the BSP world) the
+// first time the world is drawn after it changed.
+void noteLevel() {
+  if (!g_engineClient)
+    return;
+  using GetLevelNameFn = const char *(*)(void *);
+  const char *level = reinterpret_cast<GetLevelNameFn>((*static_cast<void ***>(g_engineClient))[51])(g_engineClient);
+  if (!level || !*level || std::strncmp(level, g_level, sizeof(g_level)) == 0)
+    return;
+  std::snprintf(g_level, sizeof(g_level), "%s", level);
+  char text[300];
+  std::snprintf(text, sizeof(text), "openremix:map %s", g_level);
+  marker(text);
+}
 } // namespace proxy::engine
 
 // IVRenderView (VEngineRenderView014) slot 13: DrawWorldLists. Inside it the
@@ -53,7 +68,10 @@ namespace {
 // engine then bound a null material).
 extern "C" {
 void *openremix_drawWorldListsOriginal = nullptr;
-void openremix_worldListsBegin() { proxy::engine::marker("openremix:world_lists 1"); }
+void openremix_worldListsBegin() {
+  proxy::engine::noteLevel();
+  proxy::engine::marker("openremix:world_lists 1");
+}
 void openremix_worldListsEnd() { proxy::engine::marker("openremix:world_lists 0"); }
 void openremix_drawWorldLists();
 }
@@ -126,6 +144,7 @@ bool install() {
     return false;
   void *renderView = createInterface("engine.dll", "VEngineRenderView014");
   g_materials = createInterface("materialsystem.dll", "VMaterialSystem080");
+  g_engineClient = createInterface("engine.dll", "VEngineClient013");
   if (!renderView || !g_materials)
     return false;
   openremix_drawWorldListsOriginal =

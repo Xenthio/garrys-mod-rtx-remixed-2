@@ -158,20 +158,44 @@ std::vector<SearchPath> g_paths;
 bool g_indexed = false;
 Pak g_pak;
 
+void addLoose(const std::wstring &directory) {
+  g_paths.push_back({g_root + L"\\" + directory + L"\\", nullptr});
+}
+
+void addVpk(const std::wstring &dirFile) {
+  auto vpk = std::make_unique<Vpk>();
+  if (vpk->open(g_root + L"\\" + dirFile))
+    g_paths.push_back({{}, std::move(vpk)});
+}
+
 void index() {
   if (g_indexed)
     return;
   g_indexed = true;
-  // left4dead2/gameinfo.txt SearchPaths.
-  for (const wchar_t *dir : {L"update", L"left4dead2_dlc3", L"left4dead2_dlc2", L"left4dead2_dlc1", L"left4dead2",
-                             L"hl2"}) {
-    SearchPath p;
-    p.directory = g_root + L"\\" + dir + L"\\";
-    auto vpk = std::make_unique<Vpk>();
-    if (vpk->open(p.directory + L"pak01_dir.vpk"))
-      p.vpk = std::move(vpk);
-    g_paths.push_back(std::move(p));
+  // garrysmod/gameinfo.txt SearchPaths (GMod x64 layout: the exe sits in the
+  // game root). Loose addon folders (not .gma archives) come first.
+  WIN32_FIND_DATAW found;
+  HANDLE find = FindFirstFileW((g_root + L"\\garrysmod\\addons\\*").c_str(), &found);
+  if (find != INVALID_HANDLE_VALUE) {
+    do
+      if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && found.cFileName[0] != L'.')
+        addLoose(std::wstring(L"garrysmod\\addons\\") + found.cFileName);
+    while (FindNextFileW(find, &found));
+    FindClose(find);
   }
+  addVpk(L"garrysmod\\garrysmod_dir.vpk");
+  for (const wchar_t *vpk : {L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
+    addVpk(std::wstring(L"sourceengine\\") + vpk + L"_dir.vpk");
+  addVpk(L"platform\\platform_misc_dir.vpk");
+  addLoose(L"garrysmod");
+  addLoose(L"sourceengine");
+  addLoose(L"platform");
+  addLoose(L"garrysmod\\download");
+  // Mounted game content (cfg/mount.cfg) as shipped with GMod, then the
+  // missing-content fallbacks.
+  addVpk(L"sourceengine\\content_hl2_dir.vpk");
+  addVpk(L"sourceengine\\content_cstrike_dir.vpk");
+  addVpk(L"garrysmod\\fallbacks_dir.vpk");
 }
 
 } // namespace
@@ -223,7 +247,7 @@ bool size(const std::string &path, uint64_t &out) {
   }
   for (const auto &p : g_paths) {
     WIN32_FILE_ATTRIBUTE_DATA attributes;
-    if (GetFileAttributesExW((p.directory + widen(key)).c_str(), GetFileExInfoStandard, &attributes) &&
+    if (!p.directory.empty() && GetFileAttributesExW((p.directory + widen(key)).c_str(), GetFileExInfoStandard, &attributes) &&
         !(attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
       out = (uint64_t(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
       return true;
@@ -250,7 +274,7 @@ bool read(const std::string &path, std::vector<uint8_t> &out, uint64_t offset, u
     return true;
   }
   for (const auto &p : g_paths) {
-    if (readFile(p.directory + widen(key), out, offset, length))
+    if (!p.directory.empty() && readFile(p.directory + widen(key), out, offset, length))
       return true;
     if (p.vpk)
       if (auto it = p.vpk->entries.find(key); it != p.vpk->entries.end())
@@ -264,7 +288,7 @@ std::wstring locate(const std::string &path) {
   index();
   const std::wstring key = widen(normalize(path));
   for (const auto &p : g_paths)
-    if (GetFileAttributesW((p.directory + key).c_str()) != INVALID_FILE_ATTRIBUTES)
+    if (!p.directory.empty() && GetFileAttributesW((p.directory + key).c_str()) != INVALID_FILE_ATTRIBUTES)
       return p.directory + key;
   return {};
 }
