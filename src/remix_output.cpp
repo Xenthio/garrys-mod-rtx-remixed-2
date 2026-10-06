@@ -4,6 +4,7 @@
 #include "sky_faces.h"
 #include "bsp_world.h"
 #include "dxvk_hash.h"
+#include "engine_lights.h"
 #include "texture_categories.h"
 #include <unordered_set>
 
@@ -290,8 +291,13 @@ std::unordered_map<uint64_t, SourceLight> g_frameLights, g_lastLights;
 struct CachedLight {
   remixapi_LightHandle handle = nullptr;
   uint64_t lastFrame = 0;
+  uint64_t definition = 0; // see g_lightDefinitions
 };
 std::unordered_map<uint64_t, CachedLight> g_lights;
+// This frame's lights whose hash is an identity, not their contents (styled
+// map lights, dlights, projected textures): the contents' hash. When it
+// changes the Remix light is redefined under the same hash.
+std::unordered_map<uint64_t, uint64_t> g_lightDefinitions;
 
 float envScale(const char *name, float fallback) {
   char v[32] = {};
@@ -1837,6 +1843,28 @@ void onPresent() {
   }
   {
     std::lock_guard<std::mutex> lock(g_lightLock);
+    // The engine's own light state (engine_lights), as sampled for this frame.
+    const auto engineLights = engine_lights::current();
+    uint32_t styled = 0, styledOff = 0, duplicates = 0;
+    g_lightDefinitions.clear();
+    // Dlights the engine also handed to a model (SetLight): one light.
+    if (engineLights && !engineLights->dlights.empty())
+      for (auto it = g_frameLights.begin(); it != g_frameLights.end();) {
+        bool duplicate = false;
+        for (const auto &d : engineLights->dlights)
+          if (it->second.type != 2 && std::fabs(it->second.position[0] - d.position[0]) < .1f &&
+              std::fabs(it->second.position[1] - d.position[1]) < .1f &&
+              std::fabs(it->second.position[2] - d.position[2]) < .1f) {
+            duplicate = true;
+            break;
+          }
+        duplicates += duplicate;
+        it = duplicate ? g_frameLights.erase(it) : std::next(it);
+      }
+    auto addDefined = [](uint64_t hash, const SourceLight &l) {
+      g_frameLights[hash] = l;
+      g_lightDefinitions[hash] = fnv(&l, sizeof(l)) | 1; // never 0 (a light without a definition)
+    };
     for (const auto &b : bsp::lights()) {
       SourceLight l = {};
       l.type = b.type;
@@ -1848,12 +1876,52 @@ void onPresent() {
       l.attenuation2 = b.attenuation[2];
       l.thetaDot = b.thetaDot;
       l.phiDot = b.phiDot;
+      if (b.style) {
+        // Switchable and flickering lights: scaled by their lightstyle (off at 0).
+        const float value = engineLights && engineLights->styles && b.style > 0 && b.style < 128
+                                ? engineLights->style[b.style]
+                                : 1.0f;
+        ++styled;
+        if (!(value > 0)) {
+          ++styledOff;
+          continue;
+        }
+        for (float &c : l.color)
+          c *= value;
+        addDefined(b.hash, l);
+        continue;
+      }
       g_frameLights[b.hash] = l;
     }
+    if (engineLights)
+      for (const auto *list : {&engineLights->dlights, &engineLights->projected})
+        for (const auto &e : *list) {
+          SourceLight l = {};
+          l.type = e.type;
+          std::memcpy(l.color, e.color, 12);
+          std::memcpy(l.position, e.position, 12);
+          std::memcpy(l.direction, e.direction, 12);
+          l.attenuation0 = e.attenuation[0];
+          l.attenuation1 = e.attenuation[1];
+          l.attenuation2 = e.attenuation[2];
+          l.thetaDot = e.thetaDot;
+          l.phiDot = e.phiDot;
+          addDefined(e.hash, l);
+        }
+    engine_lights::report(styled, styledOff, duplicates);
     for (auto &[hash, l] : g_frameLights) {
       auto &cached = g_lights[hash];
-      if (!cached.handle && !(cached.handle = createLight(l, hash)))
-        continue;
+      const auto defined = g_lightDefinitions.find(hash);
+      const uint64_t definition = defined == g_lightDefinitions.end() ? 0 : defined->second;
+      if (!cached.handle || cached.definition != definition) {
+        // CreateLight under an existing hash replaces that light in place
+        // (same handle).
+        const remixapi_LightHandle handle = createLight(l, hash);
+        if (!handle)
+          continue;
+        cached.handle = handle;
+        cached.definition = definition;
+      }
       cached.lastFrame = g_frame;
       g_api.DrawLightInstance(cached.handle);
       ++g_stats.lights;
@@ -2323,6 +2391,8 @@ bool onMarker(const char *text) {
     g_markerCategories = std::atoi(v) ? REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL |
                                             REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY
                                       : 0;
+  else if (const char *v = argument("lights"))
+    engine_lights::activate(uint32_t(std::strtoul(v, nullptr, 10)));
   else if (const char *v = argument("map")) {
     if (g_ready) {
       resetSky(); // the previous map's dome; this map's sky draws follow

@@ -1,5 +1,6 @@
 #include "bsp_world.h"
 
+#include "engine_lights.h"
 #include "source_fs.h"
 #include "texture_categories.h"
 
@@ -466,6 +467,7 @@ struct World {
   uint64_t replayedFrames = 0;
   uint32_t recordings = 0;
   uint32_t styledLights = 0, skyboxLights = 0, otherLights = 0;
+  uint32_t styleDrivenLights = 0; // of lights: scaled by their lightstyle
 } g_world;
 bool g_active = false;
 
@@ -1332,8 +1334,10 @@ static_assert(sizeof(WorldLight) == 100);
 enum { kEmitPoint = 1, kEmitSpot = 2, kEmitSky = 3 };
 
 // The map's static lights (HDR worldlights; LDR when the map has no HDR
-// lighting). Lights with a light style (switchable, flickering) and lights
-// in the 3D skybox stay with the engine's per-model light state.
+// lighting). Lights with a light style (switchable, flickering) keep it: the
+// renderer scales them by the engine's lightstyle value each frame (without
+// engine_lights they stay with the engine's per-model light state, as lights
+// in the 3D skybox do).
 // OPENREMIX_PROXY_BSP_LIGHTS=0 leaves all lights to the engine.
 template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
   static const bool enabled = [] {
@@ -1368,7 +1372,8 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     }
     // The sun keeps its light (GMod's light_environment often has a style,
     // e.g. 33 on gm_construct, for day/night control).
-    if (w.style != 0 && w.type != kEmitSky) {
+    const bool styled = w.style != 0 && w.type != kEmitSky;
+    if (styled && !engine_lights::stylesActive()) {
       ++g_world.styledLights;
       continue;
     }
@@ -1388,6 +1393,10 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     l.thetaDot = w.stopdot;
     l.phiDot = w.stopdot2;
     l.hash = 0x6c696768745f6273ull ^ (uint64_t(i) * 0x9e3779b97f4a7c15ull);
+    if (styled) {
+      l.style = w.style;
+      ++g_world.styleDrivenLights;
+    }
     g_world.lights.push_back(l);
   }
 }
@@ -2373,8 +2382,9 @@ void dumpStatistics(FILE *out) {
   }
   fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
           int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
-  fprintf(out, "   BSP lights: %zu static (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
-          g_world.lights.size(), g_world.styledLights, g_world.skyboxLights, g_world.otherLights);
+  fprintf(out, "   BSP lights: %zu static, %u of them styled (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
+          g_world.lights.size(), g_world.styleDrivenLights, g_world.styledLights, g_world.skyboxLights,
+          g_world.otherLights);
   for (auto &path : g_world.failedModels)
     fprintf(out, "     prop model left to the engine: %s\n", path.c_str());
   for (auto &m : g_world.materials)

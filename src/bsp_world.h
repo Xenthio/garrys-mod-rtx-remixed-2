@@ -50,6 +50,7 @@ struct Light {
   float attenuation[3] = {}; // constant, linear, quadratic
   float thetaDot = 0, phiDot = 0; // spot inner and outer cone cosines
   uint64_t hash = 0;
+  int style = 0; // lightstyle scaling the color each frame (0: none)
 };
 // The map's static lights, submitted every frame.
 const std::vector<Light> &lights();
