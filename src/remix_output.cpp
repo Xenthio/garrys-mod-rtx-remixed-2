@@ -54,7 +54,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -1427,6 +1427,36 @@ void onPresent() {
       mainKey = key;
     }
   }
+  // Draw counts can favour the 3D skybox: looking down, the engine culls most
+  // of the world while the skybox view draws its whole miniature city. The
+  // skybox view looks from sky_camera's origin + eye / scale with the main
+  // rotation, so a winner that is another candidate's skybox view yields to it.
+  float skyOrigin[3], skyScale = 0;
+  if (main && bsp::skyCamera(skyOrigin, skyScale) && skyScale > 0) {
+    auto eyeOf = [](const View &v, float out[3]) {
+      for (int i = 0; i < 3; ++i)
+        out[i] = -(v.view[12] * v.view[i * 4] + v.view[13] * v.view[i * 4 + 1] + v.view[14] * v.view[i * 4 + 2]);
+    };
+    float mainEye[3];
+    eyeOf(*main, mainEye);
+    for (auto &[key, v] : g_views) {
+      if (&v == main || !v.perspective || int(std::lround(v.projection[5] * 1000)) != worldFov ||
+          !sameRotation(v.view, main->view))
+        continue;
+      float eye[3], distance2 = 0;
+      eyeOf(v, eye);
+      for (int i = 0; i < 3; ++i) {
+        const float d = mainEye[i] - (skyOrigin[i] + eye[i] / skyScale);
+        distance2 += d * d;
+      }
+      if (distance2 < 4.0f * 4.0f) {
+        main = &v;
+        mainKey = key;
+        ++g_stats.skyViewDemoted;
+        break;
+      }
+    }
+  }
   if (main) {
     g_lastCamera = *main;
     // The 3D skybox keeps its own camera: the runtime draws SKY instances with
@@ -2055,7 +2085,8 @@ void dumpStatistics(FILE *out) {
       modsDiagnostic(diagnostic, sizeof(diagnostic));
     fprintf(out, "   USD mods: configure %d; %s\n", int(g_modsResult), diagnostic);
   }
-  fprintf(out, "   frames with a sky view %.2f\n%s", g_stats.skyFrames.exchange(0) / f, g_viewSummary.c_str());
+  fprintf(out, "   frames with a sky view %.2f (skybox view had the most draws %.2f)\n%s", g_stats.skyFrames.exchange(0) / f,
+          g_stats.skyViewDemoted.exchange(0) / f, g_viewSummary.c_str());
   fprintf(out, "   player body (l4d2-rtx shadow mesh) %.1f\n", g_stats.playerBody.exchange(0) / f);
   fprintf(out, "   rtx.conf texture categories: %zu hashes; ignored/hidden draws %.1f\n", categories::size(),
           g_stats.ignored.exchange(0) / f);
