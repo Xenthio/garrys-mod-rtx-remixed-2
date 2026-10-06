@@ -1610,6 +1610,18 @@ void onPresent() {
         world.projection[14] = -kNear * world.projection[10];
       }
     }
+    // A path-traced 3D skybox lies far beyond the map (scaled up around it):
+    // the far plane (raster primary visibility, depth) must reach it.
+    if (const float reach = bsp::skyTracedReach(); reach > 0) {
+      const float p10 = world.projection[10], p14 = world.projection[14];
+      if (p10 > 1.0f) {
+        const float nearPlane = -p14 / p10, farPlane = p14 / (1.0f - p10), wanted = 2.0f * reach + 4096.0f;
+        if (farPlane < wanted && nearPlane > 0) {
+          world.projection[10] = wanted / (wanted - nearPlane);
+          world.projection[14] = -nearPlane * world.projection[10];
+        }
+      }
+    }
     setup(REMIXAPI_CAMERA_TYPE_WORLD, world);
     // Without engine draws in the 3D skybox view (its world comes from the
     // BSP), the sky camera is the main camera moved into the skybox:
@@ -1675,12 +1687,14 @@ void onPresent() {
       return id;
     };
     std::unordered_map<uint64_t, bool> seen; // multipass draws: the first pass wins
+    // A path-traced 3D skybox comes from the BSP: the sky view's draws repeat it.
+    const bool skyTraced = bsp::skyTracedReach() > 0;
     for (auto &inst : g_instances) {
       const Role role = roles[inst.view];
       if (role == Role::Skip)
         continue;
       if ((role == Role::ViewModel && &g_views[inst.view] != viewModel) ||
-          (role == Role::Sky && &g_views[inst.view] != sky))
+          (role == Role::Sky && (&g_views[inst.view] != sky || skyTraced)))
         continue;
       if (role == Role::ViewModel && !rasterViewModel) {
         if (inst.bones.empty())

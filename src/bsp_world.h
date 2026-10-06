@@ -77,6 +77,11 @@ bool providesProp(const float *rows);
 // The map's sky_camera (3D skybox origin and scale), if any.
 bool skyCamera(float origin[3], float &scale);
 
+// The 3D skybox is path traced in world space (its engine sky-view draws are
+// redundant): the distance its geometry reaches from the playable map's
+// centre, or 0 when it is rasterized by the sky camera.
+float skyTracedReach();
+
 // The BSP material using a texture (for statistics), or empty.
 std::string materialName(uint64_t textureHash);
 

@@ -391,6 +391,7 @@ struct World {
   std::vector<Node> nodes;
   std::vector<Plane> planes;
   std::vector<int16_t> leafAreas;
+  std::vector<uint8_t> leafPlayable; // empty, in a cluster, outside the 3D skybox
   int skyArea = -1;
   std::map<std::array<int32_t, 5>, OverlayGroup> overlayGroups;
   std::unordered_map<std::string, int> overlayMaterialIndex;
@@ -401,6 +402,13 @@ struct World {
   bool skyCamera = false;
   float skyOrigin[3] = {};
   float skyScale = 16;
+  // Path-traced 3D skybox (OPENREMIX_PROXY_SKY_TRACE, default on): its faces
+  // and props baked into world space, p_world = (p_sky - skyOrigin) * scale,
+  // minus what lands inside the playable map (low-detail stand-ins of it).
+  bool skyTraced = false;
+  float playableMins[3] = {}, playableMaxs[3] = {};
+  float skyReach = 0; // farthest traced sky point from the playable bounds' centre
+  uint32_t skyTracedTriangles = 0, skyStandInTriangles = 0, skyTracedProps = 0, skyStandInProps = 0;
   uint64_t frames = 0;
   // Statistics.
   uint32_t faces = 0, displacements = 0, skyFaces = 0, skippedTranslucent = 0, skippedIgnored = 0, keptIgnored = 0, triangles = 0;
@@ -854,6 +862,37 @@ void destroyMeshes() {
 }
 
 // Static props (game lump "sprp", version 9/10 placements of at least 72 bytes).
+bool skyTraceEnabled() {
+  static const bool enabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_SKY_TRACE", v, sizeof(v)) && v[0] == '0');
+  }();
+  return enabled;
+}
+
+// A 3D skybox point in world space (where the main camera sees it).
+void skyToWorld(const float in[3], float out[3]) {
+  for (int k = 0; k < 3; ++k)
+    out[k] = (in[k] - g_world.skyOrigin[k]) * g_world.skyScale;
+}
+
+// Whether a point lies in space the player can occupy (an empty leaf of the
+// main map): skybox geometry there stands in for the map itself. Skybox
+// scenery lands behind the map's sky brushes, in solid or outside space.
+bool insidePlayable(const Bsp &bsp, const float p[3]) {
+  const int leaf = leafAt(bsp, p);
+  return leaf >= 0 && size_t(leaf) < g_world.leafPlayable.size() && g_world.leafPlayable[leaf];
+}
+
+void noteSkyReach(const float p[3]) {
+  float d2 = 0;
+  for (int k = 0; k < 3; ++k) {
+    const float c = .5f * (g_world.playableMins[k] + g_world.playableMaxs[k]);
+    d2 += (p[k] - c) * (p[k] - c);
+  }
+  g_world.skyReach = std::max(g_world.skyReach, std::sqrt(d2));
+}
+
 template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
   // OPENREMIX_PROXY_BSP_PROPS=0 leaves static props to the engine.
   static const bool enabled = [] {
@@ -917,12 +956,26 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
       continue;
     // 3D skybox props stay with the engine: they are seen only through the
     // sky camera, which the engine's sky view already draws in full.
-    if (inSky(origin)) {
-      ++g_world.skyProps;
-      continue;
-    }
     Prop prop;
     angleMatrix(angles, origin, prop.transform);
+    if (inSky(origin)) {
+      ++g_world.skyProps;
+      if (!g_world.skyTraced)
+        continue;
+      float moved[3];
+      skyToWorld(origin, moved);
+      if (insidePlayable(bsp, moved)) {
+        ++g_world.skyStandInProps;
+        continue;
+      }
+      for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c)
+          prop.transform[r][c] *= g_world.skyScale;
+        prop.transform[r][3] = moved[r];
+      }
+      noteSkyReach(moved);
+      ++g_world.skyTracedProps;
+    }
     prop.model = &it->second;
     prop.id = XXH3_64bits_withSeed(&p, sizeof(p), 0x70726f70ull) | 1;
     g_world.propCells[propCell(origin)].push_back(uint32_t(g_world.props.size()));
@@ -1273,13 +1326,32 @@ bool build(const Bsp &bsp) {
       skyArea = leafs[leaf].areaFlags & 0x1ff;
   }
   g_world.skyArea = skyArea;
+  g_world.skyTraced = skyArea >= 0 && skyTraceEnabled() && g_world.skyScale > 0;
+  if (g_world.skyTraced) {
+    // Empty leaves outside the skybox: the volume the player can see from.
+    bool any = false;
+    for (size_t l = 1; l < leafCount; ++l) {
+      const Leaf &leaf = leafs[l];
+      if ((leaf.contents & 1) || leaf.cluster < 0 || (leaf.areaFlags & 0x1ff) == skyArea)
+        continue;
+      for (int k = 0; k < 3; ++k) {
+        g_world.playableMins[k] = any ? std::min(g_world.playableMins[k], float(leaf.mins[k])) : float(leaf.mins[k]);
+        g_world.playableMaxs[k] = any ? std::max(g_world.playableMaxs[k], float(leaf.maxs[k])) : float(leaf.maxs[k]);
+      }
+      any = true;
+    }
+    g_world.skyTraced = any;
+  }
   {
     const auto [nodes, nodeCount] = bsp.lump<Node>(kNodes);
     if (nodes)
       g_world.nodes.assign(nodes, nodes + nodeCount);
     g_world.planes.assign(planes, planes + planeCount);
-    for (size_t l = 0; leafs && l < leafCount; ++l)
+    for (size_t l = 0; leafs && l < leafCount; ++l) {
       g_world.leafAreas.push_back(int16_t(leafs[l].areaFlags & 0x1ff));
+      g_world.leafPlayable.push_back(l > 0 && !(leafs[l].contents & 1) && leafs[l].cluster >= 0 &&
+                                     (leafs[l].areaFlags & 0x1ff) != skyArea);
+    }
   }
   std::vector<uint8_t> skyFace(faceCount, 0);
   if (skyArea >= 0) {
@@ -1386,12 +1458,45 @@ bool build(const Bsp &bsp) {
         centroid[k] += c[k] / float(corners.size());
     // Into the leaf in front of the face.
     const float probe[3] = {centroid[0] + normal[0], centroid[1] + normal[1], centroid[2] + normal[2]};
-    // The 3D skybox is left to the engine (l4d2-rtx keeps its draws).
-    if (skyFace[size_t(f)] != 0 || inSky(probe)) {
+    // The 3D skybox: path traced in world space, or left to the engine's
+    // sky view (l4d2-rtx keeps its draws).
+    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe);
+    if (skyboxFace) {
       ++g_world.skyFaces;
-      continue;
+      if (!g_world.skyTraced)
+        continue;
+      float moved[3];
+      skyToWorld(centroid, moved);
+      std::memcpy(centroid, moved, sizeof(moved));
     }
     const bool sky = false;
+    // Bakes a skybox face's vertices (from `base`, indices from `firstIndex`)
+    // into world space and drops triangles inside the playable map.
+    auto toWorld = [&](Geometry &g, size_t base, size_t firstIndex) {
+      if (!skyboxFace)
+        return;
+      for (size_t v = base; v < g.vertices.size(); ++v) {
+        float p[3];
+        skyToWorld(g.vertices[v].position, p);
+        std::memcpy(g.vertices[v].position, p, sizeof(p));
+        noteSkyReach(p);
+      }
+      size_t out = firstIndex;
+      for (size_t i = firstIndex; i + 2 < g.indices.size(); i += 3) {
+        float c[3] = {};
+        for (int j = 0; j < 3; ++j)
+          for (int k = 0; k < 3; ++k)
+            c[k] += g.vertices[g.indices[i + j]].position[k] / 3;
+        if (insidePlayable(bsp, c)) {
+          ++g_world.skyStandInTriangles;
+          continue;
+        }
+        ++g_world.skyTracedTriangles;
+        for (int j = 0; j < 3; ++j)
+          g.indices[out++] = g.indices[i + j];
+      }
+      g.indices.resize(out);
+    };
 
     if (face.dispInfo >= 0 && dispInfos && size_t(face.dispInfo) < dispInfoCount && corners.size() == 4) {
       // Displacement: a (2^power+1)^2 grid over the face, offset per vertex;
@@ -1416,6 +1521,7 @@ bool build(const Bsp &bsp) {
         continue;
       Geometry &g = groupFor(centroid, sky, m);
       const uint32_t base = uint32_t(g.vertices.size());
+      const size_t firstIndex = g.indices.size();
       for (int v = 0; v < size; ++v) {
         const float t = float(v) / float(size - 1);
         float left[3], right[3];
@@ -1466,15 +1572,18 @@ bool build(const Bsp &bsp) {
         for (int k = 0; k < 3; ++k)
           n[k] = len > 1e-12f ? n[k] / len : normal[k];
       }
+      toWorld(g, base, firstIndex);
       g_world.triangles += uint32_t((size - 1) * (size - 1) * 2);
       ++g_world.displacements;
     } else if (face.dispInfo < 0) {
       Geometry &g = groupFor(centroid, sky, m);
       const uint32_t base = uint32_t(g.vertices.size());
+      const size_t firstIndex = g.indices.size();
       for (auto &c : corners)
         g.vertices.push_back(vertex(c.data(), normal, ti, td));
       for (uint32_t k = 1; k + 1 < corners.size(); ++k)
         g.indices.insert(g.indices.end(), {base, base + k, base + k + 1});
+      toWorld(g, base, firstIndex);
       g_world.triangles += uint32_t(corners.size() - 2);
       ++g_world.faces;
     }
@@ -1626,6 +1735,8 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
 bool active() { return g_active; }
 
 bool overlaysActive() { return g_active && !g_world.overlayGroups.empty(); }
+
+float skyTracedReach() { return g_active && g_world.skyTraced ? g_world.skyReach : 0; }
 
 bool skyCamera(float origin[3], float &scale) {
   if (!g_active || !g_world.skyCamera || !g_world.skyFaces)
@@ -2030,6 +2141,10 @@ void dumpStatistics(FILE *out) {
           int(g_world.skyCamera), g_world.props.size(), g_world.skyProps, g_world.propModels.size(),
           g_world.propModelsFailed, g_world.propParts, g_world.overlays, g_world.overlayTriangles,
           g_world.overlayGroups.size(), g_world.waterMaterials);
+  if (g_world.skyTraced)
+    fprintf(out, "   3D skybox path traced: %u triangles, %u props (stand-ins dropped: %u triangles, %u props), reach %.0f\n",
+            g_world.skyTracedTriangles, g_world.skyTracedProps, g_world.skyStandInTriangles, g_world.skyStandInProps,
+            g_world.skyReach);
   fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
           int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
   fprintf(out, "   BSP lights: %zu static (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
