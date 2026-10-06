@@ -58,7 +58,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -419,7 +419,7 @@ struct StencilGroup {
   uint32_t passes = 0;
   uint32_t mask = 0; // runtime mask group (1..32), assigned at Present
 };
-enum : uint8_t { kStencilNone, kStencilSource, kStencilSourceOnly, kStencilInside };
+enum : uint8_t { kStencilNone, kStencilSource, kStencilSourceOnly, kStencilInside, kStencilCut };
 std::vector<StencilGroup> g_stencilGroups;           // this frame's
 std::unordered_map<uint32_t, int> g_stencilCurrent;  // stencil value -> its current group
 std::vector<std::pair<int, bool>> g_uiCommandMasks;  // per g_uiCommands entry: group (-1 none), outside
@@ -1714,8 +1714,12 @@ void onDraw(const Draw &d) {
         return; // nothing marked: not visible
       inst.stencilRole = kStencilInside;
     }
-    // NOTEQUAL and the rest are drawn as they are (a scope's body around its
-    // lens opening: the opening's own geometry is not drawn while aiming).
+    else if (d.stencilFunc == D3DCMP_NOTEQUAL) {
+      // A scope's body around its lens opening: a scene instance as ever,
+      // which the camera does not see inside the group.
+      inst.stencilGroup = stencilReader(value);
+      inst.stencilRole = inst.stencilGroup >= 0 ? kStencilCut : kStencilNone;
+    }
   }
   g_instances.push_back(inst);
   if (inst.stencilRole == kStencilSourceOnly || inst.stencilRole == kStencilInside)
@@ -2089,7 +2093,7 @@ void onPresent() {
           for (auto &bone : inst.bones)
             premultiply(viewModelTransform, bone.matrix);
       }
-      if (inst.stencilGroup >= 0) {
+      if (inst.stencilGroup >= 0 && inst.stencilRole != kStencilCut) {
         assignStencilMasks();
         const StencilGroup &group = g_stencilGroups[inst.stencilGroup];
         remixapi_InstanceInfoMaterialOverrideEXT maskMaterial = {};
@@ -2237,6 +2241,17 @@ void onPresent() {
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
       std::memcpy(info.transform.matrix, inst.transform, sizeof(info.transform.matrix));
       info.doubleSided = !inst.singleSided;
+      remixapi_InstanceInfoMaskEXT cut = {};
+      if (inst.stencilRole == kStencilCut) {
+        assignStencilMasks();
+        if ((cut.group = g_stencilGroups[inst.stencilGroup].mask)) {
+          cut.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MASK_EXT;
+          cut.pNext = info.pNext;
+          cut.role = REMIXAPI_INSTANCE_MASK_CUT_EXT;
+          info.pNext = &cut;
+          ++g_stats.maskCuts;
+        }
+      }
       g_api.DrawInstance(&info);
       ++g_stats.submitted;
     }
@@ -2814,9 +2829,10 @@ void dumpStatistics(FILE *out) {
     g_census.clear();
   }
   fprintf(out, "   halos per frame: %.2f groups, %.2f source instances | stencil masks: %.2f groups, %.2f sources, "
-               "%.2f overlays, %.2f UI draws\n",
+               "%.2f overlays, %.2f UI draws, %.2f cut instances\n",
           g_stats.haloGroups.exchange(0) / f, g_stats.haloSources.exchange(0) / f, g_stats.maskGroups.exchange(0) / f,
-          g_stats.maskSources.exchange(0) / f, g_stats.maskOverlays.exchange(0) / f, g_stats.maskUi.exchange(0) / f);
+          g_stats.maskSources.exchange(0) / f, g_stats.maskOverlays.exchange(0) / f, g_stats.maskUi.exchange(0) / f,
+          g_stats.maskCuts.exchange(0) / f);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",
           g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, g_stats.uiStencil.exchange(0) / f, [] {
             std::lock_guard<std::mutex> lock(g_textureLock);
