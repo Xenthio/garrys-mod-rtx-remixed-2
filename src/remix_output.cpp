@@ -1355,10 +1355,23 @@ void onDraw(const Draw &d) {
   // (captured, the cookie got pasted over every surface). Those lights are
   // path traced (engine_lights), so the pass goes. The shadow manager's
   // virtual iterator is not what the world pass uses, so it is caught here.
-  if (g_worldLists > 0 && d.blend && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE) {
+  // Models get the same additive pass outside the world lists, where other
+  // additive draws are legitimate (glows, sprites): the world pass teaches
+  // which textures are cookies, and additive draws using one are dropped.
+  if (d.blend && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE) {
+    static std::unordered_set<const void *> cookies; // render thread only
+    static uint32_t cookieEpoch = ~0u;
+    if (cookieEpoch != g_skyEpoch) { // a new map: texture pointers are reused
+      cookies.clear();
+      cookieEpoch = g_skyEpoch;
+    }
     if (const auto lights = engine_lights::current(); lights && !lights->projected.empty()) {
-      ++g_stats.flashlightPasses;
-      return;
+      if (g_worldLists > 0 && d.texture0)
+        cookies.insert(d.texture0);
+      if (g_worldLists > 0 || cookies.count(d.texture0)) {
+        ++g_stats.flashlightPasses;
+        return;
+      }
     }
   }
   if (g_worldLists > 0 && bsp::active()) {
