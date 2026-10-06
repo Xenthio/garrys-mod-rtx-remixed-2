@@ -391,7 +391,7 @@ struct Instance {
   // Stencil emulation: the draw's group (g_stencilGroups index) and part in it.
   int stencilGroup = -1;
   uint8_t stencilRole = 0;
-  bool depthTest = true;
+  bool depthTest = true, depthWrite = true;
 };
 std::vector<Instance> g_instances;
 
@@ -415,6 +415,14 @@ struct StencilGroup {
   uint32_t sources = 0, consumers = 0;
   int within = -1;
   bool fill = false, halo = false, additive = true, ignoreZ = false;
+  // A sight's reticle floats ~100 units ahead, depth-tested: in the game only
+  // against the view model (its own depth range), where it shows through the
+  // sight's glass and not its housing. Here the view model shares the world's
+  // depth and a nearby wall hid the reticle. With `throughGlass`, only the
+  // marks that write no depth (the glass) make the mask and the reticle is
+  // not depth-tested.
+  uint32_t glassSources = 0;
+  bool throughGlass = false;
   float color[3] = {};
   uint32_t passes = 0;
   uint32_t mask = 0; // runtime mask group (1..32), assigned at Present
@@ -1688,8 +1696,10 @@ void onDraw(const Draw &d) {
   if (d.stencil) { // see StencilGroup
     const uint32_t value = d.stencilRef & d.stencilMask & 0xff, written = d.stencilRef & d.stencilWriteMask & 0xff;
     inst.depthTest = d.depthTest;
+    inst.depthWrite = d.zWrite;
     if (d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
       inst.stencilGroup = stencilWriter(written);
+      g_stencilGroups[inst.stencilGroup].glassSources += !d.zWrite;
       // A render-target texture without contents (not read back, see
       // d3d::requestTargetContents): such a writer only marks.
       inst.stencilRole = d.texture0Target && !inst.material ? kStencilSourceOnly : kStencilSource;
@@ -2079,6 +2089,10 @@ void onPresent() {
     std::unordered_map<uint64_t, bool> seen; // multipass draws: the first pass wins
     // A path-traced 3D skybox comes from the BSP: the sky view's draws repeat it.
     const bool skyTraced = bsp::skyTracedReach() > 0;
+    for (const auto &inst : g_instances)
+      if (inst.stencilRole == kStencilInside && inst.depthTest && roles[inst.view] == Role::ViewModel &&
+          g_stencilGroups[inst.stencilGroup].glassSources)
+        g_stencilGroups[inst.stencilGroup].throughGlass = true;
     for (auto &inst : g_instances) {
       const Role role = roles[inst.view];
       if (role == Role::Skip)
@@ -2138,7 +2152,7 @@ void onPresent() {
           remixapi_InstanceRasterStateEXT raster = {};
           raster.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_RASTER_STATE_EXT;
           raster.pNext = &maskBlend;
-          raster.depthTest = inst.depthTest;
+          raster.depthTest = inst.depthTest && !group.throughGlass;
           raster.depthCompare = 3; // LESS_OR_EQUAL
           remixapi_InstanceInfoMaskEXT mask = {};
           mask.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MASK_EXT;
@@ -2155,7 +2169,9 @@ void onPresent() {
             ++g_stats.maskSources;
           }
           info.pNext = &mask;
-          if (mask.role == REMIXAPI_INSTANCE_MASK_INSIDE_EXT || group.within < 0 || mask.within)
+          if (mask.role == REMIXAPI_INSTANCE_MASK_SOURCE_EXT && group.throughGlass && inst.depthWrite)
+            ; // housing: hides the reticle, as its depth did
+          else if (mask.role == REMIXAPI_INSTANCE_MASK_INSIDE_EXT || group.within < 0 || mask.within)
             g_api.DrawInstance(&info);
         }
         // A housing that marks (ALWAYS/REPLACE) is also what the game shows.
