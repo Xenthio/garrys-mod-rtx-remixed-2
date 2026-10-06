@@ -1440,6 +1440,14 @@ void sampleGpuPasses() {
     g_gpuAverages.passes[t.passes[i].name] += t.passes[i].milliseconds;
 }
 
+void shutdown() {
+  if (!g_ready)
+    return;
+  g_ready = false;
+  remix_ui::uninstall();
+  g_api.Shutdown();
+}
+
 void onPresent() {
   sampleGpuPasses();
   if (!g_ready)

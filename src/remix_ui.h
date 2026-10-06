@@ -16,6 +16,9 @@ namespace proxy::remix_ui {
 // Call on the thread that ran remixapi Startup (it owns the window's events).
 void install(HWND window, remixapi_Interface *api);
 
+// Restores the window procedure (before the runtime releases its window).
+void uninstall();
+
 // Whether the panel is open.
 bool active();
 

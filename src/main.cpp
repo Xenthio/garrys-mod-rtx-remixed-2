@@ -112,6 +112,16 @@ bool deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn factory) {
   return proxy::original<Fn>(self, 0)(self->real, factory ? connectFactory : nullptr);
 }
 
+// IShaderDeviceMgr slot 4: void Shutdown() (IAppSystem). The material system
+// shuts the shader device down on quit, on the main thread: OpenRemix stops
+// here rather than in exit-time teardown.
+void deviceMgrShutdown(proxy::Wrapper *self) {
+  using Fn = void (*)(void *);
+  log("proxy: IShaderDeviceMgr::Shutdown");
+  proxy::original<Fn>(self, 4)(self->real);
+  proxy::remix::shutdown();
+}
+
 // IShaderDeviceMgr slot 12 (5 + 7): CreateInterfaceFn SetMode(void *hWnd,
 // int nAdapter, const ShaderDeviceInfo_t &mode). The material system fetches
 // the shader API interfaces through the factory it returns.
@@ -174,6 +184,7 @@ const KnownInterface kKnown[] = {
      [](proxy::Kind *k) {
        proxy::setHook(k, 0, reinterpret_cast<void *>(&deviceMgrConnect));
        proxy::setHook(k, 2, reinterpret_cast<void *>(&deviceMgrQueryInterface));
+       proxy::setHook(k, 4, reinterpret_cast<void *>(&deviceMgrShutdown));
        proxy::setHook(k, 12, reinterpret_cast<void *>(&deviceMgrSetMode));
      }},
     {"ShaderApi030",
@@ -321,10 +332,25 @@ void sampleThreads() {
   fclose(f);
 }
 
+// Dev aid: `shaderapi_proxy_close.request` closes the game's windows
+// (WM_CLOSE, as the window's close button; GMod blocks `quit` from Lua).
+BOOL CALLBACK closeWindow(HWND window, LPARAM) {
+  DWORD process = 0;
+  GetWindowThreadProcessId(window, &process);
+  if (process == GetCurrentProcessId() && IsWindowVisible(window))
+    PostMessageW(window, WM_CLOSE, 0, 0);
+  return TRUE;
+}
+
 DWORD WINAPI profilerThread(void *) {
   const std::wstring request = g_dir + L"\\shaderapi_proxy_profile.request";
+  const std::wstring close = g_dir + L"\\shaderapi_proxy_close.request";
   for (;;) {
     Sleep(250);
+    if (GetFileAttributesW(close.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      DeleteFileW(close.c_str());
+      EnumWindows(closeWindow, 0);
+    }
     if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
       continue;
     DeleteFileW(request.c_str());

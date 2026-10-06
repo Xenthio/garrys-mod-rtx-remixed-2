@@ -74,6 +74,9 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
 void onTextureCopy(const void *source, const void *destination);
 void onTextureReleased(const void *texture);
 void onPresent();
+// The game is shutting its renderer down: stop OpenRemix while every thread
+// is alive (exit-time teardown after ExitProcess hung on its workers).
+void shutdown();
 
 // IShaderAPI::SetLights(int count, const LightDesc_t *lights): the lights the
 // game hands to models (including the map's directional sun).

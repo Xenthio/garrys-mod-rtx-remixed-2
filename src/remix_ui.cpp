@@ -287,6 +287,18 @@ void install(HWND window, remixapi_Interface *api) {
                 GetCurrentThreadId());
 }
 
+void uninstall() {
+  if (!g_previous)
+    return;
+  // Only when still on top; otherwise a later subclass chains through ours.
+  if (GetWindowLongPtrW(g_window, GWLP_WNDPROC) == reinterpret_cast<LONG_PTR>(&windowProc))
+    SetWindowLongPtrW(g_window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_previous));
+  if (g_active)
+    setCursorVisible(false);
+  g_active = false;
+  std::snprintf(g_status, sizeof(g_status), "uninstalled");
+}
+
 bool active() { return g_active; }
 
 void dumpStatistics(FILE *out) {
