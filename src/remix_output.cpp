@@ -2318,12 +2318,13 @@ void onPresent() {
                                 ? engineLights->style[b.style]
                                 : 1.0f;
         ++styled;
-        if (!(value > 0)) {
-          ++styledOff;
-          continue;
-        }
+        // An off light stays in the set, black: the runtime keeps zero-power
+        // lights as slots of its light tree (a refit). Leaving it out changed
+        // the light count, which rebuilds the tree and resets the light
+        // guiding history of the whole scene at every flicker.
+        styledOff += !(value > 0);
         for (float &c : l.color)
-          c *= value;
+          c *= value > 0 ? value : 0.0f;
         addDefined(b.hash, l);
         continue;
       }
