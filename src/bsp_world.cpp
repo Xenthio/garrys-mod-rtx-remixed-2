@@ -130,8 +130,16 @@ public:
     _fseeki64(f, 0, SEEK_SET);
     const bool ok = fread(data.data(), 1, data.size(), f) == data.size();
     fclose(f);
+    return ok && parse();
+  }
+  // A map read through the file system (e.g. from a workshop addon).
+  bool open(std::vector<uint8_t> bytes) {
+    data = std::move(bytes);
+    return parse();
+  }
+  bool parse() {
     int32_t version = 0;
-    if (!ok || data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0)
+    if (data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0)
       return false;
     std::memcpy(&version, data.data() + 4, 4);
     if (version < 19 || version > 21)
@@ -286,7 +294,20 @@ std::vector<uint64_t> textureHashes(const std::string &name) {
   std::memcpy(&format, header.data() + 52, 4);
   const uint8_t mips = header[56];
   uint32_t blockBytes = 0, pixelBytes = 0;
+  // D3D9 has no 24-bit or RGBA-order formats: Source widens/swizzles these
+  // to B8G8R8A8 or B8G8R8X8 before the upload the proxy hashes. X is filled
+  // with 0xff or 0 depending on the conversion path: both are candidates.
+  int convert = 0; // 0 none, 2 RGB888, 3 BGR888, 1 RGBA8888
   switch (format) {
+  case 0: // RGBA8888
+    pixelBytes = 4;
+    convert = 1;
+    break;
+  case 2: // RGB888
+  case 3: // BGR888
+    pixelBytes = 3;
+    convert = format;
+    break;
   case 13: // DXT1
   case 20: // DXT1_ONEBITALPHA
     blockBytes = 8;
@@ -314,7 +335,26 @@ std::vector<uint64_t> textureHashes(const std::string &name) {
     std::vector<uint8_t> level;
     if (!fs::read(path, level, end - block, bytes) || level.size() != bytes)
       break;
-    hashes.push_back(XXH3_64bits(level.data(), level.size()));
+    if (!convert) {
+      hashes.push_back(XXH3_64bits(level.data(), level.size()));
+    } else {
+      const size_t pixels = size_t(w) * h;
+      std::vector<uint8_t> bgra(pixels * 4);
+      for (int fill : {0xff, 0x00}) {
+        for (size_t i = 0; i < pixels; ++i) {
+          const uint8_t *s = level.data() + i * pixelBytes;
+          uint8_t *d = bgra.data() + i * 4;
+          const bool rgbOrder = convert != 3;
+          d[0] = rgbOrder ? s[2] : s[0];
+          d[1] = s[1];
+          d[2] = rgbOrder ? s[0] : s[2];
+          d[3] = convert == 1 ? s[3] : uint8_t(fill);
+        }
+        hashes.push_back(XXH3_64bits(bgra.data(), bgra.size()));
+        if (convert == 1)
+          break;
+      }
+    }
     end -= block;
   }
   return hashes;
@@ -1860,8 +1900,11 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
     initialized = true;
   }
   Bsp bsp;
-  const std::wstring path = fs::locate("maps/" + lower(mapName) + ".bsp");
-  if (path.empty() || !bsp.open(path)) {
+  // A loose map file, else through the file system (workshop addons, etc.).
+  const std::string file = "maps/" + lower(mapName) + ".bsp";
+  const std::wstring path = fs::locate(file);
+  std::vector<uint8_t> bytes;
+  if (path.empty() ? !(fs::read(file, bytes) && bsp.open(std::move(bytes))) : !bsp.open(path)) {
     sendPartition(nullptr);
     return false;
   }
@@ -2304,6 +2347,30 @@ void dumpStatistics(FILE *out) {
             "triangles, %u props; pieces on world faces %u), reach %.0f\n",
             g_world.skyTracedTriangles, g_world.skyClippedTriangles, g_world.skyTracedProps,
             g_world.skyStandInTriangles, g_world.skyStandInProps, g_world.skyCoplanarPieces, g_world.skyReach);
+  {
+    // Unresolved materials: no predictable texture hash (VTF missing or its
+    // format not modelled) vs. a hash the engine never uploaded.
+    uint32_t noCandidates = 0, notUploaded = 0;
+    std::string examples;
+    for (const auto &m : g_world.materials) {
+      if (m.resolved)
+        continue;
+      ++(m.candidates.empty() ? noCandidates : notUploaded);
+      if (examples.size() < 600) {
+        KeyValues kv;
+        std::string base = loadMaterial(m.name, kv) && kv.values.count("$basetexture") ? kv.values["$basetexture"] : "-";
+        std::vector<uint8_t> header;
+        int32_t format = -1;
+        if (base != "-" && fs::read("materials/" + lower(base) + ".vtf", header, 0, 64) && header.size() >= 56)
+          std::memcpy(&format, header.data() + 52, 4);
+        examples += "      " + m.name + " (" + kv.shader + ", $basetexture " + base + ", vtf format " +
+                    std::to_string(format) + (m.candidates.empty() ? ", no hash" : ", not uploaded") + ")\n";
+      }
+    }
+    if (noCandidates + notUploaded)
+      fprintf(out, "   BSP materials unresolved: %u without a texture hash, %u not uploaded\n%s", noCandidates,
+              notUploaded, examples.c_str());
+  }
   fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
           int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
   fprintf(out, "   BSP lights: %zu static (left to the engine: styled %u, 3D skybox %u, other types %u)\n",

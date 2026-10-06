@@ -168,6 +168,56 @@ void addVpk(const std::wstring &dirFile) {
     g_paths.push_back({{}, std::move(vpk)});
 }
 
+// GMod's own file system (filesystem_stdio IBaseFileSystem, VBaseFileSystem011)
+// for what the proxy's index lacks: workshop addons (steamapps/workshop/.gma,
+// LZMA legacy archives), mounted games, downloads. Slots: Read 0, Open 2,
+// Close 3, Seek 4, Tell 5 (Size's two overloads are not relied on).
+void *engineFileSystem() {
+  static void *fs = nullptr;
+  if (!fs) {
+    using CreateInterfaceFn = void *(*)(const char *, int *);
+    HMODULE module = GetModuleHandleA("filesystem_stdio.dll");
+    auto factory = module ? reinterpret_cast<CreateInterfaceFn>(GetProcAddress(module, "CreateInterface")) : nullptr;
+    fs = factory ? factory("VBaseFileSystem011", nullptr) : nullptr;
+  }
+  return fs;
+}
+
+bool engineRead(const std::string &path, std::vector<uint8_t> *out, uint64_t offset, uint64_t length,
+                uint64_t *size) {
+  void *fs = engineFileSystem();
+  if (!fs)
+    return false;
+  void **vt = *static_cast<void ***>(fs);
+  using OpenFn = void *(*)(void *, const char *, const char *, const char *);
+  using CloseFn = void (*)(void *, void *);
+  using SeekFn = void (*)(void *, void *, long long, int);
+  using TellFn = unsigned int (*)(void *, void *);
+  using ReadFn = int (*)(void *, void *, int, void *);
+  void *file = reinterpret_cast<OpenFn>(vt[2])(fs, path.c_str(), "rb", "GAME");
+  if (!file)
+    return false;
+  reinterpret_cast<SeekFn>(vt[4])(fs, file, 0, 2); // FILESYSTEM_SEEK_TAIL
+  const uint64_t total = reinterpret_cast<TellFn>(vt[5])(fs, file);
+  bool ok = true;
+  if (size)
+    *size = total;
+  if (out) {
+    ok = offset <= total;
+    length = ok ? std::min<uint64_t>(length, total - offset) : 0;
+    out->resize(size_t(length));
+    reinterpret_cast<SeekFn>(vt[4])(fs, file, (long long)offset, 0); // FILESYSTEM_SEEK_HEAD
+    for (uint64_t done = 0; ok && done < length;) {
+      const int chunk = int(std::min<uint64_t>(length - done, 64u << 20));
+      const int got = reinterpret_cast<ReadFn>(vt[0])(fs, out->data() + done, chunk, file);
+      ok = got == chunk;
+      done += got > 0 ? uint64_t(got) : 0;
+    }
+  }
+  reinterpret_cast<CloseFn>(vt[3])(fs, file);
+  return ok;
+}
+
 void index() {
   if (g_indexed)
     return;
@@ -258,7 +308,7 @@ bool size(const std::string &path, uint64_t &out) {
         return true;
       }
   }
-  return false;
+  return engineRead(key, nullptr, 0, 0, &out);
 }
 
 bool read(const std::string &path, std::vector<uint8_t> &out, uint64_t offset, uint64_t length) {
@@ -280,7 +330,7 @@ bool read(const std::string &path, std::vector<uint8_t> &out, uint64_t offset, u
       if (auto it = p.vpk->entries.find(key); it != p.vpk->entries.end())
         return p.vpk->read(it->second, out, offset, length);
   }
-  return false;
+  return engineRead(key, &out, offset, length, nullptr);
 }
 
 std::wstring locate(const std::string &path) {
