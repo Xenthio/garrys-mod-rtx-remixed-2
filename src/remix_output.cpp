@@ -57,7 +57,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -387,8 +387,25 @@ struct Instance {
   std::vector<remixapi_Transform> bones; // skinned instances
   float transform[3][4];
   uint64_t view;
+  int halo = -1; // halo source (g_haloGroups index), not a scene instance
 };
 std::vector<Instance> g_instances;
+
+// Garry's Mod halos (halo.lua), recognised from their draw sequence per entry:
+// the entities re-drawn with stencil ALWAYS/REPLACE (the sources), a
+// full-screen fill in the halo colour where stencil == 1 (closes the group),
+// then DrawPasses + 1 full-screen quads of the blurred image where stencil
+// != 1. D3D rasterizes none of it here: the sources go to the runtime as halo
+// instances (remixapi_InstanceInfoHaloEXT). Blur sizes are not observable
+// (shader constants of off-screen passes): halo.Add's default is used.
+struct HaloGroup {
+  float color[3];
+  uint32_t passes = 0;
+  bool additive = true, ignoreZ = false;
+};
+std::vector<HaloGroup> g_haloGroups; // closed groups of this frame
+uint32_t g_haloOpenSources = 0;      // sources since the last fill
+bool g_haloOpenIgnoreZ = false;
 
 struct View {
   std::vector<std::array<float, 3>> ambientUp; // +Z ambient cube of lit models in this view
@@ -655,6 +672,14 @@ void captureUi(const Draw &d) {
   remixapi_UITextureHandle texture = 0;
   if (d.texture0 && !(texture = uiTextureFor(d.texture0))) {
     ++g_stats.uiNoTexture; // render-target sampling (post-processing): not UI
+    // A halo's blurred image, composited once per pass outside the sources.
+    if (stencilTested && d.stencilFunc == D3DCMP_NOTEQUAL && !g_haloGroups.empty()) {
+      ++g_haloGroups.back().passes;
+      // pp/add adds (destination ONE); pp/sub is a Modulate: the runtime's
+      // non-additive halo multiplies likewise.
+      if (d.dstBlend != D3DBLEND_ONE)
+        g_haloGroups.back().additive = false;
+    }
     return;
   }
   // Indices first (the declared vertex range may cover a whole buffer).
@@ -736,6 +761,16 @@ void captureUi(const Draw &d) {
     const float w = std::min(x1, float(g_displayWidth)) - std::max(x0, 0.0f);
     const float h = std::min(y1, float(g_displayHeight)) - std::max(y0, 0.0f);
     if (w > 0 && h > 0 && w * h >= 0.9f * float(g_displayWidth) * float(g_displayHeight)) {
+      if (d.stencilFunc == D3DCMP_EQUAL && g_haloOpenSources) {
+        HaloGroup group;
+        const uint32_t c = g_uiVertices[base].color; // R in the low byte
+        group.color[0] = float(c & 255) / 255, group.color[1] = float((c >> 8) & 255) / 255,
+        group.color[2] = float((c >> 16) & 255) / 255;
+        group.ignoreZ = g_haloOpenIgnoreZ;
+        g_haloGroups.push_back(group);
+        g_haloOpenSources = 0;
+        g_haloOpenIgnoreZ = false;
+      }
       g_uiVertices.resize(base);
       ++g_stats.uiStencil;
       return;
@@ -1526,6 +1561,13 @@ void onDraw(const Draw &d) {
     std::memcpy(inst.transform, d.vsConstants + kRegModel * 4, sizeof(inst.transform));
   }
   inst.view = viewKey;
+  if (d.stencil && d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
+    inst.halo = int(g_haloGroups.size()); // the group its fill will close
+    ++g_haloOpenSources;
+    g_haloOpenIgnoreZ |= !d.depthTest;
+    g_instances.push_back(inst);
+    return; // a re-draw: no part in lighting estimates
+  }
   g_instances.push_back(inst);
   if (boneCount) // studio models: their ambient cube samples the surrounding (sky) light
     view.ambientUp.push_back({d.vsConstants[kRegAmbientUp * 4], d.vsConstants[kRegAmbientUp * 4 + 1],
@@ -1894,6 +1936,33 @@ void onPresent() {
           for (auto &bone : inst.bones)
             premultiply(viewModelTransform, bone.matrix);
       }
+      if (inst.halo >= 0) {
+        // Sources whose fill never came are some other stencil effect.
+        if (size_t(inst.halo) >= g_haloGroups.size())
+          continue;
+        const HaloGroup &group = g_haloGroups[inst.halo];
+        remixapi_InstanceInfoBoneTransformsEXT haloBones = {};
+        haloBones.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+        haloBones.boneTransforms_values = inst.bones.data();
+        haloBones.boneTransforms_count = uint32_t(inst.bones.size());
+        remixapi_InstanceInfoHaloEXT halo = {};
+        halo.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_HALO_EXT;
+        halo.pNext = inst.bones.empty() ? nullptr : &haloBones;
+        halo.color = {group.color[0], group.color[1], group.color[2]};
+        halo.blurX = halo.blurY = 2; // halo.Add's default
+        halo.passes = std::max(group.passes, 1u);
+        halo.additive = group.additive;
+        halo.ignoreZ = group.ignoreZ;
+        remixapi_InstanceInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+        info.pNext = &halo;
+        info.mesh = inst.mesh;
+        std::memcpy(info.transform.matrix, inst.transform, sizeof(info.transform.matrix));
+        info.doubleSided = 1;
+        g_api.DrawInstance(&info);
+        ++g_stats.haloSources;
+        continue;
+      }
       struct {
         remixapi_MeshHandle mesh;
         float transform[12];
@@ -2105,6 +2174,10 @@ void onPresent() {
     g_api.Present(nullptr);
   }
   g_instances.clear();
+  g_stats.haloGroups += uint32_t(g_haloGroups.size());
+  g_haloGroups.clear();
+  g_haloOpenSources = 0;
+  g_haloOpenIgnoreZ = false;
   g_views.clear();
   g_worldViews.clear();
   g_viewOrder = 0;
@@ -2442,6 +2515,8 @@ void dumpStatistics(FILE *out) {
           g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
           g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f,
           g_stats.additiveBlack.exchange(0) / f);
+  fprintf(out, "   halos per frame: %.2f groups, %.2f source instances\n", g_stats.haloGroups.exchange(0) / f,
+          g_stats.haloSources.exchange(0) / f);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",
           g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, g_stats.uiStencil.exchange(0) / f, [] {
             std::lock_guard<std::mutex> lock(g_textureLock);

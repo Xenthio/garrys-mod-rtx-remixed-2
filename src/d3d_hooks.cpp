@@ -788,6 +788,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.stencil = g_renderStates[D3DRS_STENCILENABLE] != 0;
   d.stencilFunc = g_renderStates[D3DRS_STENCILFUNC];
   d.stencilPass = g_renderStates[D3DRS_STENCILPASS];
+  d.depthTest = g_renderStates[D3DRS_ZENABLE] != D3DZB_FALSE && g_renderStates[D3DRS_ZFUNC] != D3DCMP_ALWAYS;
   d.forkCategories = g_renderStates[42]; // unused by D3D9; dxvk-remix fork category tag
   d.elements = decl->second.data();
   d.declaration = g_decl;
@@ -1180,6 +1181,8 @@ HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
     g_renderStates[D3DRS_COLORWRITEENABLE] = 0xf;
     g_renderStates[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
     g_renderStates[D3DRS_STENCILPASS] = D3DSTENCILOP_KEEP;
+    g_renderStates[D3DRS_ZENABLE] = D3DZB_TRUE;
+    g_renderStates[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
     g_renderStates[D3DRS_SRCBLEND] = D3DBLEND_ONE;
     g_renderStates[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
     g_renderStates[D3DRS_BLENDOP] = D3DBLENDOP_ADD;

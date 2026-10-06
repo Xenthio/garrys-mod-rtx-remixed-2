@@ -55,6 +55,7 @@ struct Draw {
   bool stencil = false;                 // D3DRS_STENCILENABLE
   uint32_t stencilFunc = D3DCMP_ALWAYS; // D3DRS_STENCILFUNC
   uint32_t stencilPass = D3DSTENCILOP_KEEP; // D3DRS_STENCILPASS
+  bool depthTest = true;                // D3DRS_ZENABLE and ZFUNC != ALWAYS
   uint32_t forkCategories = 0; // dxvk-remix fork InstanceCategories (render state 42, set by l4d2-rtx)
 };
 
