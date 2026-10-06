@@ -28,10 +28,14 @@ namespace {
 //     51 GetLevelName() -> const char *
 //   CVEfx (VEngineEffects001): 6 int CL_GetActiveDLights(dlight_t *list[32])
 //   CShadowMgr (VEngineShadowMgr002): 1 DestroyShadow(ShadowHandle_t),
-//     16 UpdateFlashlightState(ShadowHandle_t, const FlashlightState_t &)
+//     16 UpdateFlashlightState(ShadowHandle_t, const FlashlightState_t &),
+//     23 GMOD_StartFlashLight() -> first flashlight to render (0xffff: none;
+//        what r_flashlightrender 0 returns)
 constexpr uintptr_t kClientVtable = 0x3a3078, kLightStyleValue = 0x7f770, kGetLevelName = 0x7ede0;
 constexpr uintptr_t kEffectsVtable = 0x3cd0f8, kGetActiveDLights = 0x143320;
-constexpr uintptr_t kShadowMgrVtable = 0x3cd330, kDestroyShadow = 0x149d40, kUpdateFlashlightState = 0x1506a0;
+constexpr uintptr_t kShadowMgrVtable = 0x3cd330, kDestroyShadow = 0x149d40, kUpdateFlashlightState = 0x1506a0,
+                    kStartFlashlight = 0x14b3a0;
+constexpr unsigned kSlotStartFlashlight = 23;
 constexpr unsigned kSlotLightStyleValue = 44, kSlotGetLevelName = 51, kSlotGetActiveDLights = 6, kSlotDestroyShadow = 1,
                    kSlotUpdateFlashlightState = 16;
 constexpr int kMaxDLights = 32;
@@ -120,6 +124,26 @@ uintptr_t updateFlashlightState(void *self, uint16_t handle, const void *state) 
   using Fn = uintptr_t (*)(void *, uint16_t, const void *);
   return reinterpret_cast<Fn>(g_updateOriginal.load(std::memory_order_relaxed))(self, handle, state);
 }
+// The engine's own flashlight rendering re-draws every lit surface additively
+// with the cookie as its first texture; captured, those draws pasted the
+// cookie over the meshes. The projected textures are path traced, so the
+// engine iterates none (as with r_flashlightrender 0, without the cvar).
+// OPENREMIX_PROXY_FLASHLIGHT_RASTER=1 keeps the engine's passes.
+std::atomic<void *> g_startFlashlightOriginal{nullptr};
+std::atomic<uint32_t> g_flashlightIterationsSuppressed{0};
+uintptr_t startFlashlight(void *self) {
+  static const bool keep = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_FLASHLIGHT_RASTER", v, sizeof(v)) && v[0] == '1';
+  }();
+  if (keep) {
+    using Fn = uintptr_t (*)(void *);
+    return reinterpret_cast<Fn>(g_startFlashlightOriginal.load(std::memory_order_relaxed))(self);
+  }
+  g_flashlightIterationsSuppressed.fetch_add(1, std::memory_order_relaxed);
+  return 0xffff;
+}
+
 uintptr_t destroyShadow(void *self, uint16_t handle) {
   {
     std::lock_guard<std::mutex> lock(g_projectedLock);
@@ -312,6 +336,11 @@ bool install() {
   else {
     g_projectedStatus = "ok (hooked)";
     g_projected = true;
+    // Only once the lights are taken at the source.
+    if (!slotAt(g_shadowMgr, kSlotStartFlashlight, kStartFlashlight) ||
+        !hookSlot(g_shadowMgr, kSlotStartFlashlight, reinterpret_cast<void *>(&startFlashlight),
+                  g_startFlashlightOriginal))
+      g_projectedStatus = "ok (hooked; engine flashlight passes not suppressed)";
   }
   g_installed = g_styles || g_dlights || g_projected;
   return g_installed;
@@ -441,6 +470,8 @@ void dumpStatistics(FILE *out) {
           "dropped at map change %u\n",
           g_stats.samples.exchange(0), g_stats.published.exchange(0), pending, g_stats.updates.exchange(0),
           g_stats.destroys.exchange(0), g_stats.invalidProjected.exchange(0), g_stats.staleProjected.load());
+  fprintf(out, "   engine flashlight render iterations suppressed %u\n",
+          g_flashlightIterationsSuppressed.exchange(0));
 }
 
 } // namespace proxy::engine_lights
