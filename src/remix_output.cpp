@@ -1364,9 +1364,29 @@ void onDraw(const Draw &d) {
   // path traced (engine_lights), so the pass goes. The shadow manager's
   // virtual iterator is not what the world pass uses, so it is caught here.
   // Models get the same additive pass outside the world lists, where other
-  // additive draws are legitimate (glows, sprites): the world pass teaches
-  // which textures are cookies, and additive draws using one are dropped.
-  if (d.blend && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE) {
+  // additive draws are legitimate (glows, sprites). Two signs of the pass:
+  // the cookie as texture 0 (world-style shaders; the world pass teaches
+  // which textures are cookies), or, for models, whose pass keeps the base
+  // texture there, the same buffers and range as an opaque draw earlier in
+  // the frame (effects are drawn once). Additive is ONE/ONE, or
+  // SRCALPHA/ONE for translucent materials (decals).
+  struct {
+    const void *vertices, *indexBuffer;
+    uint32_t offset, startIndex, primCount, minIndex;
+    int baseVertex;
+    uint32_t padding; // hashed as bytes: no indeterminate padding
+    uint64_t view;
+  } drawRange = {ps.buffer, d.indices.buffer, ps.offset, d.startIndex, d.primCount, d.minIndex, d.baseVertex, 0, viewKey};
+  static std::unordered_set<uint64_t> opaqueDrawn; // render thread only
+  static uint64_t opaqueFrame = ~0ull;
+  if (opaqueFrame != g_frame) {
+    opaqueDrawn.clear();
+    opaqueFrame = g_frame;
+  }
+  const uint64_t geometryKey = fnv(&drawRange, sizeof(drawRange));
+  if (!d.blend && !ps.dynamic)
+    opaqueDrawn.insert(geometryKey);
+  if (d.blend && d.dstBlend == D3DBLEND_ONE && (d.srcBlend == D3DBLEND_ONE || d.srcBlend == D3DBLEND_SRCALPHA)) {
     static std::unordered_set<const void *> cookies; // render thread only
     static uint32_t cookieEpoch = ~0u;
     if (cookieEpoch != g_skyEpoch) { // a new map: texture pointers are reused
@@ -1376,7 +1396,7 @@ void onDraw(const Draw &d) {
     if (const auto lights = engine_lights::current(); lights && !lights->projected.empty()) {
       if (g_worldLists > 0 && d.texture0)
         cookies.insert(d.texture0);
-      if (g_worldLists > 0 || cookies.count(d.texture0)) {
+      if (g_worldLists > 0 || cookies.count(d.texture0) || (!ps.dynamic && opaqueDrawn.count(geometryKey))) {
         ++g_stats.flashlightPasses;
         return;
       }
