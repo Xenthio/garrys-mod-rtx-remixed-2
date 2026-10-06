@@ -1772,7 +1772,7 @@ void storeCpuCopy(const void *texture, uint32_t width, uint32_t height, D3DFORMA
 }
 
 void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
-                     uint32_t pitch) {
+                     uint32_t pitch, uint32_t levels) {
   if (!g_ready || !data || !width || !height)
     return;
   remixapi_Format remixFormat;
@@ -1829,6 +1829,13 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   info.format = remixFormat;
   info.data = pixels.data();
   info.dataSize = pixels.size();
+  // Only level 0 is captured: the runtime builds the chain for textures the
+  // game made mipmapped (single-level ones, e.g. lookup gradients, stay so).
+  remixapi_TextureInfoGenerateMipsEXT mips = {};
+  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
+  mips.generate = true;
+  if (levels > 1)
+    info.pNext = &mips;
   const bool created = g_api.CreateTexture(&info, &t->texture) == REMIXAPI_ERROR_CODE_SUCCESS;
   ++g_stats.textures;
   if (created) {

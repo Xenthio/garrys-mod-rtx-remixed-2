@@ -268,7 +268,7 @@ HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level)
       const bool whole = !l.hasRect || (l.rect.left == 0 && l.rect.top == 0 && UINT(l.rect.right) >= desc.Width &&
                                         UINT(l.rect.bottom) >= desc.Height);
       if (whole)
-        remix::onTextureUpload(self, desc.Width, desc.Height, desc.Format, l.bits, l.pitch);
+        remix::onTextureUpload(self, desc.Width, desc.Height, desc.Format, l.bits, l.pitch, self->GetLevelCount());
       else {
         ++g_stats.partialTextureLocks;
         remix::onTexturePartialUpload(self, desc.Width, desc.Height, desc.Format, l.rect, l.bits, l.pitch);
@@ -327,7 +327,8 @@ HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self) {
                                       UINT(l.rect.bottom) >= desc.Height);
     if (IDirect3DTexture9 *texture = levelZeroTexture(self)) {
       if (whole)
-        remix::onTextureUpload(texture, desc.Width, desc.Height, desc.Format, l.bits, l.pitch);
+        remix::onTextureUpload(texture, desc.Width, desc.Height, desc.Format, l.bits, l.pitch,
+                               texture->GetLevelCount());
       else {
         ++g_stats.partialTextureLocks;
         remix::onTexturePartialUpload(texture, desc.Width, desc.Height, desc.Format, l.rect, l.bits, l.pitch);

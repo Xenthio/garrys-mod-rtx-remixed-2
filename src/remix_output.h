@@ -64,9 +64,9 @@ void onDeviceCreated(IDirect3DDevice9 *device);
 void onDraw(const Draw &draw);
 
 // Texture contents: level 0 of a 2D texture was written (`pitch` = bytes per
-// row, or per block row for BC formats).
+// row, or per block row for BC formats; `levels`: the texture's mip count).
 void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
-                     uint32_t pitch);
+                     uint32_t pitch, uint32_t levels);
 // A sub-rectangle of level 0 was written (`data` points at the rect's first row).
 void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const RECT &rect,
                             const uint8_t *data, uint32_t pitch);
