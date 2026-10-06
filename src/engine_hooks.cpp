@@ -1,4 +1,6 @@
 #include "engine_hooks.h"
+#include "engine_lights.h"
+#include "engine_patches.h"
 
 #include <windows.h>
 
@@ -70,9 +72,14 @@ extern "C" {
 void *openremix_drawWorldListsOriginal = nullptr;
 void openremix_worldListsBegin() {
   proxy::engine::noteLevel();
+  proxy::engine_lights::sample();
+  proxy::engine_patches::beginWorldLists();
   proxy::engine::marker("openremix:world_lists 1");
 }
-void openremix_worldListsEnd() { proxy::engine::marker("openremix:world_lists 0"); }
+void openremix_worldListsEnd() {
+  proxy::engine::marker("openremix:world_lists 0");
+  proxy::engine_patches::endWorldLists();
+}
 void openremix_drawWorldLists();
 }
 asm(R"(
@@ -149,6 +156,8 @@ bool install() {
     return false;
   openremix_drawWorldListsOriginal =
       patch(*static_cast<void ***>(renderView), 13, reinterpret_cast<void *>(&openremix_drawWorldLists));
+  engine_patches::install();
+  engine_lights::install();
   done = true;
   return true;
 }

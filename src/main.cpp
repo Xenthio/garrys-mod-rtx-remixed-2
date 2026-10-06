@@ -2,6 +2,8 @@
 // shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "d3d_hooks.h"
+#include "engine_lights.h"
+#include "engine_patches.h"
 #include "remix_output.h"
 #include "vtable_proxy.h"
 
@@ -367,6 +369,8 @@ DWORD WINAPI statisticsThread(void *) {
     FILE *f = _wfopen((g_dir + L"\\shaderapi_proxy_slots.txt").c_str(), L"w");
     if (f) {
       proxy::d3d::dumpStatistics(f);
+      proxy::engine_patches::dumpStatistics(f);
+      proxy::engine_lights::dumpStatistics(f);
       proxy::dumpStatistics(f);
       fclose(f);
     }
