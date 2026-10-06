@@ -1,5 +1,6 @@
 #include <map>
 #include "remix_output.h"
+#include "remix_ui.h"
 #include "sky_faces.h"
 #include "bsp_world.h"
 #include "dxvk_hash.h"
@@ -898,6 +899,7 @@ bool startRemix() {
   startup.hwnd = g_gameWindow;
   if (g_api.Startup(&startup) != REMIXAPI_ERROR_CODE_SUCCESS)
     return false;
+  remix_ui::install(g_gameWindow, &g_api);
   // OPENREMIX_PROXY_BACKEND=pathtrace|raster (runtime default: raster).
   char backend[32] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_BACKEND", backend, sizeof(backend)))
@@ -1905,6 +1907,7 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   dropped for the BSP world: static prop draws %.1f, overlay draws %.1f\n",
           g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f);
   bsp::dumpStatistics(out);
+  remix_ui::dumpStatistics(out);
   {
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
     for (const auto &[hash, n] : g_keptWorldTextures)
