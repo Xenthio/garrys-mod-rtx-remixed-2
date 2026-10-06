@@ -91,6 +91,17 @@ bool onMarker(const char *text);
 // Supplies the real shader API object for matrix queries (GetMatrix).
 void setShaderApi(void *realShaderApi);
 
+// The current view and projection (row-major D3DX), from the shader API.
+bool viewMatrices(float view[16], float projection[16]);
+
+// Whether a draw belongs to the 2D skybox (dynamic-buffer opaque draws inside
+// IVRenderView::DrawWorldLists): captured by the D3D hooks, not submitted.
+bool isSkyDraw(const Draw &draw);
+
+// The 2D skybox as six BGRA faces (proxy::sky::faceBasis, kFaceSize square):
+// becomes the dome light (environment and background).
+void setSkyFaces(const uint8_t *const faces[6]);
+
 void dumpStatistics(FILE *out);
 
 } // namespace proxy::remix

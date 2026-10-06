@@ -2,6 +2,8 @@
 #include <initguid.h>
 
 #include "d3d_hooks.h"
+#include "engine_hooks.h"
+#include "sky_faces.h"
 
 #include "bsp_world.h"
 #include "remix_output.h"
@@ -439,6 +441,11 @@ bool occludersEnabled() {
   return enabled;
 }
 
+namespace skycap {
+void finish(IDirect3DDevice9 *dev);
+void release();
+} // namespace skycap
+
 void refreshBackBuffer(IDirect3DDevice9 *dev) {
   IDirect3DSurface9 *bb = nullptr;
   if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) && bb) {
@@ -463,11 +470,14 @@ HRESULT STDMETHODCALLTYPE present(IDirect3DDevice9 *dev, const RECT *src, const 
   }();
   const HRESULT hr = presentD3D || !remix::enabled() ? g_present(dev, src, dst, wnd, dirty) : D3D_OK;
   g_stats.usPresent += nowUs() - t0;
+  skycap::finish(dev);
+  engine::install();
   remix::onPresent();
   return hr;
 }
 
 HRESULT STDMETHODCALLTYPE reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp) {
+  skycap::release(); // D3DPOOL_DEFAULT targets must go before Reset
   remix::onCreateDevice(nullptr, pp);
   const HRESULT hr = g_reset(dev, pp);
   if (SUCCEEDED(hr))
@@ -725,11 +735,13 @@ HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, 
   return hr;
 }
 
-void captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numVertices, UINT startIndex,
+// Hands the draw to the Remix output; returns whether it is a 2D skybox
+// draw instead (captured into the sky faces, not submitted).
+bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numVertices, UINT startIndex,
                  UINT primCount) {
   auto decl = g_declElements.find(g_decl);
   if (decl == g_declElements.end())
-    return;
+    return false;
   remix::Draw d;
   d.type = type;
   d.baseVertex = baseVertex;
@@ -776,15 +788,225 @@ void captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   if (it != g_shadows.end())
     d.indices = {it->second.data.data(), uint32_t(it->second.data.size()), it->second.is32, g_indices,
                  it->second.version, it->second.dynamic};
+  if (remix::isSkyDraw(d))
+    return true;
   remix::onDraw(d);
+  return false;
 }
+
+// --- 2D skybox capture -----------------------------------------------------
+// GMod's 2D skybox (painted or textured) is drawn by its own shaders. Once
+// every kSkyInterval frames its draws (dynamic-buffer draws inside
+// DrawWorldLists, remix::isSkyDraw) are rasterized again into six
+// world-aligned cube faces around the camera, with the game's shaders and
+// constants and only the matrix registers replaced; the faces are read back
+// at Present and become the Remix dome (remix::setSkyFaces).
+namespace skycap {
+constexpr uint64_t kSkyInterval = 30;
+struct Faces {
+  IDirect3DDevice9 *device = nullptr;
+  IDirect3DSurface9 *targets[6] = {}, *readback[6] = {};
+  bool failed = false, captured = false;
+  uint64_t clearedFrame = ~0ull, lastCapture = 0;
+  bool anyCapture = false;
+} g;
+
+void release() {
+  for (int f = 0; f < 6; ++f) {
+    if (g.targets[f])
+      g.targets[f]->Release();
+    if (g.readback[f])
+      g.readback[f]->Release();
+    g.targets[f] = g.readback[f] = nullptr;
+  }
+  g.device = nullptr;
+  g.captured = false;
+}
+
+bool ready(IDirect3DDevice9 *dev) {
+  if (g.device == dev && g.targets[0])
+    return true;
+  if (g.failed)
+    return false;
+  release();
+  for (int f = 0; f < 6; ++f) {
+    if (FAILED(dev->CreateRenderTarget(sky::kFaceSize, sky::kFaceSize, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE,
+                                       &g.targets[f], nullptr)) ||
+        FAILED(dev->CreateOffscreenPlainSurface(sky::kFaceSize, sky::kFaceSize, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM,
+                                                &g.readback[f], nullptr))) {
+      release();
+      g.failed = true;
+      return false;
+    }
+  }
+  g.device = dev;
+  return true;
+}
+
+// Row-major 4x4, row vectors (D3DX): out = a * b.
+void multiply(const float *a, const float *b, float *out) {
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      float v = 0;
+      for (int k = 0; k < 4; ++k)
+        v += a[r * 4 + k] * b[k * 4 + c];
+      out[r * 4 + c] = v;
+    }
+}
+
+bool invert(const float *m, float *out) {
+  float a[4][8];
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 8; ++c)
+      a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r ? 1.f : 0.f);
+  for (int c = 0; c < 4; ++c) {
+    int pivot = c;
+    for (int r = c + 1; r < 4; ++r)
+      if (std::fabs(a[r][c]) > std::fabs(a[pivot][c]))
+        pivot = r;
+    if (std::fabs(a[pivot][c]) < 1e-12f)
+      return false;
+    for (int k = 0; k < 8; ++k)
+      std::swap(a[c][k], a[pivot][k]);
+    const float inv = 1 / a[c][c];
+    for (int k = 0; k < 8; ++k)
+      a[c][k] *= inv;
+    for (int r = 0; r < 4; ++r)
+      if (r != c && a[r][c] != 0) {
+        const float f = a[r][c];
+        for (int k = 0; k < 8; ++k)
+          a[r][k] -= f * a[c][k];
+      }
+  }
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c)
+      out[r * 4 + c] = a[r][c + 4];
+  return true;
+}
+
+// Right-handed D3DX view * projection for a face around `eye` (90 degrees).
+void faceViewProjection(int face, const float eye[3], float *out) {
+  float right[3], up[3], forward[3];
+  sky::faceBasis(face, right, up, forward);
+  float view[16] = {};
+  for (int i = 0; i < 3; ++i) {
+    view[i * 4 + 0] = right[i];
+    view[i * 4 + 1] = up[i];
+    view[i * 4 + 2] = -forward[i];
+  }
+  for (int c = 0; c < 3; ++c)
+    view[12 + c] = -(eye[0] * view[c] + eye[1] * view[4 + c] + eye[2] * view[8 + c]);
+  view[15] = 1;
+  constexpr float n = 4, f = 1e6f;
+  const float projection[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, f / (n - f), -1, 0, 0, n * f / (n - f), 0};
+  multiply(view, projection, out);
+}
+
+// Register block (c[k] = column k of the row-vector matrix) <-> matrix.
+void fromRegisters(const float *regs, float *m) {
+  for (int k = 0; k < 4; ++k)
+    for (int j = 0; j < 4; ++j)
+      m[j * 4 + k] = regs[k * 4 + j];
+}
+void toRegisters(const float *m, float *regs) {
+  for (int k = 0; k < 4; ++k)
+    for (int j = 0; j < 4; ++j)
+      regs[k * 4 + j] = m[j * 4 + k];
+}
+
+bool due() { return !g.anyCapture || g_d3dFrame - g.lastCapture >= kSkyInterval || g.clearedFrame == g_d3dFrame; }
+
+void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numVertices,
+             UINT startIndex, UINT primCount) {
+  if (!due() || !ready(dev))
+    return;
+  float view[16], projection[16];
+  if (!remix::viewMatrices(view, projection))
+    return;
+  float eye[3];
+  for (int i = 0; i < 3; ++i)
+    eye[i] = -(view[12] * view[i * 4] + view[13] * view[i * 4 + 1] + view[14] * view[i * 4 + 2]);
+  float mvp[16], viewProj[16], inverseViewProj[16], model[16];
+  fromRegisters(&g_vsConstants[4 * 4], mvp);
+  fromRegisters(&g_vsConstants[8 * 4], viewProj);
+  if (!invert(viewProj, inverseViewProj))
+    return;
+  multiply(mvp, inverseViewProj, model);
+
+  float saved[8 * 4];
+  std::memcpy(saved, &g_vsConstants[4 * 4], sizeof(saved));
+  IDirect3DSurface9 *oldTarget = nullptr, *oldDepth = nullptr;
+  dev->GetRenderTarget(0, &oldTarget);
+  dev->GetDepthStencilSurface(&oldDepth);
+  D3DVIEWPORT9 oldViewport;
+  dev->GetViewport(&oldViewport);
+  const DWORD zEnable = g_renderStates[D3DRS_ZENABLE], zWrite = g_renderStates[D3DRS_ZWRITEENABLE],
+              scissor = g_renderStates[D3DRS_SCISSORTESTENABLE];
+  dev->SetDepthStencilSurface(nullptr);
+  g_setRenderState(dev, D3DRS_ZENABLE, FALSE);
+  g_setRenderState(dev, D3DRS_ZWRITEENABLE, FALSE);
+  g_setRenderState(dev, D3DRS_SCISSORTESTENABLE, FALSE);
+  const D3DVIEWPORT9 faceViewport = {0, 0, sky::kFaceSize, sky::kFaceSize, 0, 1};
+  for (int face = 0; face < 6; ++face) {
+    g_setRenderTarget(dev, 0, g.targets[face]);
+    dev->SetViewport(&faceViewport);
+    if (g.clearedFrame != g_d3dFrame)
+      dev->Clear(0, nullptr, D3DCLEAR_TARGET, 0, 1, 0);
+    float vp[16], m[16], regs[8 * 4];
+    faceViewProjection(face, eye, vp);
+    multiply(model, vp, m);
+    toRegisters(m, regs);
+    toRegisters(vp, regs + 16);
+    g_setVertexShaderConstantF(dev, 4, regs, 8);
+    g_drawIndexedPrimitive(dev, type, baseVertex, minIndex, numVertices, startIndex, primCount);
+  }
+  g.clearedFrame = g_d3dFrame;
+  g.captured = true;
+  g_setVertexShaderConstantF(dev, 4, saved, 8);
+  g_setRenderTarget(dev, 0, oldTarget);
+  dev->SetDepthStencilSurface(oldDepth);
+  dev->SetViewport(&oldViewport);
+  g_setRenderState(dev, D3DRS_ZENABLE, zEnable);
+  g_setRenderState(dev, D3DRS_ZWRITEENABLE, zWrite);
+  g_setRenderState(dev, D3DRS_SCISSORTESTENABLE, scissor);
+  if (oldTarget)
+    oldTarget->Release();
+  if (oldDepth)
+    oldDepth->Release();
+}
+
+// At Present: read this frame's faces back and hand them to the dome.
+void finish(IDirect3DDevice9 *dev) {
+  if (!g.captured || g.device != dev)
+    return;
+  g.captured = false;
+  g.anyCapture = true;
+  g.lastCapture = g_d3dFrame;
+  std::vector<uint8_t> faces[6];
+  const uint8_t *pointers[6];
+  for (int f = 0; f < 6; ++f) {
+    D3DLOCKED_RECT locked;
+    if (FAILED(dev->GetRenderTargetData(g.targets[f], g.readback[f])) ||
+        FAILED(g.readback[f]->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+      return;
+    faces[f].resize(sky::kFaceSize * sky::kFaceSize * 4);
+    for (UINT y = 0; y < sky::kFaceSize; ++y)
+      std::memcpy(faces[f].data() + y * sky::kFaceSize * 4, static_cast<uint8_t *>(locked.pBits) + y * locked.Pitch,
+                  sky::kFaceSize * 4);
+    g.readback[f]->UnlockRect();
+    pointers[f] = faces[f].data();
+  }
+  remix::setSkyFaces(pointers);
+}
+} // namespace skycap
 
 HRESULT STDMETHODCALLTYPE drawIndexedPrimitive(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex,
                                                UINT minIndex, UINT numVertices, UINT startIndex, UINT primCount) {
   ++g_stats.dip;
   g_stats.dipPrims += primCount;
   if (remix::enabled()) {
-    captureDraw(type, baseVertex, minIndex, numVertices, startIndex, primCount);
+    if (captureDraw(type, baseVertex, minIndex, numVertices, startIndex, primCount))
+      skycap::capture(dev, type, baseVertex, minIndex, numVertices, startIndex, primCount);
     // Phase 2b: Remix presents the frame, so D3D9 no longer rasterizes it.
     // OPENREMIX_PROXY_D3D_DRAWS=1 keeps the original rendering (hidden window).
     static const bool keep = [] {

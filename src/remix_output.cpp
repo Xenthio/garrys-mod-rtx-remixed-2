@@ -1,5 +1,6 @@
 #include <map>
 #include "remix_output.h"
+#include "sky_faces.h"
 #include "bsp_world.h"
 #include "dxvk_hash.h"
 #include "texture_categories.h"
@@ -978,6 +979,106 @@ bool enabled() {
 
 void setShaderApi(void *real) { g_shaderApi = real; }
 
+bool viewMatrices(float view[16], float projection[16]) {
+  if (!g_shaderApi)
+    return false;
+  getMatrix(kMatrixView, view);
+  getMatrix(kMatrixProjection, projection);
+  return true;
+}
+
+bool isSkyDraw(const Draw &d) {
+  return g_ready && g_worldLists > 0 && d.mainTarget && !d.blend && d.streams[0].dynamic && d.colorWrite;
+}
+
+// --- Sky dome ----------------------------------------------------------------
+// The captured 2D skybox, resampled to the dome's equirectangular layout
+// (u = atan2(z, x) / 2pi + 0.5, v = acos(y) / pi, identity transform: texel
+// directions are world directions) and lit at OPENREMIX_PROXY_SKY_DOME_SCALE.
+remixapi_LightHandle g_skyDome = nullptr;
+remixapi_TextureHandle g_skyTexture = nullptr;
+uint64_t g_skyTextureHash = 0;
+
+void setSkyFaces(const uint8_t *const faces[6]) {
+  if (!g_ready)
+    return;
+  constexpr uint32_t kWidth = 512, kHeight = 256, S = proxy::sky::kFaceSize;
+  float bases[6][3][3];
+  for (int f = 0; f < 6; ++f)
+    proxy::sky::faceBasis(f, bases[f][0], bases[f][1], bases[f][2]);
+  std::vector<uint8_t> rgba(kWidth * kHeight * 4);
+  for (uint32_t v = 0; v < kHeight; ++v) {
+    const float theta = (v + 0.5f) / kHeight * 3.14159265f;
+    for (uint32_t u = 0; u < kWidth; ++u) {
+      const float phi = ((u + 0.5f) / kWidth - 0.5f) * 6.28318531f;
+      const float w[3] = {std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi)};
+      int face = 0;
+      float best = -2;
+      for (int f = 0; f < 6; ++f) {
+        const float z = w[0] * bases[f][2][0] + w[1] * bases[f][2][1] + w[2] * bases[f][2][2];
+        if (z > best) {
+          best = z;
+          face = f;
+        }
+      }
+      const float x = (w[0] * bases[face][0][0] + w[1] * bases[face][0][1] + w[2] * bases[face][0][2]) / best;
+      const float y = (w[0] * bases[face][1][0] + w[1] * bases[face][1][1] + w[2] * bases[face][1][2]) / best;
+      const float px = std::clamp((x * 0.5f + 0.5f) * S - 0.5f, 0.f, S - 1.001f);
+      const float py = std::clamp((0.5f - y * 0.5f) * S - 0.5f, 0.f, S - 1.001f);
+      const uint32_t x0 = uint32_t(px), y0 = uint32_t(py);
+      const float fx = px - x0, fy = py - y0;
+      uint8_t *out = &rgba[(v * kWidth + u) * 4];
+      for (int c = 0; c < 3; ++c) {
+        auto at = [&](uint32_t xx, uint32_t yy) { return float(faces[face][(yy * S + xx) * 4 + (2 - c)]); };
+        const float value = (at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx) * (1 - fy) +
+                            (at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx) * fy;
+        out[c] = uint8_t(std::lround(value));
+      }
+      out[3] = 255;
+    }
+  }
+  const uint64_t hash = fnv(rgba.data(), rgba.size()) | 1;
+  if (hash == g_skyTextureHash)
+    return;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.hash = hash;
+  info.width = kWidth;
+  info.height = kHeight;
+  info.depth = 1;
+  info.mipLevels = 1;
+  info.format = REMIXAPI_FORMAT_R8G8B8A8_SRGB;
+  info.data = rgba.data();
+  info.dataSize = rgba.size();
+  remixapi_TextureHandle texture = nullptr;
+  if (g_api.CreateTexture(&info, &texture) != REMIXAPI_ERROR_CODE_SUCCESS)
+    return;
+  static const float domeScale = envScale("OPENREMIX_PROXY_SKY_DOME_SCALE", 1.0f);
+  wchar_t path[32];
+  std::swprintf(path, 32, L"0x%llx", static_cast<unsigned long long>(hash));
+  remixapi_LightInfoDomeEXT dome = {};
+  dome.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DOME_EXT;
+  dome.transform = {{{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}}};
+  dome.colorTexture = path;
+  remixapi_LightInfo light = {};
+  light.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+  light.pNext = &dome;
+  light.hash = 0x5b7d0e0000000001ull;
+  light.radiance = {domeScale, domeScale, domeScale};
+  remixapi_LightHandle handle = nullptr;
+  if (g_api.CreateLight(&light, &handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_api.DestroyTexture(texture);
+    return;
+  }
+  if (g_skyDome && g_skyDome != handle)
+    g_api.DestroyLight(g_skyDome);
+  if (g_skyTexture)
+    g_api.DestroyTexture(g_skyTexture);
+  g_skyDome = handle;
+  g_skyTexture = texture;
+  g_skyTextureHash = hash;
+}
+
 void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp) {
   if (!enabled() || !pp)
     return;
@@ -1595,6 +1696,8 @@ void onPresent() {
       g_api.DrawLightInstance(cached.handle);
       ++g_stats.lights;
     }
+    if (g_skyDome)
+      g_api.DrawLightInstance(g_skyDome); // the captured 2D skybox (setSkyFaces)
     g_lastLights.swap(g_frameLights);
     g_frameLights.clear();
     for (auto it = g_lights.begin(); it != g_lights.end();) {
