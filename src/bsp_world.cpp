@@ -408,7 +408,8 @@ struct World {
   bool skyTraced = false;
   float playableMins[3] = {}, playableMaxs[3] = {};
   float skyReach = 0; // farthest traced sky point from the playable bounds' centre
-  uint32_t skyTracedTriangles = 0, skyStandInTriangles = 0, skyTracedProps = 0, skyStandInProps = 0;
+  uint32_t skyTracedTriangles = 0, skyStandInTriangles = 0, skyClippedTriangles = 0, skyTracedProps = 0,
+           skyStandInProps = 0, skyCoplanarPieces = 0;
   uint64_t frames = 0;
   // Statistics.
   uint32_t faces = 0, displacements = 0, skyFaces = 0, skippedTranslucent = 0, skippedIgnored = 0, keptIgnored = 0, triangles = 0;
@@ -882,6 +883,78 @@ void skyToWorld(const float in[3], float out[3]) {
 bool insidePlayable(const Bsp &bsp, const float p[3]) {
   const int leaf = leafAt(bsp, p);
   return leaf >= 0 && size_t(leaf) < g_world.leafPlayable.size() && g_world.leafPlayable[leaf];
+}
+
+// Clips a convex polygon against the map's BSP: the pieces outside playable
+// space (solid, or beyond the map) go to `out`. `split` reports any cut or
+// drop, so an untouched polygon can keep its original vertices.
+void clipOutsidePlayable(const Bsp &bsp, int index, std::vector<remixapi_HardcodedVertex> polygon,
+                         std::vector<std::vector<remixapi_HardcodedVertex>> &out, bool &split, int depth = 0) {
+  const auto [nodes, nodeCount] = bsp.lump<Node>(kNodes);
+  const auto [planes, planeCount] = bsp.lump<Plane>(kPlanes);
+  if (polygon.size() < 3)
+    return;
+  if (index < 0) {
+    const int leaf = -1 - index;
+    if (size_t(leaf) < g_world.leafPlayable.size() && g_world.leafPlayable[leaf]) {
+      split = true;
+      return;
+    }
+    out.push_back(std::move(polygon));
+    return;
+  }
+  if (size_t(index) >= nodeCount || size_t(nodes[index].plane) >= planeCount || depth > 256) {
+    out.push_back(std::move(polygon));
+    return;
+  }
+  const Plane &plane = planes[nodes[index].plane];
+  constexpr float kEpsilon = 0.01f;
+  std::vector<float> d(polygon.size());
+  bool front = false, back = false;
+  for (size_t i = 0; i < polygon.size(); ++i) {
+    d[i] = dot(plane.normal, polygon[i].position) - plane.dist;
+    front |= d[i] > kEpsilon;
+    back |= d[i] < -kEpsilon;
+  }
+  if (!back) // on the plane counts as in front, as leafAt does
+    return clipOutsidePlayable(bsp, nodes[index].children[0], std::move(polygon), out, split, depth + 1);
+  if (!front)
+    return clipOutsidePlayable(bsp, nodes[index].children[1], std::move(polygon), out, split, depth + 1);
+  split = true;
+  auto lerp = [](const remixapi_HardcodedVertex &a, const remixapi_HardcodedVertex &b, float t) {
+    remixapi_HardcodedVertex v = a;
+    for (int k = 0; k < 3; ++k) {
+      v.position[k] = a.position[k] + (b.position[k] - a.position[k]) * t;
+      v.normal[k] = a.normal[k] + (b.normal[k] - a.normal[k]) * t;
+    }
+    for (int k = 0; k < 2; ++k)
+      v.texcoord[k] = a.texcoord[k] + (b.texcoord[k] - a.texcoord[k]) * t;
+    v.color = 0;
+    for (int shift = 0; shift < 32; shift += 8) {
+      const float ca = float((a.color >> shift) & 255), cb = float((b.color >> shift) & 255);
+      v.color |= uint32_t(std::lround(ca + (cb - ca) * t)) << shift;
+    }
+    const float length = std::sqrt(dot(v.normal, v.normal));
+    if (length > 1e-6f)
+      for (float &n : v.normal)
+        n /= length;
+    return v;
+  };
+  std::vector<remixapi_HardcodedVertex> frontPart, backPart;
+  for (size_t i = 0; i < polygon.size(); ++i) {
+    const size_t j = (i + 1) % polygon.size();
+    if (d[i] >= 0)
+      frontPart.push_back(polygon[i]);
+    if (d[i] < 0)
+      backPart.push_back(polygon[i]);
+    if ((d[i] >= 0) != (d[j] >= 0)) {
+      const auto v = lerp(polygon[i], polygon[j], d[i] / (d[i] - d[j]));
+      frontPart.push_back(v);
+      backPart.push_back(v);
+    }
+  }
+  clipOutsidePlayable(bsp, nodes[index].children[0], std::move(frontPart), out, split, depth + 1);
+  clipOutsidePlayable(bsp, nodes[index].children[1], std::move(backPart), out, split, depth + 1);
 }
 
 void noteSkyReach(const float p[3]) {
@@ -1417,6 +1490,69 @@ bool build(const Bsp &bsp) {
   };
 
   const Model &world = models[0];
+  // The map's own visible flat faces (planes and bounds): a traced skybox's
+  // copies of the map boundary that lie on them would z-fight with them.
+  struct WorldPlane {
+    float normal[3], dist, mins[3], maxs[3];
+  };
+  std::vector<WorldPlane> worldPlanes;
+  if (g_world.skyTraced)
+    for (int32_t f = world.firstFace; f < world.firstFace + world.numFaces && size_t(f) < faceCount; ++f) {
+      const Face &face = faces[f];
+      if (face.texInfo < 0 || size_t(face.texInfo) >= texInfoCount || face.numEdges < 3 || face.dispInfo >= 0 ||
+          size_t(face.plane) >= planeCount || skyFace[size_t(f)])
+        continue;
+      if (texInfos[face.texInfo].flags & (kSurfSky2D | kSurfSky | kSurfNoDraw | kSurfHint | kSurfSkip | kSurfTrans))
+        continue;
+      WorldPlane w;
+      const float sign = face.side ? -1.0f : 1.0f;
+      for (int k = 0; k < 3; ++k)
+        w.normal[k] = planes[face.plane].normal[k] * sign;
+      w.dist = planes[face.plane].dist * sign;
+      bool valid = true;
+      for (int e = 0; e < face.numEdges && valid; ++e) {
+        const size_t se = size_t(face.firstEdge + e);
+        const int32_t edge = se < surfEdgeCount ? surfEdges[se] : 0;
+        const size_t ei = size_t(edge < 0 ? -edge : edge);
+        valid = se < surfEdgeCount && ei < edgeCount && edges[ei][edge < 0 ? 1 : 0] < vertexCount;
+        if (!valid)
+          break;
+        const auto &v = vertexes[edges[ei][edge < 0 ? 1 : 0]];
+        for (int k = 0; k < 3; ++k) {
+          w.mins[k] = e ? std::min(w.mins[k], v[k]) : v[k];
+          w.maxs[k] = e ? std::max(w.maxs[k], v[k]) : v[k];
+        }
+      }
+      if (valid && !inSky(w.mins))
+        worldPlanes.push_back(w);
+    }
+  // Whether a skybox piece lies on (within a sky unit of) a world face's plane, over that face.
+  auto onWorldFace = [&](const std::vector<remixapi_HardcodedVertex> &piece) {
+    const float *a = piece[0].position, *b = piece[1].position, *c = piece[2].position;
+    const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float length = std::sqrt(dot(n, n));
+    if (length < 1e-6f)
+      return false;
+    for (float &x : n)
+      x /= length;
+    float centroid[3] = {};
+    for (const auto &v : piece)
+      for (int k = 0; k < 3; ++k)
+        centroid[k] += v.position[k] / float(piece.size());
+    const float tolerance = g_world.skyScale;
+    for (const auto &w : worldPlanes) {
+      if (std::fabs(dot(w.normal, n)) < 0.996f || std::fabs(dot(w.normal, centroid) - w.dist) > tolerance)
+        continue;
+      bool over = true;
+      for (int k = 0; k < 3 && over; ++k)
+        over = centroid[k] >= w.mins[k] - tolerance && centroid[k] <= w.maxs[k] + tolerance;
+      if (over)
+        return true;
+    }
+    return false;
+  };
+
   for (int32_t f = world.firstFace; f < world.firstFace + world.numFaces && size_t(f) < faceCount; ++f) {
     const Face &face = faces[f];
     if (face.texInfo < 0 || size_t(face.texInfo) >= texInfoCount || face.numEdges < 3 ||
@@ -1481,21 +1617,43 @@ bool build(const Bsp &bsp) {
         std::memcpy(g.vertices[v].position, p, sizeof(p));
         noteSkyReach(p);
       }
-      size_t out = firstIndex;
-      for (size_t i = firstIndex; i + 2 < g.indices.size(); i += 3) {
-        float c[3] = {};
-        for (int j = 0; j < 3; ++j)
-          for (int k = 0; k < 3; ++k)
-            c[k] += g.vertices[g.indices[i + j]].position[k] / 3;
-        if (insidePlayable(bsp, c)) {
-          ++g_world.skyStandInTriangles;
+      // Source draws the skybox behind the whole map. Here it shares world
+      // space: what reaches into playable space (stand-ins of the map, or
+      // skybox walls and ground misaligned with the map's own) is clipped
+      // away along the map's BSP planes.
+      const std::vector<uint32_t> triangles(g.indices.begin() + firstIndex, g.indices.end());
+      g.indices.resize(firstIndex);
+      std::vector<std::vector<remixapi_HardcodedVertex>> pieces;
+      for (size_t i = 0; i + 2 < triangles.size(); i += 3) {
+        pieces.clear();
+        bool split = false;
+        clipOutsidePlayable(bsp, 0,
+                            {g.vertices[triangles[i]], g.vertices[triangles[i + 1]], g.vertices[triangles[i + 2]]},
+                            pieces, split);
+        pieces.erase(std::remove_if(pieces.begin(), pieces.end(),
+                                    [&](const auto &piece) {
+                                      const bool coplanar = onWorldFace(piece);
+                                      g_world.skyCoplanarPieces += coplanar;
+                                      split |= coplanar;
+                                      return coplanar;
+                                    }),
+                     pieces.end());
+        if (!split) {
+          g.indices.insert(g.indices.end(), triangles.begin() + i, triangles.begin() + i + 3);
+          ++g_world.skyTracedTriangles;
           continue;
         }
-        ++g_world.skyTracedTriangles;
-        for (int j = 0; j < 3; ++j)
-          g.indices[out++] = g.indices[i + j];
+        if (pieces.empty())
+          ++g_world.skyStandInTriangles;
+        else
+          ++g_world.skyClippedTriangles;
+        for (const auto &piece : pieces) {
+          const uint32_t first = uint32_t(g.vertices.size());
+          g.vertices.insert(g.vertices.end(), piece.begin(), piece.end());
+          for (uint32_t k = 1; k + 1 < piece.size(); ++k)
+            g.indices.insert(g.indices.end(), {first, first + k, first + k + 1});
+        }
       }
-      g.indices.resize(out);
     };
 
     if (face.dispInfo >= 0 && dispInfos && size_t(face.dispInfo) < dispInfoCount && corners.size() == 4) {
@@ -2142,9 +2300,10 @@ void dumpStatistics(FILE *out) {
           g_world.propModelsFailed, g_world.propParts, g_world.overlays, g_world.overlayTriangles,
           g_world.overlayGroups.size(), g_world.waterMaterials);
   if (g_world.skyTraced)
-    fprintf(out, "   3D skybox path traced: %u triangles, %u props (stand-ins dropped: %u triangles, %u props), reach %.0f\n",
-            g_world.skyTracedTriangles, g_world.skyTracedProps, g_world.skyStandInTriangles, g_world.skyStandInProps,
-            g_world.skyReach);
+    fprintf(out, "   3D skybox path traced: %u triangles, %u clipped at the map, %u props (in playable space: %u "
+            "triangles, %u props; pieces on world faces %u), reach %.0f\n",
+            g_world.skyTracedTriangles, g_world.skyClippedTriangles, g_world.skyTracedProps,
+            g_world.skyStandInTriangles, g_world.skyStandInProps, g_world.skyCoplanarPieces, g_world.skyReach);
   fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
           int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
   fprintf(out, "   BSP lights: %zu static (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
