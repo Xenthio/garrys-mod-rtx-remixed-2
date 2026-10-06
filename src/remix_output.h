@@ -52,6 +52,9 @@ struct Draw {
   uint32_t alphaFunc = D3DCMP_ALWAYS;
   bool depthBias = false;       // D3DRS_DEPTHBIAS / SLOPESCALEDEPTHBIAS set (decals, overlays)
   uint32_t cullMode = D3DCULL_CCW; // D3DRS_CULLMODE
+  bool stencil = false;                 // D3DRS_STENCILENABLE
+  uint32_t stencilFunc = D3DCMP_ALWAYS; // D3DRS_STENCILFUNC
+  uint32_t stencilPass = D3DSTENCILOP_KEEP; // D3DRS_STENCILPASS
   uint32_t forkCategories = 0; // dxvk-remix fork InstanceCategories (render state 42, set by l4d2-rtx)
 };
 

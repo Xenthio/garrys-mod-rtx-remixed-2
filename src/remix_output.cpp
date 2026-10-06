@@ -57,7 +57,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -645,6 +645,13 @@ void captureUi(const Draw &d) {
   const auto *col = findElement(d.elements, D3DDECLUSAGE_COLOR, 0);
   if (!pos || !d.indices.data || !g_displayWidth || !g_displayHeight)
     return;
+  // Stencil: D3D no longer rasterizes, so a stencil test cannot be evaluated.
+  // NEVER only writes the mask and shows nothing.
+  const bool stencilTested = d.stencil && d.stencilFunc != D3DCMP_ALWAYS;
+  if (d.stencil && d.stencilFunc == D3DCMP_NEVER) {
+    ++g_stats.uiStencil;
+    return;
+  }
   remixapi_UITextureHandle texture = 0;
   if (d.texture0 && !(texture = uiTextureFor(d.texture0))) {
     ++g_stats.uiNoTexture; // render-target sampling (post-processing): not UI
@@ -716,6 +723,24 @@ void captureUi(const Draw &d) {
         out.color = uint32_t(c[2]) | uint32_t(c[1]) << 8 | uint32_t(c[0]) << 16 | uint32_t(c[3]) << 24;
     g_uiVertices.push_back(out);
   }
+  // A stencil-tested draw over the whole screen is a masked fill or composite
+  // (halo.lua: surface.DrawRect(0, 0, ScrW(), ScrH()) in the halo colour where
+  // stencil == 1): unmasked it covered everything. Smaller masked draws
+  // (addons' round avatars) stay, unmasked.
+  if (stencilTested) {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (size_t i = base; i < g_uiVertices.size(); ++i) {
+      x0 = std::min(x0, g_uiVertices[i].x), x1 = std::max(x1, g_uiVertices[i].x);
+      y0 = std::min(y0, g_uiVertices[i].y), y1 = std::max(y1, g_uiVertices[i].y);
+    }
+    const float w = std::min(x1, float(g_displayWidth)) - std::max(x0, 0.0f);
+    const float h = std::min(y1, float(g_displayHeight)) - std::max(y0, 0.0f);
+    if (w > 0 && h > 0 && w * h >= 0.9f * float(g_displayWidth) * float(g_displayHeight)) {
+      g_uiVertices.resize(base);
+      ++g_stats.uiStencil;
+      return;
+    }
+  }
   remixapi_UIDrawCommand command = {};
   command.textureId = texture;
   command.indexCount = uint32_t(indices.size());
@@ -729,14 +754,22 @@ void captureUi(const Draw &d) {
 // Converts one indexed draw into a Remix mesh. Returns nullptr when the draw
 // cannot be represented yet.
 // `normalOffset` > 0 lifts the surface off its receiver (decals, see onDraw).
+// `vertexColors`: forward COLOR0 (additive raster-only draws: Source fades and
+// hides sprites and beams through it, e.g. a holstered gravity gun's beams
+// stay alive at brightness 0); such a draw that is all black adds nothing and
+// yields no mesh.
 remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVertex, uint32_t *boneCount,
-                              float normalOffset = 0) {
+                              float normalOffset = 0, bool vertexColors = false) {
   Timer timer(g_usBuild);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
   const auto *boneIndices = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0);
   const auto *tex = findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 0);
   const auto *nrm = findElement(d.elements, D3DDECLUSAGE_NORMAL, 0);
+  const auto *col = vertexColors ? findElement(d.elements, D3DDECLUSAGE_COLOR, 0) : nullptr;
+  if (col && col->Type != D3DDECLTYPE_D3DCOLOR)
+    col = nullptr;
+  uint32_t anyRgb = 0;
   const auto &ps = d.streams[pos->Stream];
 
   std::vector<uint32_t> indices;
@@ -826,8 +859,17 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         out.normal[0] = out.normal[1] = out.normal[2] = 0;
     }
     out.color = 0xffffffff;
+    if (col)
+      if (const uint8_t *c = fetch(col, v, 4)) { // D3DCOLOR in memory, the runtime's layout
+        std::memcpy(&out.color, c, 4);
+        anyRgb |= out.color & 0xffffff;
+      }
   }
   (void)ps;
+  if (col && !anyRgb) {
+    ++g_stats.additiveBlack;
+    return nullptr;
+  }
 
   // Source skinning (common_vs_fxc.h): up to three bone indices in a
   // D3DCOLOR (memory bytes 0..2), two stored weights (float2, or short2 / 32767)
@@ -1433,7 +1475,9 @@ void onDraw(const Draw &d) {
       std::lock_guard<std::mutex> lock(g_transientSampleLock);
       ++g_transientDecls[d.declaration];
     }
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0);
+    // Additive as onPresent classifies it (destination factor ONE): raster only.
+    const bool additive = d.blend && d.dstBlend == D3DBLEND_ONE;
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0, additive);
     if (!mesh)
       return;
     g_transient.push_back(mesh);
@@ -2394,11 +2438,12 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   player body (l4d2-rtx shadow mesh) %.1f\n", g_stats.playerBody.exchange(0) / f);
   fprintf(out, "   rtx.conf texture categories: %zu hashes; ignored/hidden draws %.1f\n", categories::size(),
           g_stats.ignored.exchange(0) / f);
-  fprintf(out, "   depthOnly %.1f additive %.1f other blended %.1f duplicate %.1f; engine flashlight passes dropped %.1f\n",
+  fprintf(out, "   depthOnly %.1f additive %.1f other blended %.1f duplicate %.1f; engine flashlight passes dropped %.1f; black additive dropped %.1f\n",
           g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
-          g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f);
-  fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f); CPU texture copies %zu\n",
-          g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, [] {
+          g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f,
+          g_stats.additiveBlack.exchange(0) / f);
+  fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",
+          g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, g_stats.uiStencil.exchange(0) / f, [] {
             std::lock_guard<std::mutex> lock(g_textureLock);
             return g_cpuTextures.size();
           }());
