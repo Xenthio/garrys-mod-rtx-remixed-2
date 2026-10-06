@@ -56,7 +56,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -1350,6 +1350,17 @@ void onDraw(const Draw &d) {
     ++g_stats.bspPropsDropped;
     return;
   }
+  // The engine's flashlight pass over the world: with a projected texture on,
+  // it re-draws the lit surfaces additively with the cookie as texture 0
+  // (captured, the cookie got pasted over every surface). Those lights are
+  // path traced (engine_lights), so the pass goes. The shadow manager's
+  // virtual iterator is not what the world pass uses, so it is caught here.
+  if (g_worldLists > 0 && d.blend && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE) {
+    if (const auto lights = engine_lights::current(); lights && !lights->projected.empty()) {
+      ++g_stats.flashlightPasses;
+      return;
+    }
+  }
   if (g_worldLists > 0 && bsp::active()) {
     if (!d.blend && !ps.dynamic) {
       ++g_stats.bspDropped;
@@ -2295,8 +2306,9 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   player body (l4d2-rtx shadow mesh) %.1f\n", g_stats.playerBody.exchange(0) / f);
   fprintf(out, "   rtx.conf texture categories: %zu hashes; ignored/hidden draws %.1f\n", categories::size(),
           g_stats.ignored.exchange(0) / f);
-  fprintf(out, "   depthOnly %.1f additive %.1f other blended %.1f duplicate %.1f\n", g_stats.depthOnly.exchange(0) / f,
-          g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f, g_stats.duplicate.exchange(0) / f);
+  fprintf(out, "   depthOnly %.1f additive %.1f other blended %.1f duplicate %.1f; engine flashlight passes dropped %.1f\n",
+          g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
+          g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f); CPU texture copies %zu\n",
           g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, [] {
             std::lock_guard<std::mutex> lock(g_textureLock);
