@@ -58,7 +58,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -388,25 +388,77 @@ struct Instance {
   std::vector<remixapi_Transform> bones; // skinned instances
   float transform[3][4];
   uint64_t view;
-  int halo = -1; // halo source (g_haloGroups index), not a scene instance
+  // Stencil emulation: the draw's group (g_stencilGroups index) and part in it.
+  int stencilGroup = -1;
+  uint8_t stencilRole = 0;
+  bool depthTest = true;
 };
 std::vector<Instance> g_instances;
 
-// Garry's Mod halos (halo.lua), recognised from their draw sequence per entry:
-// the entities re-drawn with stencil ALWAYS/REPLACE (the sources), a
-// full-screen fill in the halo colour where stencil == 1 (closes the group),
-// then DrawPasses + 1 full-screen quads of the blurred image where stencil
-// != 1. D3D rasterizes none of it here: the sources go to the runtime as halo
-// instances (remixapi_InstanceInfoHaloEXT). Blur sizes are not observable
-// (shader constants of off-screen passes): halo.Add's default is used.
-struct HaloGroup {
-  float color[3];
+// The stencil buffer no longer exists (D3D rasterizes nothing), so stencil
+// use is emulated from the draws' state. Draws that write a value mark a
+// group; draws tested against that value are shown only inside (EQUAL; LESS
+// for the value above) or outside (NOTEQUAL) the group's silhouette, through
+// the runtime's masks (remixapi_InstanceInfoMaskEXT, masked UI commands).
+// A group whose value is tested and then written again starts over (the game
+// cleared the stencil in between: Clear is not seen).
+//   Writers: ALWAYS + pass REPLACE (also drawn normally: a sight's housing);
+//   NEVER + fail REPLACE (invisible: a scope's lens opening); EQUAL + pass
+//   INCR (invisible marks inside another group: thermal bodies in the lens).
+//   halo.lua: a full-screen fill in the halo colour where EQUAL, then the
+//   blurred image where NOTEQUAL: such a group is a halo
+//   (remixapi_InstanceInfoHaloEXT), its sources are re-draws, not scene
+//   instances. Blur sizes are not observable: halo.Add's default is used.
+struct StencilGroup {
+  uint32_t value = 0;
+  bool tested = false;
+  uint32_t sources = 0, consumers = 0;
+  int within = -1;
+  bool fill = false, halo = false, additive = true, ignoreZ = false;
+  float color[3] = {};
   uint32_t passes = 0;
-  bool additive = true, ignoreZ = false;
+  uint32_t mask = 0; // runtime mask group (1..32), assigned at Present
 };
-std::vector<HaloGroup> g_haloGroups; // closed groups of this frame
-uint32_t g_haloOpenSources = 0;      // sources since the last fill
-bool g_haloOpenIgnoreZ = false;
+enum : uint8_t { kStencilNone, kStencilSource, kStencilSourceOnly, kStencilInside };
+std::vector<StencilGroup> g_stencilGroups;           // this frame's
+std::unordered_map<uint32_t, int> g_stencilCurrent;  // stencil value -> its current group
+std::vector<std::pair<int, bool>> g_uiCommandMasks;  // per g_uiCommands entry: group (-1 none), outside
+
+// Halo groups need their fill (the colour); the other groups that are both
+// marked and tested get a runtime mask. Once per frame, before submission.
+bool g_stencilMasksAssigned = false;
+void assignStencilMasks() {
+  if (g_stencilMasksAssigned)
+    return;
+  g_stencilMasksAssigned = true;
+  uint32_t next = 0;
+  for (auto &group : g_stencilGroups) {
+    if (group.halo && group.fill)
+      continue;
+    if (group.sources && group.consumers && next < REMIXAPI_INSTANCE_MASK_MAX_GROUP_EXT)
+      group.mask = ++next;
+  }
+}
+
+int stencilWriter(uint32_t value) {
+  auto it = g_stencilCurrent.find(value);
+  if (it == g_stencilCurrent.end() || g_stencilGroups[it->second].tested) {
+    g_stencilGroups.emplace_back().value = value;
+    it = g_stencilCurrent.insert_or_assign(value, int(g_stencilGroups.size()) - 1).first;
+  }
+  ++g_stencilGroups[it->second].sources;
+  return it->second;
+}
+
+// The group a test against `value` reads (-1: nothing wrote it).
+int stencilReader(uint32_t value) {
+  auto it = g_stencilCurrent.find(value);
+  if (it == g_stencilCurrent.end())
+    return -1;
+  g_stencilGroups[it->second].tested = true;
+  ++g_stencilGroups[it->second].consumers;
+  return it->second;
+}
 
 struct View {
   std::vector<std::array<float, 3>> ambientUp; // +Z ambient cube of lit models in this view
@@ -663,23 +715,39 @@ void captureUi(const Draw &d) {
   const auto *col = findElement(d.elements, D3DDECLUSAGE_COLOR, 0);
   if (!pos || !d.indices.data || !g_displayWidth || !g_displayHeight)
     return;
-  // Stencil: D3D no longer rasterizes, so a stencil test cannot be evaluated.
-  // NEVER only writes the mask and shows nothing.
+  // Stencil (see StencilGroup): NEVER only writes and shows nothing; a test
+  // names the group this draw is limited to.
   const bool stencilTested = d.stencil && d.stencilFunc != D3DCMP_ALWAYS;
+  // 2D marks (round avatars' circles) cannot be mask sources: what tests the
+  // value afterwards has no known group.
+  if (d.stencil && ((d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) ||
+                    (d.stencilFunc == D3DCMP_NEVER && d.stencilFail == D3DSTENCILOP_REPLACE)))
+    g_stencilCurrent.erase(d.stencilRef & d.stencilWriteMask & 0xff);
   if (d.stencil && d.stencilFunc == D3DCMP_NEVER) {
     ++g_stats.uiStencil;
     return;
+  }
+  int maskGroup = -1;
+  const bool maskOutside = d.stencilFunc == D3DCMP_NOTEQUAL;
+  if (stencilTested) {
+    const uint32_t value = d.stencilRef & d.stencilMask & 0xff;
+    if (d.stencilFunc == D3DCMP_EQUAL || d.stencilFunc == D3DCMP_NOTEQUAL)
+      maskGroup = stencilReader(value);
+    else if (d.stencilFunc == D3DCMP_LESS) // ref < stencil: the value above (INCR marks)
+      maskGroup = stencilReader(value + 1);
   }
   remixapi_UITextureHandle texture = 0;
   if (d.texture0 && !(texture = uiTextureFor(d.texture0))) {
     ++g_stats.uiNoTexture; // render-target sampling (post-processing): not UI
     // A halo's blurred image, composited once per pass outside the sources.
-    if (stencilTested && d.stencilFunc == D3DCMP_NOTEQUAL && !g_haloGroups.empty()) {
-      ++g_haloGroups.back().passes;
+    if (maskGroup >= 0 && maskOutside) {
+      StencilGroup &group = g_stencilGroups[maskGroup];
+      group.halo = true;
+      ++group.passes;
       // pp/add adds (destination ONE); pp/sub is a Modulate: the runtime's
       // non-additive halo multiplies likewise.
       if (d.dstBlend != D3DBLEND_ONE)
-        g_haloGroups.back().additive = false;
+        group.additive = false;
     }
     return;
   }
@@ -751,8 +819,9 @@ void captureUi(const Draw &d) {
   }
   // A stencil-tested draw over the whole screen is a masked fill or composite
   // (halo.lua: surface.DrawRect(0, 0, ScrW(), ScrH()) in the halo colour where
-  // stencil == 1): unmasked it covered everything. Smaller masked draws
-  // (addons' round avatars) stay, unmasked.
+  // stencil == 1; a thermal sight's tint in its lens). With its group known
+  // it is masked; otherwise it would cover everything and is dropped. Smaller
+  // draws of unknown groups (addons' round avatars) stay, unmasked.
   if (stencilTested) {
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (size_t i = base; i < g_uiVertices.size(); ++i) {
@@ -762,19 +831,18 @@ void captureUi(const Draw &d) {
     const float w = std::min(x1, float(g_displayWidth)) - std::max(x0, 0.0f);
     const float h = std::min(y1, float(g_displayHeight)) - std::max(y0, 0.0f);
     if (w > 0 && h > 0 && w * h >= 0.9f * float(g_displayWidth) * float(g_displayHeight)) {
-      if (d.stencilFunc == D3DCMP_EQUAL && g_haloOpenSources) {
-        HaloGroup group;
+      if (maskGroup >= 0 && d.stencilFunc == D3DCMP_EQUAL) {
+        StencilGroup &group = g_stencilGroups[maskGroup];
         const uint32_t c = g_uiVertices[base].color; // R in the low byte
         group.color[0] = float(c & 255) / 255, group.color[1] = float((c >> 8) & 255) / 255,
         group.color[2] = float((c >> 16) & 255) / 255;
-        group.ignoreZ = g_haloOpenIgnoreZ;
-        g_haloGroups.push_back(group);
-        g_haloOpenSources = 0;
-        g_haloOpenIgnoreZ = false;
+        group.fill = true;
       }
-      g_uiVertices.resize(base);
-      ++g_stats.uiStencil;
-      return;
+      if (maskGroup < 0) {
+        g_uiVertices.resize(base);
+        ++g_stats.uiStencil;
+        return;
+      }
     }
   }
   remixapi_UIDrawCommand command = {};
@@ -784,6 +852,7 @@ void captureUi(const Draw &d) {
   for (uint32_t i : indices)
     g_uiIndices.push_back(base + i - low);
   g_uiCommands.push_back(command);
+  g_uiCommandMasks.push_back({maskGroup, maskOutside});
   ++g_stats.uiDraws;
 }
 
@@ -1606,14 +1675,41 @@ void onDraw(const Draw &d) {
     std::memcpy(inst.transform, d.vsConstants + kRegModel * 4, sizeof(inst.transform));
   }
   inst.view = viewKey;
-  if (d.stencil && d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
-    inst.halo = int(g_haloGroups.size()); // the group its fill will close
-    ++g_haloOpenSources;
-    g_haloOpenIgnoreZ |= !d.depthTest;
-    g_instances.push_back(inst);
-    return; // a re-draw: no part in lighting estimates
+  if (d.stencil) { // see StencilGroup
+    const uint32_t value = d.stencilRef & d.stencilMask & 0xff, written = d.stencilRef & d.stencilWriteMask & 0xff;
+    inst.depthTest = d.depthTest;
+    if (d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
+      inst.stencilGroup = stencilWriter(written);
+      // A render-target texture has no contents here (a scope's lens disc
+      // showing its vignette): such a writer only marks.
+      inst.stencilRole = d.texture0Target ? kStencilSourceOnly : kStencilSource;
+      g_stencilGroups[inst.stencilGroup].ignoreZ |= !d.depthTest;
+    } else if (d.stencilFunc == D3DCMP_NEVER) {
+      if (d.stencilFail != D3DSTENCILOP_REPLACE)
+        return;
+      inst.stencilGroup = stencilWriter(written);
+      inst.stencilRole = kStencilSourceOnly;
+      inst.depthTest = false; // fails before the depth test: marks through anything
+    } else if (d.stencilFunc == D3DCMP_EQUAL &&
+               (d.stencilPass == D3DSTENCILOP_INCR || d.stencilPass == D3DSTENCILOP_INCRSAT)) {
+      const int parent = stencilReader(value);
+      if (parent < 0)
+        return;
+      inst.stencilGroup = stencilWriter(value + 1);
+      g_stencilGroups[inst.stencilGroup].within = parent;
+      inst.stencilRole = kStencilSourceOnly;
+    } else if (d.stencilFunc == D3DCMP_EQUAL || d.stencilFunc == D3DCMP_LESS) {
+      inst.stencilGroup = stencilReader(d.stencilFunc == D3DCMP_LESS ? value + 1 : value);
+      if (inst.stencilGroup < 0)
+        return; // nothing marked: not visible
+      inst.stencilRole = kStencilInside;
+    }
+    // NOTEQUAL and the rest are drawn as they are (a scope's body around its
+    // lens opening: the opening's own geometry is not drawn while aiming).
   }
   g_instances.push_back(inst);
+  if (inst.stencilRole == kStencilSourceOnly || inst.stencilRole == kStencilInside)
+    return; // marks and overlays: no part in lighting estimates
   if (boneCount) // studio models: their ambient cube samples the surrounding (sky) light
     view.ambientUp.push_back({d.vsConstants[kRegAmbientUp * 4], d.vsConstants[kRegAmbientUp * 4 + 1],
                               d.vsConstants[kRegAmbientUp * 4 + 2]});
@@ -1981,32 +2077,74 @@ void onPresent() {
           for (auto &bone : inst.bones)
             premultiply(viewModelTransform, bone.matrix);
       }
-      if (inst.halo >= 0) {
-        // Sources whose fill never came are some other stencil effect.
-        if (size_t(inst.halo) >= g_haloGroups.size())
-          continue;
-        const HaloGroup &group = g_haloGroups[inst.halo];
-        remixapi_InstanceInfoBoneTransformsEXT haloBones = {};
-        haloBones.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
-        haloBones.boneTransforms_values = inst.bones.data();
-        haloBones.boneTransforms_count = uint32_t(inst.bones.size());
-        remixapi_InstanceInfoHaloEXT halo = {};
-        halo.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_HALO_EXT;
-        halo.pNext = inst.bones.empty() ? nullptr : &haloBones;
-        halo.color = {group.color[0], group.color[1], group.color[2]};
-        halo.blurX = halo.blurY = 2; // halo.Add's default
-        halo.passes = std::max(group.passes, 1u);
-        halo.additive = group.additive;
-        halo.ignoreZ = group.ignoreZ;
+      if (inst.stencilGroup >= 0) {
+        assignStencilMasks();
+        const StencilGroup &group = g_stencilGroups[inst.stencilGroup];
+        remixapi_InstanceInfoMaterialOverrideEXT maskMaterial = {};
+        maskMaterial.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT;
+        maskMaterial.material = inst.material;
+        remixapi_InstanceInfoBoneTransformsEXT maskBones = {};
+        maskBones.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+        maskBones.boneTransforms_values = inst.bones.data();
+        maskBones.boneTransforms_count = uint32_t(inst.bones.size());
+        maskMaterial.pNext = inst.bones.empty() ? nullptr : &maskBones;
+        void *const chain = inst.material ? static_cast<void *>(&maskMaterial)
+                                          : (inst.bones.empty() ? nullptr : static_cast<void *>(&maskBones));
         remixapi_InstanceInfo info = {};
         info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-        info.pNext = &halo;
         info.mesh = inst.mesh;
         std::memcpy(info.transform.matrix, inst.transform, sizeof(info.transform.matrix));
         info.doubleSided = 1;
-        g_api.DrawInstance(&info);
-        ++g_stats.haloSources;
-        continue;
+        if (role == Role::ViewModel && rasterViewModel)
+          info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
+        if (group.halo && group.fill) {
+          // The sources are halo.lua's re-draws of the entities.
+          if (inst.stencilRole == kStencilSource) {
+            remixapi_InstanceInfoHaloEXT halo = {};
+            halo.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_HALO_EXT;
+            halo.pNext = chain;
+            halo.color = {group.color[0], group.color[1], group.color[2]};
+            halo.blurX = halo.blurY = 2; // halo.Add's default
+            halo.passes = std::max(group.passes, 1u);
+            halo.additive = group.additive;
+            halo.ignoreZ = group.ignoreZ;
+            info.pNext = &halo;
+            g_api.DrawInstance(&info);
+            ++g_stats.haloSources;
+          }
+          continue;
+        }
+        if (group.mask) {
+          // The blend state carries the alpha test (a silhouette's cutouts)
+          // and, for overlays, how they blend.
+          remixapi_InstanceInfoBlendEXT maskBlend = inst.blend;
+          maskBlend.pNext = chain;
+          remixapi_InstanceRasterStateEXT raster = {};
+          raster.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_RASTER_STATE_EXT;
+          raster.pNext = &maskBlend;
+          raster.depthTest = inst.depthTest;
+          raster.depthCompare = 3; // LESS_OR_EQUAL
+          remixapi_InstanceInfoMaskEXT mask = {};
+          mask.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MASK_EXT;
+          mask.group = group.mask;
+          if (inst.stencilRole == kStencilInside) {
+            mask.role = REMIXAPI_INSTANCE_MASK_INSIDE_EXT;
+            mask.pNext = &raster;
+            ++g_stats.maskOverlays;
+          } else {
+            mask.role = REMIXAPI_INSTANCE_MASK_SOURCE_EXT;
+            mask.pNext = &maskBlend;
+            mask.within = group.within >= 0 ? g_stencilGroups[group.within].mask : 0;
+            mask.depthTest = inst.depthTest;
+            ++g_stats.maskSources;
+          }
+          info.pNext = &mask;
+          if (mask.role == REMIXAPI_INSTANCE_MASK_INSIDE_EXT || group.within < 0 || mask.within)
+            g_api.DrawInstance(&info);
+        }
+        // A housing that marks (ALWAYS/REPLACE) is also what the game shows.
+        if (inst.stencilRole != kStencilSource)
+          continue;
       }
       struct {
         remixapi_MeshHandle mesh;
@@ -2206,12 +2344,35 @@ void onPresent() {
   ui.vertexCount = uint32_t(g_uiVertices.size());
   ui.pIndices = g_uiIndices.data();
   ui.indexCount = uint32_t(g_uiIndices.size());
+  // Stencil-tested 2D draws: masked to their group, dropped if it is a halo
+  // (its fill and composites are the runtime's now) or was never marked.
+  assignStencilMasks();
+  if (g_uiCommandMasks.size() == g_uiCommands.size()) {
+    size_t kept = 0;
+    for (size_t i = 0; i < g_uiCommands.size(); ++i) {
+      remixapi_UIDrawCommand command = g_uiCommands[i];
+      if (const auto [index, outside] = g_uiCommandMasks[i]; index >= 0) {
+        const StencilGroup &group = g_stencilGroups[index];
+        if ((group.halo && group.fill) || (!group.mask && !outside))
+          continue;
+        if (group.mask) {
+          command.flags |= group.mask << REMIXAPI_UI_NATIVE_MASK_GROUP_SHIFT;
+          if (outside)
+            command.flags |= REMIXAPI_UI_NATIVE_MASK_OUTSIDE;
+          ++g_stats.maskUi;
+        }
+      }
+      g_uiCommands[kept++] = command;
+    }
+    g_uiCommands.resize(kept);
+  }
   ui.pCommands = g_uiCommands.data();
   ui.commandCount = uint32_t(g_uiCommands.size());
   g_api.SubmitUIDrawList(&ui);
   g_uiVertices.clear();
   g_uiIndices.clear();
   g_uiCommands.clear();
+  g_uiCommandMasks.clear();
 
   serviceScreenshotRequest();
   {
@@ -2219,10 +2380,13 @@ void onPresent() {
     g_api.Present(nullptr);
   }
   g_instances.clear();
-  g_stats.haloGroups += uint32_t(g_haloGroups.size());
-  g_haloGroups.clear();
-  g_haloOpenSources = 0;
-  g_haloOpenIgnoreZ = false;
+  for (const auto &group : g_stencilGroups) {
+    g_stats.haloGroups += group.halo && group.fill;
+    g_stats.maskGroups += group.mask != 0;
+  }
+  g_stencilGroups.clear();
+  g_stencilCurrent.clear();
+  g_stencilMasksAssigned = false;
   g_views.clear();
   g_worldViews.clear();
   g_viewOrder = 0;
@@ -2594,8 +2758,10 @@ void dumpStatistics(FILE *out) {
       fclose(log);
     g_census.clear();
   }
-  fprintf(out, "   halos per frame: %.2f groups, %.2f source instances\n", g_stats.haloGroups.exchange(0) / f,
-          g_stats.haloSources.exchange(0) / f);
+  fprintf(out, "   halos per frame: %.2f groups, %.2f source instances | stencil masks: %.2f groups, %.2f sources, "
+               "%.2f overlays, %.2f UI draws\n",
+          g_stats.haloGroups.exchange(0) / f, g_stats.haloSources.exchange(0) / f, g_stats.maskGroups.exchange(0) / f,
+          g_stats.maskSources.exchange(0) / f, g_stats.maskOverlays.exchange(0) / f, g_stats.maskUi.exchange(0) / f);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",
           g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, g_stats.uiStencil.exchange(0) / f, [] {
             std::lock_guard<std::mutex> lock(g_textureLock);
@@ -2647,6 +2813,7 @@ extern "C" __declspec(dllexport) void __cdecl openremix_ui_append(const remixapi
     remixapi_UIDrawCommand command = commands[c];
     command.indexOffset += baseIndex;
     g_uiCommands.push_back(command);
+    g_uiCommandMasks.push_back({-1, false});
   }
 }
 
