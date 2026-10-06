@@ -156,9 +156,11 @@ bool levelLayout(D3DFORMAT format, uint32_t width, uint32_t height, uint32_t &ro
   }
 }
 
+// CPU copies feed UI textures (RegisterUITexture). GMod's Chromium panels
+// (main menu, DHTML) are A8R8G8B8 textures of up to 2048x2048 or more.
 bool keepCpuCopy(D3DFORMAT format, uint32_t width, uint32_t height) {
   const bool wide = format == D3DFMT_A8R8G8B8 || format == D3DFMT_X8R8G8B8;
-  return uint64_t(width) * height <= (wide ? 1024u * 1024u : 512u * 512u);
+  return uint64_t(width) * height <= (wide ? 4096u * 4096u : 512u * 512u);
 }
 
 // dxvk-remix variables the proxy implements itself (l4d2-rtx map configs).
@@ -527,6 +529,10 @@ const D3DVERTEXELEMENT9 *findElement(const D3DVERTEXELEMENT9 *e, BYTE usage, BYT
   return nullptr;
 }
 
+// UI texture (re)registrations: count, bytes and time since the last dump.
+std::atomic<uint32_t> g_usUiRegister{0}, g_usUiRegisterApi{0};
+std::atomic<uint64_t> g_uiRegistrations{0}, g_uiRegisteredBytes{0};
+
 // Registers (or refreshes) the UI texture for a D3D texture; 0 when the
 // texture has no CPU copy (e.g. render targets).
 remixapi_UITextureHandle uiTextureFor(const void *texture) {
@@ -537,6 +543,9 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
   auto &t = *it->second;
   const auto id = static_cast<remixapi_UITextureHandle>(reinterpret_cast<uintptr_t>(it->second.get()));
   if (t.registeredVersion != t.version) {
+    Timer timer(g_usUiRegister);
+    ++g_uiRegistrations;
+    g_uiRegisteredBytes += uint64_t(t.width) * t.height * 4;
     std::vector<uint8_t> rgba;
     remixapi_Format format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
     if (t.format == D3DFMT_DXT1) {
@@ -550,8 +559,12 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
         for (size_t i = 3; i < rgba.size(); i += 4)
           rgba[i] = 0xff;
     }
-    if (g_api.RegisterUITexture(id, t.width, t.height, format, rgba.data(), rgba.size()) !=
-        REMIXAPI_ERROR_CODE_SUCCESS)
+    remixapi_ErrorCode registered;
+    {
+      Timer apiTimer(g_usUiRegisterApi);
+      registered = g_api.RegisterUITexture(id, t.width, t.height, format, rgba.data(), rgba.size());
+    }
+    if (registered != REMIXAPI_ERROR_CODE_SUCCESS)
       return 0;
     t.registeredVersion = t.version;
   }
@@ -2058,7 +2071,9 @@ void dumpStatistics(FILE *out) {
     size_t bytes = 0;
     for (auto &[t, c] : g_cpuTextures)
       bytes += c->data.size();
-    fprintf(out, "   CPU texture copies: %.1f MiB\n", bytes / 1048576.0);
+    fprintf(out, "   CPU texture copies: %.1f MiB; UI texture registrations per frame %.2f (%.2f MiB, %.2f ms, runtime %.2f ms)\n",
+            bytes / 1048576.0, g_uiRegistrations.exchange(0) / f, g_uiRegisteredBytes.exchange(0) / f / 1048576.0,
+            g_usUiRegister.exchange(0) / f / 1000, g_usUiRegisterApi.exchange(0) / f / 1000);
   }
   fprintf(out, "   flat (2D) %.1f; textures uploaded %u, unsupported formats %u, live %zu\n",
           g_stats.flat.exchange(0) / f, g_stats.textures.exchange(0), g_stats.textureSkipped.exchange(0), [] {
