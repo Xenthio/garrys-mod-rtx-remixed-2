@@ -1,5 +1,6 @@
 #include <map>
 #include "remix_output.h"
+#include "d3d_hooks.h"
 #include "remix_ui.h"
 #include "sky_faces.h"
 #include "bsp_world.h"
@@ -56,7 +57,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -397,6 +398,13 @@ struct View {
   float view[16], projection[16];
 };
 uint32_t g_viewOrder = 0;
+// The views the engine drew a world for this frame (the matrices in effect at
+// each outermost "world_lists 1" marker, in order): the main view and, before
+// it, the 3D skybox view. The view model and overlays never draw a world.
+struct WorldView {
+  float view[16], projection[16];
+};
+std::vector<WorldView> g_worldViews;
 
 // D3DBLEND / D3DBLENDOP / D3DCMP to the Vulkan enums InstanceInfoBlendEXT uses.
 uint32_t vkBlendFactor(uint32_t d3d) {
@@ -1560,6 +1568,51 @@ void onPresent() {
       mainKey = key;
     }
   }
+  // Draw counts are a weak signal (with the engine's static world skipped the
+  // view model can out-draw the world, and a view may have no draws at all).
+  // The engine says which views have a world: the last one drawn is the main
+  // view (the 3D skybox comes first), unless sky_camera says otherwise.
+  if (!g_worldViews.empty()) {
+    auto eyeOf = [](const float *v, float out[3]) {
+      for (int i = 0; i < 3; ++i)
+        out[i] = -(v[12] * v[i * 4] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
+    };
+    const WorldView *chosen = &g_worldViews.back();
+    float origin[3], scale = 0;
+    if (g_worldViews.size() > 1 && bsp::skyCamera(origin, scale) && scale > 0)
+      for (const auto &candidate : g_worldViews)
+        for (const auto &other : g_worldViews) {
+          float eye[3], skyEye[3], d2 = 0;
+          eyeOf(candidate.view, eye);
+          eyeOf(other.view, skyEye);
+          for (int i = 0; i < 3; ++i) {
+            const float d = skyEye[i] - (origin[i] + eye[i] / scale);
+            d2 += d * d;
+          }
+          if (&candidate != &other && d2 < 16.0f)
+            chosen = &candidate;
+        }
+    worldFov = int(std::lround(chosen->projection[5] * 1000));
+    main = nullptr;
+    for (auto &[key, v] : g_views)
+      if (v.perspective && int(std::lround(v.projection[5] * 1000)) == worldFov &&
+          samePlacement(v.view, chosen->view) && (!main || v.draws > main->draws)) {
+        main = &v;
+        mainKey = key;
+      }
+    if (!main) {
+      // No engine draw in the main view this frame (the BSP world shows it all).
+      constexpr uint64_t kWorldViewKey = 0x776f726c64766965ull;
+      View &v = g_views[kWorldViewKey];
+      v.perspective = true;
+      v.order = g_viewOrder++;
+      std::memcpy(v.view, chosen->view, sizeof(v.view));
+      std::memcpy(v.projection, chosen->projection, sizeof(v.projection));
+      main = &v;
+      mainKey = kWorldViewKey;
+    }
+    ++g_stats.worldViewCameras;
+  }
   // Draw counts can favour the 3D skybox: looking down, the engine culls most
   // of the world while the skybox view draws its whole miniature city. The
   // skybox view looks from sky_camera's origin + eye / scale with the main
@@ -1989,6 +2042,7 @@ void onPresent() {
   }
   g_instances.clear();
   g_views.clear();
+  g_worldViews.clear();
   g_viewOrder = 0;
 
   for (auto mesh : g_transient)
@@ -2314,8 +2368,9 @@ void dumpStatistics(FILE *out) {
       modsDiagnostic(diagnostic, sizeof(diagnostic));
     fprintf(out, "   USD mods: configure %d; %s\n", int(g_modsResult), diagnostic);
   }
-  fprintf(out, "   frames with a sky view %.2f (skybox view had the most draws %.2f)\n%s", g_stats.skyFrames.exchange(0) / f,
-          g_stats.skyViewDemoted.exchange(0) / f, g_viewSummary.c_str());
+  fprintf(out, "   frames with a sky view %.2f (skybox view had the most draws %.2f); main camera from the engine's world view %.2f\n%s",
+          g_stats.skyFrames.exchange(0) / f, g_stats.skyViewDemoted.exchange(0) / f,
+          g_stats.worldViewCameras.exchange(0) / f, g_viewSummary.c_str());
   fprintf(out, "   player body (l4d2-rtx shadow mesh) %.1f\n", g_stats.playerBody.exchange(0) / f);
   fprintf(out, "   rtx.conf texture categories: %zu hashes; ignored/hidden draws %.1f\n", categories::size(),
           g_stats.ignored.exchange(0) / f);
@@ -2408,8 +2463,24 @@ bool onMarker(const char *text) {
     if (counter < 0)
       counter = 0;
   };
-  if (const char *v = argument("world_lists"))
+  if (const char *v = argument("world_lists")) {
+    if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && g_worldViews.size() < 16 && d3d::backBufferBound()) {
+      WorldView w;
+      getMatrix(kMatrixView, w.view);
+      getMatrix(kMatrixProjection, w.projection);
+      // As onDraw stores views: left-handed.
+      if (std::fabs(std::fabs(w.projection[11]) - 1.0f) < 1e-3f && std::fabs(w.projection[15]) < 1e-3f) {
+        if (w.projection[11] < 0) {
+          for (int r = 0; r < 4; ++r)
+            w.view[r * 4 + 2] = -w.view[r * 4 + 2];
+          for (int c = 0; c < 4; ++c)
+            w.projection[8 + c] = -w.projection[8 + c];
+        }
+        g_worldViews.push_back(w);
+      }
+    }
     depth(g_worldLists, v);
+  }
   else if (const char *v = argument("overlays"))
     depth(g_overlays, v);
   else if (const char *v = argument("body"))

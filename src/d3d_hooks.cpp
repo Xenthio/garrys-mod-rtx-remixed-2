@@ -1229,6 +1229,8 @@ bool install(HMODULE module) {
   return g_create != nullptr;
 }
 
+bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+
 void dumpStatistics(FILE *out) {
   const uint32_t frames = g_stats.frames.exchange(0);
   const double f = frames ? frames : 1;

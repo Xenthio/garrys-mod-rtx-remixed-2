@@ -12,6 +12,10 @@ namespace proxy::d3d {
 // shader API creates its device.
 bool install(HMODULE module);
 
+// Whether render target 0 is the back buffer (render thread): the views the
+// proxy takes draws from.
+bool backBufferBound();
+
 // Writes per-interval draw statistics and resets the interval counters.
 void dumpStatistics(FILE *out);
 
