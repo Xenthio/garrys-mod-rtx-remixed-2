@@ -107,7 +107,13 @@ struct Shadow {
   uint8_t *lockPtr = nullptr;
   uint32_t lockOffset = 0, lockSize = 0;
   bool lockReadOnly = false;
+  uint32_t usage = 0, pool = 0, lockFlags = 0; // diagnostics
 };
+// Diagnostics: Unlock write-back cost per (usage, pool, lock flags).
+struct CopyClass {
+  uint64_t us = 0, bytes = 0, copies = 0;
+};
+std::unordered_map<uint64_t, CopyClass> g_copyClasses;
 std::mutex g_shadowLock;
 std::unordered_map<const void *, Shadow> g_shadows;
 
@@ -140,6 +146,7 @@ void *noteLock(void *buffer, UINT offset, UINT size, void *ptr, DWORD flags) {
   if (!size)
     ++g_stats.wholeLocks;
   s.lockReadOnly = (flags & D3DLOCK_READONLY) != 0;
+  s.lockFlags = flags;
   if (s.lockReadOnly || offset >= s.data.size() || s.lockSize > s.data.size() - offset)
     return ptr;
   return s.data.data() + offset;
@@ -154,7 +161,14 @@ void noteUnlock(void *buffer) {
   if (s.lockPtr && !s.lockReadOnly && s.lockOffset < s.data.size() && s.lockSize <= s.data.size() - s.lockOffset) {
     const uint64_t t0 = nowUs();
     std::memcpy(s.lockPtr, s.data.data() + s.lockOffset, s.lockSize);
-    g_stats.usShadow += nowUs() - t0;
+    const uint64_t t1 = nowUs();
+    g_stats.usShadow += t1 - t0;
+    {
+      auto &c = g_copyClasses[(uint64_t(s.usage) << 32) | (uint64_t(s.pool) << 24) | s.lockFlags];
+      c.us += t1 - t0;
+      c.bytes += s.lockSize;
+      ++c.copies;
+    }
     g_stats.shadowBytes += s.lockSize;
     ++g_stats.shadowCopies;
     ++s.version;
@@ -485,13 +499,15 @@ HRESULT STDMETHODCALLTYPE reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp
   return hr;
 }
 
-void trackBuffer(const void *buffer, UINT length, DWORD usage, bool is32) {
+void trackBuffer(const void *buffer, UINT length, DWORD usage, bool is32, D3DPOOL pool) {
   std::lock_guard<std::mutex> lock(g_shadowLock);
   auto &s = g_shadows[buffer];
   s = Shadow();
   s.data.resize(length);
   s.dynamic = (usage & D3DUSAGE_DYNAMIC) != 0;
   s.is32 = is32;
+  s.usage = usage;
+  s.pool = pool;
 }
 
 HRESULT STDMETHODCALLTYPE createVertexBuffer(IDirect3DDevice9 *dev, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool,
@@ -504,7 +520,7 @@ HRESULT STDMETHODCALLTYPE createVertexBuffer(IDirect3DDevice9 *dev, UINT length,
       hookSlot(vt, kBufferLock, &vbLock, g_vbLock);
       hookSlot(vt, kBufferUnlock, &vbUnlock, g_vbUnlock);
     }
-    trackBuffer(*out, length, usage, false);
+    trackBuffer(*out, length, usage, false, pool);
   }
   return hr;
 }
@@ -519,7 +535,7 @@ HRESULT STDMETHODCALLTYPE createIndexBuffer(IDirect3DDevice9 *dev, UINT length, 
       hookSlot(vt, kBufferLock, &ibLock, g_ibLock);
       hookSlot(vt, kBufferUnlock, &ibUnlock, g_ibUnlock);
     }
-    trackBuffer(*out, length, usage, format == D3DFMT_INDEX32);
+    trackBuffer(*out, length, usage, format == D3DFMT_INDEX32, pool);
   }
   return hr;
 }
@@ -1159,6 +1175,14 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   buffer shadow copies per frame: %.1f (%.2f MiB, %.2f ms), whole-buffer locks %.1f\n",
           g_stats.shadowCopies.exchange(0) / f, g_stats.shadowBytes.exchange(0) / f / 1048576.0,
           g_stats.usShadow.exchange(0) / f / 1000, g_stats.wholeLocks.exchange(0) / f);
+  {
+    std::lock_guard<std::mutex> lock(g_shadowLock);
+    for (auto &[key, c] : g_copyClasses)
+      fprintf(out, "     usage 0x%x pool %u lock 0x%x: %.1f copies %.3f MiB %.2f ms (%.0f MB/s)\n",
+              unsigned(key >> 32), unsigned((key >> 24) & 0xff), unsigned(key & 0xffffff), c.copies / f,
+              c.bytes / f / 1048576.0, c.us / f / 1000, c.us ? c.bytes / double(c.us) : 0.0);
+    g_copyClasses.clear();
+  }
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
           g_stats.vsConstCalls.exchange(0) / f);

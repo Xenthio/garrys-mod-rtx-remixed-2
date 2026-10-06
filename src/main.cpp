@@ -367,10 +367,29 @@ extern "C" __declspec(dllexport) void *CreateInterface(const char *name, int *re
   return wrapInterface(name, g_origCreateInterface(name, returnCode));
 }
 
+// DXVK puts D3DUSAGE_WRITEONLY dynamic buffers in device-local host-visible
+// memory (the PCIe BAR). The game's dynamic meshes are written through the
+// proxy's shadow at Unlock, ~2.7 MiB/frame on gm_construct: 14 ms at the
+// ~200 MB/s of a GPU behind Thunderbolt, 0.35 ms into cached system memory.
+// DXVK reads DXVK_CONFIG when the D3D9 device is created, after this.
+static void preferCachedDxvkBuffers() {
+  constexpr char kOption[] = "d3d9.cachedWriteOnlyBuffers";
+  char current[1024] = {};
+  const DWORD n = GetEnvironmentVariableA("DXVK_CONFIG", current, sizeof(current));
+  if (n >= sizeof(current) || std::strstr(current, kOption))
+    return;
+  std::string value = current;
+  if (!value.empty())
+    value += ';';
+  value += std::string(kOption) + " = True";
+  SetEnvironmentVariableA("DXVK_CONFIG", value.c_str());
+}
+
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_self = instance;
     DisableThreadLibraryCalls(instance);
+    preferCachedDxvkBuffers();
   }
   return TRUE;
 }
