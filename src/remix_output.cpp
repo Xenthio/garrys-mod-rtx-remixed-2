@@ -131,6 +131,21 @@ struct CpuTexture {
   std::vector<uint8_t> data;
   uint32_t version = 0;
   uint32_t registeredVersion = 0; // UI texture contents last registered (0 = never)
+  // Texels changed since registration (x0, y0, x1, y1; empty: x1 <= x0):
+  // forwarded as a region update (Chromium repaints dirty rectangles).
+  uint32_t dirty[4] = {};
+  void touch(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+    x1 = std::min(x1, width);
+    y1 = std::min(y1, height);
+    if (x1 <= x0 || y1 <= y0)
+      return;
+    if (dirty[2] <= dirty[0] || dirty[3] <= dirty[1]) {
+      dirty[0] = x0, dirty[1] = y0, dirty[2] = x1, dirty[3] = y1;
+      return;
+    }
+    dirty[0] = std::min(dirty[0], x0), dirty[1] = std::min(dirty[1], y0);
+    dirty[2] = std::max(dirty[2], x1), dirty[3] = std::max(dirty[3], y1);
+  }
 };
 std::unordered_map<const void *, std::shared_ptr<CpuTexture>> g_cpuTextures;
 
@@ -531,7 +546,7 @@ const D3DVERTEXELEMENT9 *findElement(const D3DVERTEXELEMENT9 *e, BYTE usage, BYT
 
 // UI texture (re)registrations: count, bytes and time since the last dump.
 std::atomic<uint32_t> g_usUiRegister{0}, g_usUiRegisterApi{0};
-std::atomic<uint64_t> g_uiRegistrations{0}, g_uiRegisteredBytes{0};
+std::atomic<uint64_t> g_uiRegistrations{0}, g_uiRegionUpdates{0}, g_uiRegisteredBytes{0};
 
 // Registers (or refreshes) the UI texture for a D3D texture; 0 when the
 // texture has no CPU copy (e.g. render targets).
@@ -542,10 +557,46 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
     return 0;
   auto &t = *it->second;
   const auto id = static_cast<remixapi_UITextureHandle>(reinterpret_cast<uintptr_t>(it->second.get()));
+  // A registered 32-bit texture changes in place: only its dirty region goes
+  // to the runtime (remixapi_UpdateUITextureRegionEXT), without a copy when
+  // its alpha is real.
+  static const auto updateRegion = reinterpret_cast<PFN_remixapi_UpdateUITextureRegionEXT>(
+      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateUITextureRegionEXT"));
+  const bool wide = t.format == D3DFMT_A8R8G8B8 || t.format == D3DFMT_X8R8G8B8;
+  if (t.registeredVersion && t.registeredVersion != t.version && updateRegion && wide &&
+      t.data.size() == size_t(t.width) * t.height * 4) {
+    const uint32_t x0 = t.dirty[0], y0 = t.dirty[1], x1 = t.dirty[2], y1 = t.dirty[3];
+    remixapi_ErrorCode updated = REMIXAPI_ERROR_CODE_SUCCESS;
+    if (x1 > x0 && y1 > y0) {
+      Timer timer(g_usUiRegister);
+      ++g_uiRegionUpdates;
+      g_uiRegisteredBytes += uint64_t(x1 - x0) * (y1 - y0) * 4;
+      const uint8_t *rows = t.data.data() + (size_t(y0) * t.width + x0) * 4;
+      uint32_t pitch = t.width * 4;
+      std::vector<uint8_t> opaque;
+      if (t.format == D3DFMT_X8R8G8B8) {
+        opaque.resize(size_t(x1 - x0) * (y1 - y0) * 4);
+        for (uint32_t y = 0; y < y1 - y0; ++y)
+          std::memcpy(opaque.data() + size_t(y) * (x1 - x0) * 4, rows + size_t(y) * pitch, size_t(x1 - x0) * 4);
+        for (size_t i = 3; i < opaque.size(); i += 4)
+          opaque[i] = 0xff;
+        rows = opaque.data();
+        pitch = (x1 - x0) * 4;
+      }
+      Timer apiTimer(g_usUiRegisterApi);
+      updated = updateRegion(id, x0, y0, x1 - x0, y1 - y0, REMIXAPI_FORMAT_B8G8R8A8_UNORM, rows, pitch);
+    }
+    if (updated == REMIXAPI_ERROR_CODE_SUCCESS) {
+      std::fill_n(t.dirty, 4, 0u);
+      t.registeredVersion = t.version;
+      return id;
+    }
+  }
   if (t.registeredVersion != t.version) {
     Timer timer(g_usUiRegister);
     ++g_uiRegistrations;
     g_uiRegisteredBytes += uint64_t(t.width) * t.height * 4;
+    std::fill_n(t.dirty, 4, 0u);
     std::vector<uint8_t> rgba;
     remixapi_Format format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
     if (t.format == D3DFMT_DXT1) {
@@ -1811,6 +1862,7 @@ void storeCpuCopy(const void *texture, uint32_t width, uint32_t height, D3DFORMA
   cpu->height = height;
   cpu->format = format;
   cpu->data = std::move(pixels);
+  cpu->touch(0, 0, width, height);
   ++cpu->version;
 }
 
@@ -1909,11 +1961,30 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
     cpu->format = format;
     cpu->data.assign(size_t(rowBytes) * rows, 0);
   }
+  // GMod rewrites a Chromium page's whole rectangle on every repaint: only
+  // the bytes that differ from the copy mark it dirty (the region forwarded
+  // to the runtime), unchanged rows are not even copied.
+  uint32_t changedX0 = ~0u, changedX1 = 0, changedY0 = ~0u, changedY1 = 0;
   for (uint32_t y = y0; y < std::min(y1, rows); ++y) {
     const uint32_t bytes = (std::min(x1, rowBytes / unitBytes) - x0) * unitBytes;
-    std::memcpy(cpu->data.data() + size_t(y) * rowBytes + size_t(x0) * unitBytes, data + size_t(y - y0) * pitch,
-                bytes);
+    uint8_t *to = cpu->data.data() + size_t(y) * rowBytes + size_t(x0) * unitBytes;
+    const uint8_t *from = data + size_t(y - y0) * pitch;
+    if (std::memcmp(to, from, bytes) == 0)
+      continue;
+    uint32_t first = 0, last = bytes;
+    while (first < bytes && to[first] == from[first])
+      ++first;
+    while (last > first && to[last - 1] == from[last - 1])
+      --last;
+    changedX0 = std::min(changedX0, x0 + first / unitBytes);
+    changedX1 = std::max(changedX1, x0 + (last + unitBytes - 1) / unitBytes);
+    changedY0 = std::min(changedY0, y);
+    changedY1 = y + 1;
+    std::memcpy(to, from, bytes);
   }
+  if (changedX1 <= changedX0)
+    return;
+  cpu->touch(changedX0 * unit, changedY0 * unit, changedX1 * unit, changedY1 * unit);
   ++cpu->version;
 }
 
@@ -2102,8 +2173,9 @@ void dumpStatistics(FILE *out) {
     size_t bytes = 0;
     for (auto &[t, c] : g_cpuTextures)
       bytes += c->data.size();
-    fprintf(out, "   CPU texture copies: %.1f MiB; UI texture registrations per frame %.2f (%.2f MiB, %.2f ms, runtime %.2f ms)\n",
-            bytes / 1048576.0, g_uiRegistrations.exchange(0) / f, g_uiRegisteredBytes.exchange(0) / f / 1048576.0,
+    fprintf(out, "   CPU texture copies: %.1f MiB; UI texture registrations per frame %.2f, region updates %.2f (%.2f MiB, %.2f ms, runtime %.2f ms)\n",
+            bytes / 1048576.0, g_uiRegistrations.exchange(0) / f, g_uiRegionUpdates.exchange(0) / f,
+            g_uiRegisteredBytes.exchange(0) / f / 1048576.0,
             g_usUiRegister.exchange(0) / f / 1000, g_usUiRegisterApi.exchange(0) / f / 1000);
   }
   fprintf(out, "   flat (2D) %.1f; textures uploaded %u, unsupported formats %u, live %zu\n",
