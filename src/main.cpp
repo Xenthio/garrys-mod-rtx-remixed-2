@@ -4,6 +4,7 @@
 #include "d3d_hooks.h"
 #include "engine_lights.h"
 #include "engine_patches.h"
+#include "engine_shadows.h"
 #include "remix_output.h"
 #include "vtable_proxy.h"
 
@@ -371,6 +372,7 @@ DWORD WINAPI statisticsThread(void *) {
       proxy::d3d::dumpStatistics(f);
       proxy::engine_patches::dumpStatistics(f);
       proxy::engine_lights::dumpStatistics(f);
+      proxy::engine_shadows::dumpStatistics(f);
       proxy::dumpStatistics(f);
       fclose(f);
     }

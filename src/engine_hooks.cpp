@@ -1,6 +1,7 @@
 #include "engine_hooks.h"
 #include "engine_lights.h"
 #include "engine_patches.h"
+#include "engine_shadows.h"
 
 #include <windows.h>
 
@@ -158,6 +159,7 @@ bool install() {
       patch(*static_cast<void ***>(renderView), 13, reinterpret_cast<void *>(&openremix_drawWorldLists));
   engine_patches::install();
   engine_lights::install();
+  engine_shadows::install();
   done = true;
   return true;
 }
