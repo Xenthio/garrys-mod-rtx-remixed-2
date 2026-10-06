@@ -22,6 +22,7 @@
 #include <array>
 #include <cstddef>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -2566,6 +2567,31 @@ void dumpStatistics(FILE *out) {
                    "6 notequal 7 gequal 8 always; stencil op: 1 keep 3 replace 4 incrsat 7 incr):\n");
     for (const auto &[key, row] : g_census)
       fprintf(out, "     %7.2f draws %8.1f prims  %s\n", row.draws / f, row.primitives / f, key.c_str());
+    // The statistics file holds one interval: every state seen since launch
+    // also goes, once, to shaderapi_proxy_census.log (texture and target
+    // pointers left out of the identity, so a state is not repeated per
+    // texture), with the interval it first appeared in.
+    static std::unordered_set<std::string> logged;
+    static uint32_t interval = 0;
+    ++interval;
+    FILE *log = nullptr;
+    for (const auto &[key, row] : g_census) {
+      std::string identity = key;
+      for (size_t at = identity.find("0000"); at != std::string::npos; at = identity.find("0000", at)) {
+        size_t end = at;
+        while (end < identity.size() && std::isxdigit(static_cast<unsigned char>(identity[end])))
+          ++end;
+        identity.replace(at, end - at, "*");
+      }
+      if (!logged.insert(identity).second)
+        continue;
+      if (!log)
+        log = _wfopen((g_moduleDir + L"\\shaderapi_proxy_census.log").c_str(), logged.size() == 1 ? L"w" : L"a");
+      if (log)
+        fprintf(log, "[%4u] %7.2f draws %8.1f prims  %s\n", interval, row.draws / f, row.primitives / f, key.c_str());
+    }
+    if (log)
+      fclose(log);
     g_census.clear();
   }
   fprintf(out, "   halos per frame: %.2f groups, %.2f source instances\n", g_stats.haloGroups.exchange(0) / f,
