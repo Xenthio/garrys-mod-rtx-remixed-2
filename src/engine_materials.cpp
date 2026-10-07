@@ -1,4 +1,5 @@
 #include "engine_materials.h"
+#include "remix_output.h"
 
 #include <windows.h>
 
@@ -170,11 +171,13 @@ struct Entry {
   Shading::Mode kind = Shading::Lit; // by shader: Lit (nothing to read), Unlit, SelfIllumBaseAlpha (capable)
   // Indices into the shader params (-1: the shader has no such parameter).
   int16_t flags = -1, color = -1, color2 = -1, tint = -1, mask = -1, maskScale = -1, envmapMask = -1,
-          envmapMaskAlpha = -1, fresnel = -1, fresnelRange = -1;
+          envmapMaskAlpha = -1, fresnel = -1, fresnelRange = -1, base = -1;
   std::string name, shaderName;
-  // The mask texture's name, by the ITexture last seen in the var.
-  void *maskTexture = nullptr;
-  std::string maskName;
+  // A texture var's name, by the ITexture last seen in it.
+  struct TextureName {
+    void *texture = nullptr;
+    std::string name;
+  } maskTexture, baseTexture;
 };
 std::unordered_map<void *, Entry> g_entries; // render thread
 Shading g_current;                           // render thread
@@ -214,7 +217,7 @@ void *paramAt(const Entry &e, int index) {
 bool defined(void *var) { return var && varType(var) != kTypeUndefined; }
 
 // The name of the texture a var holds ("" when it holds none).
-const std::string &textureName(Entry &e, void *var) {
+const std::string &textureName(Entry::TextureName &cache, void *var) {
   static const std::string none;
   if (!var || varType(var) != kTypeTexture)
     return none;
@@ -222,16 +225,16 @@ const std::string &textureName(Entry &e, void *var) {
   std::memcpy(&texture, static_cast<const uint8_t *>(var) + kVarTexture, sizeof(texture));
   if (!texture || texture == reinterpret_cast<void *>(~uintptr_t(0)))
     return none;
-  if (texture != e.maskTexture) {
+  if (texture != cache.texture) {
     // An ITexture of the material system (its vtable is in that module).
     const uintptr_t vtable = *static_cast<uintptr_t *>(texture);
     if (!g_materialSystem.inside(vtable, sizeof(void *)) ||
         !g_materialSystem.inside(*reinterpret_cast<uintptr_t *>(vtable), 1))
       return none;
-    e.maskName = lower(reinterpret_cast<NameFn>(*reinterpret_cast<void **>(vtable))(texture));
-    e.maskTexture = texture;
+    cache.name = lower(reinterpret_cast<NameFn>(*reinterpret_cast<void **>(vtable))(texture));
+    cache.texture = texture;
   }
-  return e.maskName;
+  return cache.name;
 }
 
 void resolve(Entry &e, void *material) {
@@ -243,8 +246,6 @@ void resolve(Entry &e, void *material) {
     std::lock_guard<std::mutex> lock(g_stats.lock);
     ++g_stats.shaders[e.shaderName];
   }
-  if (e.kind == Shading::Lit)
-    return;
   struct Wanted {
     const char *name;
     int16_t Entry::*index;
@@ -260,6 +261,7 @@ void resolve(Entry &e, void *material) {
       {"$selfillum_envmapmask_alpha", &Entry::envmapMaskAlpha},
       {"$selfillumfresnel", &Entry::fresnel},
       {"$selfillumfresnelminmaxexp", &Entry::fresnelRange},
+      {"$basetexture", &Entry::base},
   };
   for (int i = 0; i < e.count; ++i) {
     void *var = paramAt(e, i);
@@ -307,7 +309,7 @@ void read(Entry &e, Shading &out) {
   for (float &c : out.tint)
     c = std::max(c, 0.0f);
   if (maskAlpha) {
-    const std::string &name = textureName(e, paramAt(e, e.envmapMask));
+    const std::string &name = textureName(e.maskTexture, paramAt(e, e.envmapMask));
     if (name.empty()) {
       g_stats.noMaskTexture.fetch_add(1, std::memory_order_relaxed);
       return;
@@ -319,7 +321,7 @@ void read(Entry &e, Shading &out) {
   }
   out.mode = Shading::SelfIllumBaseAlpha;
   if (void *maskVar = paramAt(e, e.mask); defined(maskVar)) {
-    const std::string &name = textureName(e, maskVar);
+    const std::string &name = textureName(e.maskTexture, maskVar);
     if (name.empty()) {
       // The shader samples the mask instead of the base alpha: without its
       // texture nothing is known to glow.
@@ -475,9 +477,14 @@ void onBind(void *material) {
     resolve(e, material);
   }
   g_currentEntry = &e;
-  if (e.kind == Shading::Lit)
-    return;
-  read(e, g_current);
+  if (e.kind != Shading::Lit)
+    read(e, g_current);
+  // Draws are matched to the material by its base texture as well
+  // (remix::onMaterialBound): some reach D3D while another one is bound.
+  if (e.base >= 0)
+    if (void *var = e.params[e.base]; var && *static_cast<uintptr_t *>(var) == g_materialSystem.base + kVarVtable)
+      g_current.base = textureName(e.baseTexture, var);
+  remix::onMaterialBound(g_current, e.name.c_str());
   if (g_current.mode == Shading::Lit)
     return;
   switch (g_current.mode) {

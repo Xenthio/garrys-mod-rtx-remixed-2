@@ -59,7 +59,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
@@ -329,20 +329,24 @@ bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
 
 // The uploaded texture a mask name stands for (its dxvk hash), or 0.
 // Render thread. Candidate hashes come from the VTF file (as the BSP world's).
-uint64_t maskTextureHash(const std::string &name) {
-  struct Mask {
-    std::vector<uint64_t> candidates;
-    uint64_t resolved = 0;
-  };
-  static std::unordered_map<std::string, Mask> masks;
+struct NamedTexture {
+  std::vector<uint64_t> candidates;
+  uint64_t resolved = 0;
+};
+NamedTexture &namedTexture(const std::string &name) {
+  static std::unordered_map<std::string, NamedTexture> masks;
   if (masks.size() > 4096)
     masks.clear();
   auto [it, added] = masks.try_emplace(name);
-  Mask &mask = it->second;
   if (added)
-    mask.candidates = bsp::textureCandidates(name);
+    it->second.candidates = bsp::textureCandidates(name);
+  return it->second;
+}
+
+uint64_t maskTextureHash(const std::string &name, bool count = true) {
+  NamedTexture &mask = namedTexture(name);
   if (mask.candidates.empty()) {
-    ++g_stats.emissiveMaskNoHash;
+    g_stats.emissiveMaskNoHash += count;
     return 0;
   }
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
@@ -359,8 +363,57 @@ uint64_t maskTextureHash(const std::string &name) {
       break;
     }
   if (!mask.resolved)
-    ++g_stats.emissiveMaskNotUploaded;
+    g_stats.emissiveMaskNotUploaded += count;
   return mask.resolved;
+}
+
+// A draw belongs to the material bound when it reaches D3D, usually. Not
+// always (seen: a self-illuminated prop bound every frame whose draw arrived
+// under another material from some view directions), so the materials that
+// are not plainly lit are also known by their base texture: a draw of that
+// texture takes the latest bind of a material with it, lit or not.
+struct BoundShading {
+  engine_materials::Shading shading;
+  std::string material;
+  uint64_t frame = 0;
+};
+std::unordered_map<std::string, BoundShading> g_shadingByBase;  // base texture name; render thread
+std::unordered_map<uint64_t, std::string> g_emissiveBaseNames;  // uploaded texture hash -> that name
+struct Rebound {
+  std::string bound;
+  uint32_t draws = 0;
+};
+std::map<std::string, Rebound> g_rebound; // statistics, under g_transientSampleLock
+
+// The shading of a draw of `texture`, given the bound material's.
+engine_materials::Shading shadingFor(const void *texture, const engine_materials::Shading &bound) {
+  using engine_materials::Shading;
+  const uint64_t hash = textureHash(texture);
+  const auto name = hash ? g_emissiveBaseNames.find(hash) : g_emissiveBaseNames.end();
+  if (name != g_emissiveBaseNames.end()) {
+    const auto latest = g_shadingByBase.find(name->second);
+    if (latest != g_shadingByBase.end() && latest->second.frame + 1 >= g_frame) {
+      if (bound.base != name->second) {
+        std::lock_guard<std::mutex> lock(g_transientSampleLock);
+        if (g_rebound.size() < 32 || g_rebound.count(latest->second.material)) {
+          Rebound &r = g_rebound[latest->second.material];
+          r.bound = engine_materials::currentName();
+          ++r.draws;
+        }
+      }
+      return latest->second.shading;
+    }
+  }
+  // Counted, not acted on: a bound unlit or self-illuminated material whose
+  // file's hashes do not include this draw's texture (which may still be its
+  // own: other frames of an animated texture are not among them).
+  if (bound.mode != Shading::Lit && !bound.base.empty() && hash) {
+    const auto &candidates = namedTexture(bound.base).candidates;
+    if (maskTextureHash(bound.base, false) &&
+        std::find(candidates.begin(), candidates.end(), hash) == candidates.end())
+      ++g_stats.emissiveNotItsTexture;
+  }
+  return bound;
 }
 
 // The variant of a texture's material that shows it as `s` says, with the
@@ -1898,7 +1951,7 @@ void onDraw(const Draw &d) {
   const bool additiveDraw = d.blend && d.dstBlend == D3DBLEND_ONE;
   engine_materials::Shading shading;
   if (!additiveDraw && !multiply)
-    shading = engine_materials::current();
+    shading = shadingFor(d.texture0, engine_materials::current());
   // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
   // panels, sprites). Other COLOR0 streams (baked prop lighting) do not.
   const bool unlitColors = shading.mode == engine_materials::Shading::Unlit && shading.vertexColor &&
@@ -2930,6 +2983,27 @@ void applyTargetPixels() {
   g_targetPixels.clear();
 }
 
+void onMaterialBound(const engine_materials::Shading &shading, const char *material) {
+  if (shading.base.empty())
+    return;
+  auto known = g_shadingByBase.find(shading.base);
+  if (known == g_shadingByBase.end()) {
+    if (shading.mode == engine_materials::Shading::Lit)
+      return; // textures only lit materials use need no record
+    if (g_shadingByBase.size() > 4096) {
+      g_shadingByBase.clear();
+      g_emissiveBaseNames.clear();
+    }
+    known = g_shadingByBase.emplace(shading.base, BoundShading{}).first;
+  }
+  known->second.shading = shading;
+  known->second.material = material ? material : "";
+  known->second.frame = g_frame;
+  if (shading.mode != engine_materials::Shading::Lit)
+    if (const uint64_t hash = maskTextureHash(shading.base, false))
+      g_emissiveBaseNames[hash] = shading.base;
+}
+
 void onTextureCopy(const void *source, const void *destination) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(source);
@@ -3162,6 +3236,16 @@ void dumpStatistics(FILE *out) {
             pinned, g_stats.emissiveCreated.exchange(0), g_stats.emissiveEvicted.exchange(0),
             g_stats.emissiveFailed.exchange(0), g_stats.emissiveNoTexture.exchange(0) / f,
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
+  {
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    fprintf(out, "   draws matched to a material by base texture while another was bound: %zu materials; emissive draws of a "
+                 "texture its bound material's file does not list %.1f per frame\n",
+            g_rebound.size(), g_stats.emissiveNotItsTexture.exchange(0) / f);
+    for (const auto &[material, r] : g_rebound)
+      fprintf(out, "     %s: %.2f draws per frame, last while %s was bound\n", material.c_str(), r.draws / f,
+              r.bound.empty() ? "(unknown)" : r.bound.c_str());
+    g_rebound.clear();
+  }
   }
   fprintf(out, "   halos per frame: %.2f groups, %.2f source instances | stencil masks: %.2f groups, %.2f sources, "
                "%.2f overlays, %.2f UI draws, %.2f cut instances\n",

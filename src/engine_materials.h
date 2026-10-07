@@ -29,6 +29,7 @@ struct Shading {
   float tint[3] = {1, 1, 1}; // linear multiplier of the emitted colour
   float maskScale = 1;       // emitted share = mask * maskScale (above one: overbright)
   std::string mask;          // mask texture ("models/x/y_mask"), SelfIllumMask / MaskAlpha
+  std::string base;          // $basetexture's name ("" when unknown), also of Lit materials
 };
 
 // The shading a VMT's shader name selects: Unlit for the unlit shaders,

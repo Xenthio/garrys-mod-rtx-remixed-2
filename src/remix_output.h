@@ -8,6 +8,9 @@
 
 // Converts the draws the original shader API issues into Remix API calls
 // (through remix_bridge.dll) and presents them into the game window.
+namespace proxy::engine_materials {
+struct Shading;
+}
 namespace proxy::remix {
 
 struct VertexStream {
@@ -86,6 +89,8 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
 // UpdateTexture(src, dst): dst now shows src's contents.
 void onTextureCopy(const void *source, const void *destination);
 void onTextureReleased(const void *texture);
+// IShaderAPI::Bind (engine_materials): the material now bound and its name.
+void onMaterialBound(const engine_materials::Shading &shading, const char *material);
 // Contents read back from a render-target texture the scene samples (32-bit,
 // B8G8R8A8 rows); it becomes the texture's image after this frame's Present.
 void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
