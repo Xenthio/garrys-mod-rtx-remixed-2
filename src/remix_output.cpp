@@ -309,18 +309,15 @@ namespace {
 //   1  the BSP world's: self-illuminated parts of brushes and static props,
 //      and unlit materials whose VMT says $selfillum (light panels, monitors).
 //      A fixed set of emitters.
-//   1  (default) the BSP world's and static props' emitters only.
-//   2  also the self-illuminated parts of what the engine draws (models, the
-//      view model). Every lit triangle is an emitter and their number changes
-//      as the prop moves and is culled: gm_voidplaces with one helicopter
-//      bomb, 400..960 emitters, 6.5 rebuilds of the runtime's light tree per
-//      second at ~30 ms each (its per-cluster visibility table), a stutter.
+//   2  (default) also the self-illuminated parts of what the engine draws
+//      (models, the view model). Their emitters come and go with the prop;
+//      the runtime keeps them in the dynamic part of its light hierarchy.
 //   3  also every unlit surface (foliage cards, skybox scenery, 3D2D panels,
 //      sprites: many emitters, changing every frame).
 bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
   static const int mode = [] {
     char v[8] = {};
-    return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 1;
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 2;
   }();
   if (mode <= 0)
     return false;
