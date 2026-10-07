@@ -309,16 +309,18 @@ namespace {
 //   1  the BSP world's: self-illuminated parts of brushes and static props,
 //      and unlit materials whose VMT says $selfillum (light panels, monitors).
 //      A fixed set of emitters.
-//   2  (default) also the self-illuminated parts of what the engine draws
-//      (models, the view model). These emitters come and go with the engine's
-//      culling: each change of the set rebuilds the runtime's light tree
-//      (its light-guiding history starts over).
+//   1  (default) the BSP world's and static props' emitters only.
+//   2  also the self-illuminated parts of what the engine draws (models, the
+//      view model). Every lit triangle is an emitter and their number changes
+//      as the prop moves and is culled: gm_voidplaces with one helicopter
+//      bomb, 400..960 emitters, 6.5 rebuilds of the runtime's light tree per
+//      second at ~30 ms each (its per-cluster visibility table), a stutter.
 //   3  also every unlit surface (foliage cards, skybox scenery, 3D2D panels,
 //      sprites: many emitters, changing every frame).
 bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
   static const int mode = [] {
     char v[8] = {};
-    return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 2;
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 1;
   }();
   if (mode <= 0)
     return false;
@@ -1787,8 +1789,12 @@ void onDraw(const Draw &d) {
   // Source depth-biases decals and overlays. Alpha-over and multiplicative
   // ones (blood and dirt: DESTCOLOR*SRCCOLOR) paint the surface below; the
   // runtime needs them lifted off it, since only D3D applied the bias.
-  const bool multiply = (d.srcBlend == D3DBLEND_DESTCOLOR && (d.dstBlend == D3DBLEND_SRCCOLOR || d.dstBlend == D3DBLEND_ZERO)) ||
-                        (d.srcBlend == D3DBLEND_ZERO && d.dstBlend == D3DBLEND_SRCCOLOR);
+  // (Blending on: the factors stay set after a decal, and the opaque draws
+  // that followed one, with them still DESTCOLOR/SRCCOLOR, counted as
+  // multiplying: their unlit or self-illuminated materials were not applied.)
+  const bool multiply = d.blend &&
+                        ((d.srcBlend == D3DBLEND_DESTCOLOR && (d.dstBlend == D3DBLEND_SRCCOLOR || d.dstBlend == D3DBLEND_ZERO)) ||
+                         (d.srcBlend == D3DBLEND_ZERO && d.dstBlend == D3DBLEND_SRCCOLOR));
   constexpr uint32_t kDecalCategories =
       REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC |
       REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET;
