@@ -59,7 +59,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
@@ -1312,7 +1312,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   // with the last weight implied; the shader's bone count selects how many apply.
   std::vector<float> weights;
   std::vector<uint32_t> bones;
-  uint32_t maxBone = 0;
+  uint32_t maxBone = 0, maxWeightedBone = 0;
   if (bonesPerVertex) {
     weights.resize(size_t(count) * bonesPerVertex);
     bones.resize(weights.size());
@@ -1345,6 +1345,8 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         weights[size_t(v) * bonesPerVertex + k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
         bones[size_t(v) * bonesPerVertex + k] = bone;
         maxBone = std::max(maxBone, bone);
+        if (weights[size_t(v) * bonesPerVertex + k] > 0)
+          maxWeightedBone = std::max(maxWeightedBone, bone);
       }
     }
     if (maxBone >= kMaxBones) {
@@ -1382,7 +1384,13 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   surface.vertices_count = vertices.size();
   surface.indices_values = indices.data();
   surface.indices_count = indices.size();
-  if (bonesPerVertex) {
+  // Every vertex on bone 0 alone (props, most physics models: Source draws
+  // them through the skinning shader with one matrix): a rigid mesh, placed
+  // by that matrix as its instance transform. One mesh and one acceleration
+  // structure for all its instances, rigid motion vectors, and nothing for
+  // the runtime to skin or to treat as a deforming surface.
+  const bool rigid = bonesPerVertex && maxWeightedBone == 0;
+  if (bonesPerVertex && !rigid) {
     surface.skinning_hasvalue = 1;
     surface.skinning_value.bonesPerVertex = bonesPerVertex;
     surface.skinning_value.blendWeights_values = weights.data();
@@ -1390,8 +1398,8 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     surface.skinning_value.blendIndices_values = bones.data();
     surface.skinning_value.blendIndices_count = uint32_t(bones.size());
   }
-  if (boneCount)
-    *boneCount = bonesPerVertex ? maxBone + 1 : 0;
+  if (boneCount) // 1: rigid (see above)
+    *boneCount = !bonesPerVertex ? 0 : rigid ? 1 : std::max(maxBone + 1, 2u);
   remixapi_MeshInfo info = {};
   info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
   info.hash = hash ? hash : 1;
@@ -2035,14 +2043,16 @@ void onDraw(const Draw &d) {
   inst.persistent = !(ps.dynamic || d.indices.dynamic);
   noteReplacementKey(inst.replacementHash);
   inst.texture0 = d.texture0;
-  if (boneCount) {
+  if (boneCount > 1) {
     // Bone matrices map the bind pose straight to world space.
     inst.bones.resize(boneCount);
     std::memcpy(inst.bones.data(), d.vsConstants + kRegModel * 4, boneCount * sizeof(remixapi_Transform));
     static const float identity[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
     std::memcpy(inst.transform, identity, sizeof(inst.transform));
   } else {
+    // The model matrix, which is also bone 0 (a rigid studio model's only one).
     std::memcpy(inst.transform, d.vsConstants + kRegModel * 4, sizeof(inst.transform));
+    g_stats.rigidModels += boneCount == 1;
   }
   inst.view = viewKey;
   if (d.stencil) { // see StencilGroup
@@ -3035,12 +3045,12 @@ void dumpStatistics(FILE *out) {
   fprintf(out,
           "== Remix per frame (%u frames, %zu cached meshes): draws %.1f accepted %.1f submitted %.1f | skipped: "
           "offTarget %.1f noPos %.1f noData %.1f skinned %.1f badPrim %.1f badRange %.1f | hits %.1f created %.1f "
-          "transient %.1f evicted %.1f\n",
+          "transient %.1f evicted %.1f | single-bone models drawn rigid %.1f\n",
           frames, g_meshes.size(), g_stats.draws.exchange(0) / f, g_stats.accepted.exchange(0) / f,
           g_stats.submitted.exchange(0) / f, g_stats.offTarget.exchange(0) / f, g_stats.noPosition.exchange(0) / f,
           g_stats.noData.exchange(0) / f, g_stats.skinned.exchange(0) / f, g_stats.badPrim.exchange(0) / f,
           g_stats.badRange.exchange(0) / f, g_stats.cacheHits.exchange(0) / f, g_stats.created.exchange(0) / f,
-          g_stats.transient.exchange(0) / f, g_stats.evicted.exchange(0) / f);
+          g_stats.transient.exchange(0) / f, g_stats.evicted.exchange(0) / f, g_stats.rigidModels.exchange(0) / f);
   fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f\n",
           g_stats.bspDropped.exchange(0) / f, g_stats.bspKeptBlended.exchange(0) / f,
           g_stats.bspKeptDynamic.exchange(0) / f);
