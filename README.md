@@ -1,5 +1,4 @@
-# gmodrtx
-
+# shaderapirtx
 A proxy `shaderapidx9.dll` for Garry's Mod's x86-64 branch that wraps the
 Source shader API (and later D3D9) to submit the game's rendering to
 OpenRemix through the Remix C API, in process (no 32-bit bridge). Ported from
