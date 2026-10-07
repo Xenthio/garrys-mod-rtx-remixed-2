@@ -6,6 +6,7 @@
 #include "bsp_world.h"
 #include "dxvk_hash.h"
 #include "engine_lights.h"
+#include "engine_materials.h"
 #include "texture_categories.h"
 #include <unordered_set>
 
@@ -59,6 +60,10 @@ uint64_t g_frame = 0;
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
       badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0};
+  // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
+  std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
+      emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
+      emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -108,18 +113,12 @@ struct RemixTexture {
   remixapi_MaterialHandle skyMaterial = nullptr; // tinted by rtx.skyBrightness
   float skyBrightness = 0;
   uint64_t hash = 0;
-  ~RemixTexture() {
-    if (!g_ready)
-      return;
-    if (material)
-      g_api.DestroyMaterial(material);
-    if (skyMaterial)
-      g_api.DestroyMaterial(skyMaterial);
-    if (texture)
-      g_api.DestroyTexture(texture);
-  }
+  std::vector<uint64_t> emissive; // its unlit / self-illuminated variants (g_emissiveMaterials keys)
+  ~RemixTexture();
 };
-std::mutex g_textureLock;
+// Recursive: a texture record can be released, and its destructor run, while
+// the lock is held.
+std::recursive_mutex g_textureLock;
 std::unordered_map<const void *, std::shared_ptr<RemixTexture>> g_textures;
 // D3D textures with identical contents share one record: the dxvk hash names
 // the runtime texture and material, and mods key material replacements by it.
@@ -189,7 +188,7 @@ std::atomic<float> g_skyBrightness{1.0f};
 uint64_t textureHash(const void *texture) {
   if (!texture)
     return 0;
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
   return it == g_textures.end() ? 0 : it->second->hash;
 }
@@ -251,14 +250,248 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
 }
 
 remixapi_MaterialHandle materialFor(const void *texture, float skyBrightness = 0) {
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
   return it == g_textures.end() ? nullptr : ensureMaterial(*it->second, skyBrightness);
 }
 
-// The material of an uploaded texture by its dxvk hash, for the BSP world.
-bsp::MaterialRef materialForHash(uint64_t hash) {
-  std::lock_guard<std::mutex> lock(g_textureLock);
+float envScale(const char *name, float fallback);
+
+// --- Unlit and self-illuminated materials -------------------------------------
+// Source's unlit shaders output texture x colour, and $selfillum replaces the
+// lighting of the masked part of a surface by tint x texture: the value a
+// surface of that colour has under a lighting of 1 (a full-bright lightmap).
+// The proxy's lights and sky keep Source's lighting values, so the same holds
+// here with an emission of 1 x colour (remixapi_MaterialInfoSelfIlluminationEXT:
+// measured equal to the same texture lit by a uniform radiance of 1, and
+// metered by the auto exposure like it). OPENREMIX_PROXY_EMISSIVE_SCALE
+// scales it.
+// Such a material is a variant of its base texture's: the same texture is lit
+// in one material and glows in another, and tints change at runtime (material
+// proxies), so variants are keyed by everything that defines them and dropped
+// when unused. The plain lit material keeps the texture's hash (mod
+// replacements are keyed by it).
+struct EmissiveMaterial {
+  remixapi_MaterialHandle handle = nullptr;
+  uint64_t lastFrame = 0;
+  uint32_t pins = 0; // BSP materials holding it
+};
+std::unordered_map<uint64_t, EmissiveMaterial> g_emissiveMaterials; // by material hash; under g_textureLock
+
+} // namespace
+RemixTexture::~RemixTexture() {
+  // Its variants go with it (a render-target texture is a new record per
+  // image: variants left behind would keep every old image alive). One the
+  // BSP world holds keeps this record alive, so none is pinned here.
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    for (uint64_t key : emissive)
+      if (auto found = g_emissiveMaterials.find(key); found != g_emissiveMaterials.end() && !found->second.pins) {
+        if (g_ready && found->second.handle)
+          g_api.DestroyMaterial(found->second.handle);
+        g_emissiveMaterials.erase(found);
+      }
+  }
+  if (!g_ready)
+    return;
+  if (material)
+    g_api.DestroyMaterial(material);
+  if (skyMaterial)
+    g_api.DestroyMaterial(skyMaterial);
+  if (texture)
+    g_api.DestroyTexture(texture);
+}
+namespace {
+
+// OPENREMIX_PROXY_EMISSIVE_LIGHTS: which of these surfaces light the scene
+// (the runtime's emissive triangle lights; all of them glow either way).
+//   0  none.
+//   1  the BSP world's: self-illuminated parts of brushes and static props,
+//      and unlit materials whose VMT says $selfillum (light panels, monitors).
+//      A fixed set of emitters.
+//   2  (default) also the self-illuminated parts of what the engine draws
+//      (models, the view model). These emitters come and go with the engine's
+//      culling: each change of the set rebuilds the runtime's light tree
+//      (its light-guiding history starts over).
+//   3  also every unlit surface (foliage cards, skybox scenery, 3D2D panels,
+//      sprites: many emitters, changing every frame).
+bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
+  static const int mode = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 2;
+  }();
+  if (mode <= 0)
+    return false;
+  if (s.mode == engine_materials::Shading::Unlit)
+    return mode >= 3 || (bspWorld && s.luminous);
+  return bspWorld || mode >= 2;
+}
+
+// The uploaded texture a mask name stands for (its dxvk hash), or 0.
+// Render thread. Candidate hashes come from the VTF file (as the BSP world's).
+uint64_t maskTextureHash(const std::string &name) {
+  struct Mask {
+    std::vector<uint64_t> candidates;
+    uint64_t resolved = 0;
+  };
+  static std::unordered_map<std::string, Mask> masks;
+  if (masks.size() > 4096)
+    masks.clear();
+  auto [it, added] = masks.try_emplace(name);
+  Mask &mask = it->second;
+  if (added)
+    mask.candidates = bsp::textureCandidates(name);
+  if (mask.candidates.empty()) {
+    ++g_stats.emissiveMaskNoHash;
+    return 0;
+  }
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  auto live = [](uint64_t hash) {
+    auto found = g_texturesByHash.find(hash);
+    return found != g_texturesByHash.end() && !found->second.expired();
+  };
+  if (mask.resolved && live(mask.resolved))
+    return mask.resolved;
+  mask.resolved = 0;
+  for (uint64_t hash : mask.candidates)
+    if (live(hash)) {
+      mask.resolved = hash;
+      break;
+    }
+  if (!mask.resolved)
+    ++g_stats.emissiveMaskNotUploaded;
+  return mask.resolved;
+}
+
+// The variant of a texture's material that shows it as `s` says, with the
+// mask texture `maskHash` (0: none). Caller holds g_textureLock.
+EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shading &s, uint64_t maskHash, bool lights,
+                                 uint64_t *materialHash = nullptr) {
+  using engine_materials::Shading;
+  static const float scale = envScale("OPENREMIX_PROXY_EMISSIVE_SCALE", 1.0f);
+  // Tints are continuous (proxies animate them): 1/64 steps bound the variants.
+  struct Key {
+    uint64_t mask;
+    float maskScale;
+    uint16_t tint[3];
+    uint8_t mode, lights;
+  } key;
+  std::memset(&key, 0, sizeof(key)); // hashed as bytes
+  key.mask = maskHash;
+  key.maskScale = s.maskScale;
+  for (int c = 0; c < 3; ++c)
+    key.tint[c] = uint16_t(std::lround(std::clamp(std::isfinite(s.tint[c]) ? s.tint[c] : 0.0f, 0.0f, 64.0f) * 64));
+  key.mode = uint8_t(s.mode);
+  key.lights = lights;
+  uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), t.hash);
+  if (!hash || hash == t.hash)
+    hash = ~t.hash;
+  if (materialHash)
+    *materialHash = hash;
+  EmissiveMaterial &variant = g_emissiveMaterials[hash];
+  variant.lastFrame = g_frame;
+  if (variant.handle)
+    return &variant;
+  wchar_t path[32], maskPath[32];
+  swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
+  swprintf(maskPath, 32, L"0x%llX", static_cast<unsigned long long>(maskHash));
+  remixapi_MaterialInfoEmissionEXT emission = {};
+  emission.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_EMISSION_EXT;
+  emission.suppressLightGeneration = !lights;
+  remixapi_MaterialInfoSelfIlluminationEXT self = {};
+  self.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_SELF_ILLUMINATION_EXT;
+  self.pNext = &emission;
+  self.mask = s.mode == Shading::SelfIllumBaseAlpha   ? REMIXAPI_SELF_ILLUMINATION_MASK_ALBEDO_ALPHA_EXT
+              : s.mode == Shading::SelfIllumMaskAlpha ? REMIXAPI_SELF_ILLUMINATION_MASK_EMISSIVE_ALPHA_EXT
+                                                      : REMIXAPI_SELF_ILLUMINATION_MASK_NONE_EXT;
+  self.maskScale = std::isfinite(s.maskScale) && s.maskScale > 0 ? s.maskScale : 1;
+  // As the lit material (ensureMaterial), plus the emission.
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.pNext = &self;
+  opaque.albedoConstant = {1, 1, 1};
+  opaque.opacityConstant = 1;
+  opaque.alphaTestType = 7;
+  opaque.useDrawCallAlphaState = 1;
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = hash;
+  info.albedoTexture = path;
+  if (maskHash)
+    info.emissiveTexture = maskPath;
+  info.emissiveIntensity = scale;
+  info.emissiveColorConstant = {key.tint[0] / 64.0f, key.tint[1] / 64.0f, key.tint[2] / 64.0f};
+  info.filterMode = 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  if (g_api.CreateMaterial(&info, &variant.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_emissiveMaterials.erase(hash);
+    ++g_stats.emissiveFailed;
+    return nullptr;
+  }
+  ++g_stats.emissiveCreated;
+  // Evicted variants (animated tints) leave their keys behind.
+  if (t.emissive.size() >= 256)
+    t.emissive.erase(std::remove_if(t.emissive.begin(), t.emissive.end(),
+                                    [](uint64_t k) { return !g_emissiveMaterials.count(k); }),
+                     t.emissive.end());
+  t.emissive.push_back(hash);
+  return &variant;
+}
+
+// A draw's material: the texture's lit one, or its unlit / self-illuminated
+// variant (falling back to the lit one when its mask texture is not known).
+remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s) {
+  using engine_materials::Shading;
+  if (s.mode == Shading::Lit)
+    return materialFor(texture);
+  const bool masked = s.mode == Shading::SelfIllumMask || s.mode == Shading::SelfIllumMaskAlpha;
+  const uint64_t maskHash = masked ? maskTextureHash(s.mask) : 0;
+  if (masked && !maskHash)
+    return materialFor(texture);
+  const bool lights = emissiveLights(s, false);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  auto it = g_textures.find(texture);
+  if (it == g_textures.end())
+    return nullptr;
+  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights)) {
+    switch (s.mode) {
+    case Shading::Unlit: ++g_stats.unlitDraws; break;
+    case Shading::SelfIllumBaseAlpha: ++g_stats.selfIllumDraws; break;
+    case Shading::SelfIllumMask: ++g_stats.selfIllumMaskDraws; break;
+    default: ++g_stats.selfIllumMaskAlphaDraws; break;
+    }
+    g_stats.emissiveLightDraws += lights;
+    return variant->handle;
+  }
+  return ensureMaterial(*it->second, 0);
+}
+
+// Variants nothing drew for a while (a tint that changed) go; pinned ones
+// belong to the BSP world, which does not ask again.
+void evictEmissiveMaterials() {
+  if (g_frame % 64)
+    return;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  for (auto it = g_emissiveMaterials.begin(); it != g_emissiveMaterials.end();) {
+    if (!it->second.pins && g_frame - it->second.lastFrame > 300) {
+      if (it->second.handle)
+        g_api.DestroyMaterial(it->second.handle);
+      ++g_stats.emissiveEvicted;
+      it = g_emissiveMaterials.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// The material of an uploaded texture by its dxvk hash, for the BSP world;
+// `emission`: its unlit / self-illuminated variant, with the first uploaded
+// of `maskCandidates` as mask (no handle until that is uploaded).
+bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading *emission,
+                                 const std::vector<uint64_t> *maskCandidates) {
+  using engine_materials::Shading;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_texturesByHash.find(hash);
   if (it == g_texturesByHash.end())
     return {};
@@ -266,8 +499,45 @@ bsp::MaterialRef materialForHash(uint64_t hash) {
   if (!texture)
     return {};
   bsp::MaterialRef ref;
-  ref.handle = ensureMaterial(*texture, 0);
-  ref.keep = std::move(texture);
+  if (!emission || emission->mode == Shading::Lit) {
+    ref.handle = ensureMaterial(*texture, 0);
+    ref.keep = std::move(texture);
+    return ref;
+  }
+  uint64_t maskHash = 0;
+  if (emission->mode == Shading::SelfIllumMask || emission->mode == Shading::SelfIllumMaskAlpha) {
+    for (uint64_t candidate : maskCandidates ? *maskCandidates : std::vector<uint64_t>()) {
+      auto found = g_texturesByHash.find(candidate);
+      if (found != g_texturesByHash.end() && !found->second.expired()) {
+        maskHash = candidate;
+        break;
+      }
+    }
+    if (!maskHash)
+      return {};
+  }
+  uint64_t materialHash = 0;
+  EmissiveMaterial *variant = ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash);
+  if (!variant)
+    return {};
+  ++variant->pins;
+  ref.handle = variant->handle;
+  // Keeps the base texture, and the variant until the BSP material goes.
+  struct Pin {
+    std::shared_ptr<RemixTexture> texture;
+    uint64_t materialHash;
+  };
+  ref.keep = std::shared_ptr<void>(new Pin{std::move(texture), materialHash}, [](void *p) {
+    auto *pin = static_cast<Pin *>(p);
+    {
+      std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+      if (auto found = g_emissiveMaterials.find(pin->materialHash); found != g_emissiveMaterials.end() && found->second.pins) {
+        --found->second.pins;
+        found->second.lastFrame = g_frame;
+      }
+    }
+    delete pin; // may release the texture: outside the lock
+  });
   return ref;
 }
 
@@ -644,7 +914,7 @@ std::atomic<uint64_t> g_uiRegistrations{0}, g_uiRegionUpdates{0}, g_uiRegistered
 // Registers (or refreshes) the UI texture for a D3D texture; 0 when the
 // texture has no CPU copy (e.g. render targets).
 remixapi_UITextureHandle uiTextureFor(const void *texture) {
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_cpuTextures.find(texture);
   if (it == g_cpuTextures.end())
     return 0;
@@ -870,9 +1140,10 @@ void captureUi(const Draw &d) {
 // `vertexColors`: forward COLOR0 (additive raster-only draws: Source fades and
 // hides sprites and beams through it, e.g. a holstered gravity gun's beams
 // stay alive at brightness 0); such a draw that is all black adds nothing and
-// yields no mesh.
+// yields no mesh, unless `keepBlack` (unlit $vertexcolor surfaces: a black one
+// is still a surface).
 remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVertex, uint32_t *boneCount,
-                              float normalOffset = 0, bool vertexColors = false) {
+                              float normalOffset = 0, bool vertexColors = false, bool keepBlack = false) {
   Timer timer(g_usBuild);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
@@ -979,7 +1250,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       }
   }
   (void)ps;
-  if (col && !anyRgb) {
+  if (col && !anyRgb && !keepBlack) {
     ++g_stats.additiveBlack;
     return nullptr;
   }
@@ -1621,6 +1892,18 @@ void onDraw(const Draw &d) {
     }
   }
 
+  // What the Source material bound for this draw does with its texture
+  // (engine_materials). Additive and multiplying draws stay as they are:
+  // rasterized over the image, or paint on what is below.
+  const bool additiveDraw = d.blend && d.dstBlend == D3DBLEND_ONE;
+  engine_materials::Shading shading;
+  if (!additiveDraw && !multiply)
+    shading = engine_materials::current();
+  // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
+  // panels, sprites). Other COLOR0 streams (baked prop lighting) do not.
+  const bool unlitColors = shading.mode == engine_materials::Shading::Unlit && shading.vertexColor &&
+                           findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr;
+
   struct Key {
     const void *vb, *ib, *decl;
     uint32_t vbVersion, ibVersion, offset, stride;
@@ -1628,7 +1911,8 @@ void onDraw(const Draw &d) {
     uint32_t minIndex, numVertices, startIndex, primCount, type, bonesPerVertex;
   } key = {ps.buffer, d.indices.buffer, d.declaration, ps.version, d.indices.version, ps.offset, ps.stride,
            d.baseVertex, d.minIndex, d.numVertices, d.startIndex, d.primCount, uint32_t(d.type), bonesPerVertex};
-  const uint64_t hash = fnv(&key, sizeof(key)) ^ (decal ? 0xdeca1deca1deca1ull : 0);
+  const uint64_t hash = fnv(&key, sizeof(key)) ^ (decal ? 0xdeca1deca1deca1ull : 0) ^
+                        (unlitColors ? 0xc0105c0105c0105ull : 0);
 
   remixapi_MeshHandle mesh = nullptr;
   uint32_t boneCount = 0;
@@ -1641,8 +1925,8 @@ void onDraw(const Draw &d) {
       ++g_transientDecls[d.declaration];
     }
     // Additive as onPresent classifies it (destination factor ONE): raster only.
-    const bool additive = d.blend && d.dstBlend == D3DBLEND_ONE;
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0, additive);
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0, additiveDraw || unlitColors,
+                     unlitColors);
     if (!mesh)
       return;
     g_transient.push_back(mesh);
@@ -1656,7 +1940,7 @@ void onDraw(const Draw &d) {
     it->second.lastFrame = g_frame;
     ++g_stats.cacheHits;
   } else {
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0);
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0, unlitColors, unlitColors);
     if (!mesh)
       return;
     geometry = dxvk::geometryHash(d);
@@ -1665,10 +1949,22 @@ void onDraw(const Draw &d) {
 
   Instance inst;
   inst.mesh = mesh;
-  inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+  inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+  if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
+    ++g_stats.emissiveNoTexture;
   if (d.texture0Target)
     d3d::requestTargetContents(d.texture0);
   inst.blend = blendState(d);
+  if (unlitColors) {
+    ++g_stats.unlitVertexColorDraws;
+    // $vertexalpha: the vertices' alpha fades the texture's (the runtime's
+    // default takes the texture's alone). Modulate texture x vertex.
+    if (shading.vertexAlpha) {
+      inst.blend.textureAlphaOperation = 3;
+      inst.blend.textureAlphaArg1Source = 1;
+      inst.blend.textureAlphaArg2Source = 2;
+    }
+  }
   // Experiment (OPENREMIX_PROXY_CULL_BLENDED=1): blended surfaces keep D3D's
   // culling (single-sided instances). Off by default: the runtime's front-face
   // winding has not been checked against D3D's, and on openremix-testing it did
@@ -2440,6 +2736,7 @@ void onPresent() {
     g_api.DestroyMesh(mesh);
   g_stats.transient += g_transient.size();
   g_transient.clear();
+  evictEmissiveMaterials();
   // Static meshes keyed by buffer version: a rewritten buffer never matches
   // again, so old entries age out.
   ++g_frame;
@@ -2507,7 +2804,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     for (size_t i = 3; i < pixels.size(); i += 4)
       pixels[i] = 0xff;
 
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   if (auto shared = g_texturesByHash.find(contentHash); shared != g_texturesByHash.end()) {
     if (auto existing = shared->second.lock()) {
       g_textures[texture] = std::move(existing);
@@ -2555,7 +2852,7 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
   const uint32_t unitBytes = rowBytes / std::max(1u, blocks ? (width + 3) / 4 : width);
   const uint32_t x0 = uint32_t(rect.left) / unit, y0 = uint32_t(rect.top) / unit;
   const uint32_t x1 = (uint32_t(rect.right) + unit - 1) / unit, y1 = (uint32_t(rect.bottom) + unit - 1) / unit;
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto &cpu = g_cpuTextures[texture];
   if (!cpu || cpu->width != width || cpu->height != height || cpu->format != format) {
     cpu = std::make_shared<CpuTexture>();
@@ -2620,13 +2917,13 @@ void applyTargetPixels() {
   for (auto &t : g_targetPixels) {
     uint64_t previous = 0;
     {
-      std::lock_guard<std::mutex> lock(g_textureLock);
+      std::lock_guard<std::recursive_mutex> lock(g_textureLock);
       if (auto it = g_textures.find(t.texture); it != g_textures.end())
         previous = it->second->hash;
     }
     onTextureUpload(t.texture, t.width, t.height, t.format, t.pixels.data(), t.width * 4, 1);
     // The image changes while the view moves: no trail of dead records.
-    std::lock_guard<std::mutex> lock(g_textureLock);
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
     if (auto it = g_texturesByHash.find(previous); it != g_texturesByHash.end() && it->second.expired())
       g_texturesByHash.erase(it);
   }
@@ -2634,7 +2931,7 @@ void applyTargetPixels() {
 }
 
 void onTextureCopy(const void *source, const void *destination) {
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(source);
   if (it != g_textures.end())
     g_textures[destination] = it->second;
@@ -2644,7 +2941,7 @@ void onTextureCopy(const void *source, const void *destination) {
 }
 
 void onTextureReleased(const void *texture) {
-  std::lock_guard<std::mutex> lock(g_textureLock);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   g_textures.erase(texture);
   auto cpu = g_cpuTextures.find(texture);
   if (cpu != g_cpuTextures.end()) {
@@ -2845,6 +3142,27 @@ void dumpStatistics(FILE *out) {
       fclose(log);
     g_census.clear();
   }
+  {
+    static const float scale = envScale("OPENREMIX_PROXY_EMISSIVE_SCALE", 1.0f);
+    size_t variants = 0, pinned = 0;
+    {
+      std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+      variants = g_emissiveMaterials.size();
+      for (const auto &[hash, material] : g_emissiveMaterials)
+        pinned += material.pins != 0;
+    }
+    fprintf(out,
+            "   emissive draws per frame (scale %.2f): unlit %.1f (with vertex colours %.1f), self-illuminated: base "
+            "alpha %.1f, mask texture %.1f, envmap mask alpha %.1f | lighting the scene %.1f | materials: %zu live "
+            "(%zu held by the BSP world), created %u, evicted %u, rejected %u | stayed lit: no base texture %.1f, mask "
+            "without a texture hash %.1f, mask not uploaded %.1f\n",
+            scale, g_stats.unlitDraws.exchange(0) / f, g_stats.unlitVertexColorDraws.exchange(0) / f,
+            g_stats.selfIllumDraws.exchange(0) / f, g_stats.selfIllumMaskDraws.exchange(0) / f,
+            g_stats.selfIllumMaskAlphaDraws.exchange(0) / f, g_stats.emissiveLightDraws.exchange(0) / f, variants,
+            pinned, g_stats.emissiveCreated.exchange(0), g_stats.emissiveEvicted.exchange(0),
+            g_stats.emissiveFailed.exchange(0), g_stats.emissiveNoTexture.exchange(0) / f,
+            g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
+  }
   fprintf(out, "   halos per frame: %.2f groups, %.2f source instances | stencil masks: %.2f groups, %.2f sources, "
                "%.2f overlays, %.2f UI draws, %.2f cut instances\n",
           g_stats.haloGroups.exchange(0) / f, g_stats.haloSources.exchange(0) / f, g_stats.maskGroups.exchange(0) / f,
@@ -2852,11 +3170,11 @@ void dumpStatistics(FILE *out) {
           g_stats.maskCuts.exchange(0) / f);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",
           g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, g_stats.uiStencil.exchange(0) / f, [] {
-            std::lock_guard<std::mutex> lock(g_textureLock);
+            std::lock_guard<std::recursive_mutex> lock(g_textureLock);
             return g_cpuTextures.size();
           }());
   {
-    std::lock_guard<std::mutex> lock(g_textureLock);
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
     size_t bytes = 0;
     for (auto &[t, c] : g_cpuTextures)
       bytes += c->data.size();
@@ -2867,7 +3185,7 @@ void dumpStatistics(FILE *out) {
   }
   fprintf(out, "   flat (2D) %.1f; textures uploaded %u, unsupported formats %u, live %zu\n",
           g_stats.flat.exchange(0) / f, g_stats.textures.exchange(0), g_stats.textureSkipped.exchange(0), [] {
-            std::lock_guard<std::mutex> lock(g_textureLock);
+            std::lock_guard<std::recursive_mutex> lock(g_textureLock);
             return g_textures.size();
           }());
   fprintf(out, "   nonFinite %u rejected %u; camera (%u draws) view row3 %.1f %.1f %.1f proj diag %.3f %.3f %.4f %.3f\n",

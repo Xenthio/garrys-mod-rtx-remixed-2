@@ -3,6 +3,7 @@
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "d3d_hooks.h"
 #include "engine_lights.h"
+#include "engine_materials.h"
 #include "engine_patches.h"
 #include "engine_shadows.h"
 #include "remix_output.h"
@@ -168,6 +169,15 @@ void shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
   proxy::original<Fn>(self, 127)(self->real, index, desc);
 }
 
+// IShaderAPI slot 114: void Bind(IMaterial *pMaterial): the material of the
+// draws that follow (those buffered for the previous one are flushed inside).
+// Hooked only when engine_materials validated the slot.
+void shaderApiBind(proxy::Wrapper *self, void *material) {
+  using Fn = void (*)(void *, void *);
+  proxy::original<Fn>(self, 114)(self->real, material);
+  proxy::engine_materials::onBind(material);
+}
+
 // IShaderAPI slot 216: void SetPIXMarker(unsigned long color, const char *name)
 // (an empty stub in release builds). Markers "openremix:..." are ours.
 void shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
@@ -194,6 +204,8 @@ const KnownInterface kKnown[] = {
      [](proxy::Kind *k) {
        proxy::setHook(k, 127, reinterpret_cast<void *>(&shaderApiSetLight));
        proxy::setHook(k, 216, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
+       if (proxy::engine_materials::install(k->realVtbl))
+         proxy::setHook(k, 114, reinterpret_cast<void *>(&shaderApiBind));
      }},
     {"ShaderDevice001", nullptr},
     {"ShaderShadow010", nullptr},
@@ -373,6 +385,7 @@ DWORD WINAPI statisticsThread(void *) {
       proxy::engine_patches::dumpStatistics(f);
       proxy::engine_lights::dumpStatistics(f);
       proxy::engine_shadows::dumpStatistics(f);
+      proxy::engine_materials::dumpStatistics(f);
       proxy::dumpStatistics(f);
       fclose(f);
     }

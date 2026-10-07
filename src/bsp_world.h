@@ -8,6 +8,8 @@
 #define REMIX_ALLOW_X86
 #include <remix/remix_c.h>
 
+#include "engine_materials.h"
+
 // The map's static world (world brushes and displacements of the BSP's world
 // model), built once from the map file and submitted every frame as static
 // instances. The engine's own world draws are then dropped (see
@@ -20,8 +22,16 @@ struct MaterialRef {
   std::shared_ptr<void> keep; // keeps the material (and its texture) alive
 };
 // The material the proxy made for an uploaded texture with this dxvk hash
-// (null handle: not uploaded yet).
-using MaterialLookup = MaterialRef (*)(uint64_t textureHash);
+// (null handle: not uploaded yet). emission (may be null): its unlit or self-
+// illuminated variant, masked by the first uploaded texture among
+// maskCandidates (null handle while none of them is).
+using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materials::Shading *emission,
+                                       const std::vector<uint64_t> *maskCandidates);
+
+// dxvk hashes a texture ("models/x/y", as materials name it) can be uploaded
+// under: its largest mips, from the VTF file. Empty: no file, or a format the
+// proxy does not upload. Render thread.
+std::vector<uint64_t> textureCandidates(const std::string &name);
 
 // Loads `maps/<mapName>.bsp` from the search paths; an empty name unloads.
 // Returns whether the map's world is now provided from the BSP.

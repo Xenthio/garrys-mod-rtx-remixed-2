@@ -1,0 +1,550 @@
+#include "engine_materials.h"
+
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
+
+// The material system binds a material with IShaderAPI::Bind(IMaterial *)
+// (CMatRenderContext::Bind, after the material's bind proxies ran; with a
+// queued material system the proxies' writes and the Bind reach the render
+// thread in that order). CShaderAPIDx8::Bind flushes the primitives buffered
+// for the previous material before it stores the new one, so every D3D draw
+// belongs to the material bound last.
+//
+// Everything below is for one build of materialsystem.dll and of the shader
+// API (shaderapidx9_orig.dll). install() requires each function used at its
+// RVA with these instruction bytes, the offsets read are the ones in those
+// instructions, and per object the vtable must be the class's: anything else
+// (another build, CMaterialSubRect, a material var of another class) is not
+// read and counts as Lit.
+//
+//   CMaterial (IMaterial, materialsystem.dll): 0 GetName, 40 ShaderParamCount
+//     (movzx eax, byte [rcx+0x32]), 41 GetShaderParams (mov rax, [rcx+0x38]),
+//     49 GetShaderName (the shader at [rcx+0x20], its slot 0).
+//   CMaterialVar (IMaterialVar): 1 GetName, 6 GetStringValue, 17 IsDefined
+//     (type: low nibble of [rcx+0x24], 6 undefined, 3 texture), 26
+//     GetIntValueInternal, 27 GetFloatValueInternal, 29 GetVecValueInternal()
+//     (-> float[4]). GetStringValue's texture case reads the ITexture at
+//     [rcx+0x39] (-1: env_cubemap) and calls its slot 0, GetName.
+//     The getters forward to a queue-thread twin ([rcx+0x29]) only while the
+//     calling thread's render context has a call queue; on the thread that
+//     executes Bind they return the var's own value, as the shaders read it.
+//   CShaderAPIDx8 (IShaderAPI, ShaderApi030): 114 Bind(IMaterial *).
+namespace proxy::engine_materials {
+namespace {
+
+constexpr uintptr_t kMaterialVtable = 0xadf08, kVarVtable = 0xb3260;
+constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
+constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarGetInt = 26, kVarGetFloat = 27,
+                   kVarGetVec = 29;
+constexpr uintptr_t kGetName = 0xe7e0, kParamCount = 0x11cd0, kParams = 0xf020, kShaderName = 0xefd0;
+constexpr uintptr_t kVarName = 0x26b10, kVarString = 0x26ba0, kVarDefined = 0x27080, kVarInt = 0x26840,
+                    kVarFloat = 0x26720, kVarVec = 0x26f60;
+constexpr unsigned kSlotBind = 114;
+constexpr uintptr_t kBind = 0x11540;
+
+// CMaterial: m_VarCount, m_pShaderParams, m_Name (CUtlSymbol), m_pShader.
+constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 0x28, kMaterialShader = 0x20;
+// CMaterialVar: type nibble, ITexture * of a texture var.
+constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
+constexpr uint8_t kTypeTexture = 3, kTypeUndefined = 6;
+// MaterialVarFlags_t.
+constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6;
+
+struct Expected {
+  bool shaderApi; // else materialsystem.dll
+  uintptr_t rva;
+  const char *bytes; // hex, space separated
+  const char *what;
+};
+constexpr Expected kExpected[] = {
+    // mov rsi,rcx; mov rdi,rdx; mov rcx,[rcx+0x2d10] (m_pMaterial); ... InMaterialPage on both
+    {true, 0x11540,
+     "48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B FA 48 8B 89 10 2D 00 00 48 85 C9 74 47 48 85 D2 74 42 48 8B 01 FF "
+     "50 38",
+     "Bind entry"},
+    // mov rax,[rsi]; mov rcx,rsi; call [rax+0x398] (FlushBufferedPrimitives, slot 115); mov [rsi+0x2d10],rdi
+    {true, 0x115d0, "48 8B 06 48 8B CE FF 90 98 03 00 00 48 89 BE 10 2D 00 00", "Bind flushes, then stores"},
+    // add rcx,0x28; jmp CUtlSymbol::String
+    {false, kGetName, "48 83 C1 28 E9", "CMaterial::GetName"},
+    {false, kParamCount, "0F B6 41 32 C3", "CMaterial::ShaderParamCount"},
+    {false, kParams, "48 8B 41 38 C3", "CMaterial::GetShaderParams"},
+    // PrecacheVars (returns at once on a precached material); mov rcx,[rbx+0x20]; ... jmp [rax] / "shader not loaded"
+    {false, kShaderName,
+     "40 53 48 83 EC 30 48 8B 01 45 33 C9 45 33 C0 C7 44 24 20 00 00 00 00 33 D2 48 8B D9 FF 90 00 02 00 00 48 8B 4B "
+     "20 48 85 C9 74 0B 48 8B 01 48 83 C4 30 5B 48 FF 20",
+     "CMaterial::GetShaderName"},
+    // movzx ebx, word [rcx+0x26] (the name symbol); 0xffff: none
+    {false, kVarName, "40 53 48 83 EC 20 0F B7 59 26 B8 FF FF 00 00 66 3B D8", "CMaterialVar::GetName"},
+    {false, kVarDefined, "0F B6 41 24 24 0F 3C 06 0F 95 C0 C3", "CMaterialVar::IsDefined"},
+    // ...; mov eax,[rbx+0x10]; add rsp,0x20; pop rbx; ret
+    {false, kVarInt,
+     "40 53 48 83 EC 20 48 8B D9 48 8B 0D 00 48 0B 00 48 8B 01 FF 90 70 04 00 00 48 85 C0 74 18 48 8B 4B 29 48 85 C9 "
+     "74 0F 48 8B 01 48 83 C4 20 5B 48 FF A0 D0 00 00 00 8B 43 10 48 83 C4 20 5B C3",
+     "CMaterialVar::GetIntValueInternal"},
+    // ...; movss xmm0,[rbx+0x14]; ...
+    {false, kVarFloat,
+     "40 53 48 83 EC 20 48 8B D9 48 8B 0D 20 49 0B 00 48 8B 01 FF 90 70 04 00 00 48 85 C0 74 18 48 8B 4B 29 48 85 C9 "
+     "74 0F 48 8B 01 48 83 C4 20 5B 48 FF A0 D8 00 00 00 F3 0F 10 43 14 48 83 C4 20 5B C3",
+     "CMaterialVar::GetFloatValueInternal"},
+    // ...; lea rax,[rbx+0x14]; ...
+    {false, kVarVec,
+     "40 53 48 83 EC 20 48 8B D9 48 8B 0D E0 40 0B 00 48 8B 01 FF 90 70 04 00 00 48 85 C0 74 18 48 8B 4B 29 48 85 C9 "
+     "74 0F 48 8B 01 48 83 C4 20 5B 48 FF A0 E8 00 00 00 48 8D 43 14 48 83 C4 20 5B C3",
+     "CMaterialVar::GetVecValueInternal"},
+    {false, kVarString, "41 56 48 83 EC 30 4C 8B F1", "CMaterialVar::GetStringValue"},
+    // Its jump table entry for type 3 (texture): the case below.
+    {false, 0x26e3c, "A4 6D 02 00", "GetStringValue texture case"},
+    // mov rcx,[r14+0x39]; cmp rcx,-1; jne +0x12
+    {false, 0x26da4, "49 8B 4E 39 48 83 F9 FF 75 12", "texture var's ITexture"},
+    // mov rax,[rcx]; call [rax]
+    {false, 0x26dc0, "48 8B 01 FF 10", "ITexture::GetName call"},
+};
+
+struct Module {
+  uintptr_t base = 0, size = 0;
+  bool open(HMODULE module) {
+    if (!module)
+      return false;
+    base = reinterpret_cast<uintptr_t>(module);
+    const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(module);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+      return false;
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+      return false;
+    size = nt->OptionalHeader.SizeOfImage;
+    return true;
+  }
+  bool inside(uintptr_t address, size_t bytes) const {
+    return address >= base && bytes <= size && address - base <= size - bytes;
+  }
+  bool bytesAt(uintptr_t rva, const char *hex) const {
+    for (const char *p = hex; *p; ++rva) {
+      char *end = nullptr;
+      const unsigned long byte = std::strtoul(p, &end, 16);
+      if (end == p || rva >= size || *reinterpret_cast<const uint8_t *>(base + rva) != uint8_t(byte))
+        return false;
+      for (p = end; *p == ' ';)
+        ++p;
+    }
+    return true;
+  }
+} g_materialSystem, g_shaderApi;
+
+std::atomic<bool> g_installed{false};
+std::atomic<const char *> g_status{"not installed"}, g_detail{""};
+
+using NameFn = const char *(*)(void *);
+using IntFn = int (*)(void *);
+using FloatFn = float (*)(void *);
+using VecFn = const float *(*)(void *);
+NameFn g_materialName = nullptr, g_shaderName = nullptr, g_varName = nullptr;
+IntFn g_varInt = nullptr;
+FloatFn g_varFloat = nullptr;
+VecFn g_varVec = nullptr;
+
+std::string lower(const char *text) {
+  std::string out = text ? text : "";
+  for (char &c : out)
+    c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
+// What is known of a material, while it keeps this identity (a reloaded
+// material gets new vars; a freed one's address may be reused).
+struct Entry {
+  void **params = nullptr;
+  void *shader = nullptr;
+  uint16_t nameSymbol = 0;
+  uint8_t count = 0;
+  Shading::Mode kind = Shading::Lit; // by shader: Lit (nothing to read), Unlit, SelfIllumBaseAlpha (capable)
+  // Indices into the shader params (-1: the shader has no such parameter).
+  int16_t flags = -1, color = -1, color2 = -1, tint = -1, mask = -1, maskScale = -1, envmapMask = -1,
+          envmapMaskAlpha = -1, fresnel = -1, fresnelRange = -1;
+  std::string name, shaderName;
+  // The mask texture's name, by the ITexture last seen in the var.
+  void *maskTexture = nullptr;
+  std::string maskName;
+};
+std::unordered_map<void *, Entry> g_entries; // render thread
+Shading g_current;                           // render thread
+const Entry *g_currentEntry = nullptr;       // render thread
+
+struct Seen {
+  std::string shader;
+  Shading::Mode mode = Shading::Lit;
+  float tint[3] = {};
+  float maskScale = 1;
+  std::string mask;
+  uint32_t binds = 0;
+};
+struct Statistics {
+  std::atomic<uint32_t> binds{0}, unlit{0}, baseAlpha{0}, mask{0}, maskAlpha{0};
+  std::atomic<uint32_t> otherClass{0}, noParams{0}, foreignVar{0}, noMaskTexture{0};
+  std::mutex lock;
+  std::map<std::string, uint32_t> shaders; // distinct materials by shader name, since launch
+  std::map<std::string, Seen> seen;        // unlit and self-illuminated materials bound this interval
+  size_t entries = 0;
+} g_stats;
+
+uint8_t varType(void *var) { return *(static_cast<const uint8_t *>(var) + kVarType) & 0xf; }
+
+// A param the engine's getters can be called on.
+void *paramAt(const Entry &e, int index) {
+  if (index < 0 || index >= e.count)
+    return nullptr;
+  void *var = e.params[index];
+  if (!var || *static_cast<uintptr_t *>(var) != g_materialSystem.base + kVarVtable) {
+    g_stats.foreignVar.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  return var;
+}
+
+bool defined(void *var) { return var && varType(var) != kTypeUndefined; }
+
+// The name of the texture a var holds ("" when it holds none).
+const std::string &textureName(Entry &e, void *var) {
+  static const std::string none;
+  if (!var || varType(var) != kTypeTexture)
+    return none;
+  void *texture;
+  std::memcpy(&texture, static_cast<const uint8_t *>(var) + kVarTexture, sizeof(texture));
+  if (!texture || texture == reinterpret_cast<void *>(~uintptr_t(0)))
+    return none;
+  if (texture != e.maskTexture) {
+    // An ITexture of the material system (its vtable is in that module).
+    const uintptr_t vtable = *static_cast<uintptr_t *>(texture);
+    if (!g_materialSystem.inside(vtable, sizeof(void *)) ||
+        !g_materialSystem.inside(*reinterpret_cast<uintptr_t *>(vtable), 1))
+      return none;
+    e.maskName = lower(reinterpret_cast<NameFn>(*reinterpret_cast<void **>(vtable))(texture));
+    e.maskTexture = texture;
+  }
+  return e.maskName;
+}
+
+void resolve(Entry &e, void *material) {
+  e.name = lower(g_materialName(material));
+  const char *shader = g_shaderName(material);
+  e.shaderName = shader ? shader : "";
+  e.kind = shaderMode(e.shaderName.c_str());
+  {
+    std::lock_guard<std::mutex> lock(g_stats.lock);
+    ++g_stats.shaders[e.shaderName];
+  }
+  if (e.kind == Shading::Lit)
+    return;
+  struct Wanted {
+    const char *name;
+    int16_t Entry::*index;
+  };
+  static const Wanted wanted[] = {
+      {"$flags", &Entry::flags},
+      {"$color", &Entry::color},
+      {"$color2", &Entry::color2},
+      {"$selfillumtint", &Entry::tint},
+      {"$selfillummask", &Entry::mask},
+      {"$selfillummaskscale", &Entry::maskScale},
+      {"$envmapmask", &Entry::envmapMask},
+      {"$selfillum_envmapmask_alpha", &Entry::envmapMaskAlpha},
+      {"$selfillumfresnel", &Entry::fresnel},
+      {"$selfillumfresnelminmaxexp", &Entry::fresnelRange},
+  };
+  for (int i = 0; i < e.count; ++i) {
+    void *var = paramAt(e, i);
+    const char *name = var ? g_varName(var) : nullptr;
+    if (!name || name[0] != '$')
+      continue;
+    for (const Wanted &w : wanted)
+      if (e.*w.index < 0 && _stricmp(name, w.name) == 0)
+        e.*w.index = int16_t(i);
+  }
+}
+
+void vec3(const Entry &e, int index, float out[3]) {
+  void *var = paramAt(e, index);
+  if (!defined(var))
+    return;
+  const float *v = g_varVec(var);
+  for (int c = 0; c < 3; ++c)
+    if (std::isfinite(v[c]))
+      out[c] = v[c];
+}
+
+void read(Entry &e, Shading &out) {
+  void *flagsVar = paramAt(e, e.flags);
+  const int flags = flagsVar ? g_varInt(flagsVar) : 0;
+  if (e.kind == Shading::Unlit) {
+    out.mode = Shading::Unlit;
+    out.vertexColor = (flags & kFlagVertexColor) != 0;
+    out.vertexAlpha = (flags & kFlagVertexAlpha) != 0;
+    // $color x $color2, gamma values the shaders linearize.
+    float color[3] = {1, 1, 1}, color2[3] = {1, 1, 1};
+    vec3(e, e.color, color);
+    vec3(e, e.color2, color2);
+    for (int c = 0; c < 3; ++c)
+      out.tint[c] = std::pow(std::max(color[c] * color2[c], 0.0f), 2.2f);
+    return;
+  }
+  // $selfillum_envmapmask_alpha (a float; the shaders have it without
+  // $selfillum): 8 x the envmap mask's alpha, overbright above 1/8.
+  void *alphaVar = paramAt(e, e.envmapMaskAlpha);
+  const bool maskAlpha = !(flags & kFlagSelfIllum) && defined(alphaVar) && g_varFloat(alphaVar) != 0;
+  if (!(flags & kFlagSelfIllum) && !maskAlpha)
+    return;
+  vec3(e, e.tint, out.tint); // linear: the shaders multiply the linear albedo by it
+  for (float &c : out.tint)
+    c = std::max(c, 0.0f);
+  if (maskAlpha) {
+    const std::string &name = textureName(e, paramAt(e, e.envmapMask));
+    if (name.empty()) {
+      g_stats.noMaskTexture.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    out.mode = Shading::SelfIllumMaskAlpha;
+    out.mask = name;
+    out.maskScale = 8;
+    return;
+  }
+  out.mode = Shading::SelfIllumBaseAlpha;
+  if (void *maskVar = paramAt(e, e.mask); defined(maskVar)) {
+    const std::string &name = textureName(e, maskVar);
+    if (name.empty()) {
+      // The shader samples the mask instead of the base alpha: without its
+      // texture nothing is known to glow.
+      g_stats.noMaskTexture.fetch_add(1, std::memory_order_relaxed);
+      out.mode = Shading::Lit;
+      return;
+    }
+    out.mode = Shading::SelfIllumMask;
+    out.mask = name;
+    if (void *scale = paramAt(e, e.maskScale); defined(scale)) {
+      const float value = g_varFloat(scale);
+      if (std::isfinite(value) && value > 0)
+        out.maskScale = value;
+    }
+  }
+  if (void *fresnel = paramAt(e, e.fresnel); defined(fresnel) && g_varInt(fresnel) != 0) {
+    float range[3] = {0, 1, 1};
+    vec3(e, e.fresnelRange, range);
+    out.maskScale *= fresnelShare(range[0], range[1], range[2]);
+    if (!(out.maskScale > 0))
+      out.mode = Shading::Lit;
+  }
+}
+
+} // namespace
+
+Shading::Mode shaderMode(const char *shaderName) {
+  const std::string name = lower(shaderName);
+  auto is = [&](const char *prefix) {
+    const size_t n = std::strlen(prefix);
+    // The shader or one of its hardware fallbacks ("unlitgeneric_dx8").
+    return name.compare(0, n, prefix) == 0 && (name.size() == n || name[n] == '_');
+  };
+  if (is("unlitgeneric") || is("unlittwotexture") || is("monitorscreen") || is("sprite"))
+    return Shading::Unlit;
+  if (is("vertexlitgeneric") || is("lightmappedgeneric"))
+    return Shading::SelfIllumBaseAlpha;
+  return Shading::Lit;
+}
+
+float fresnelShare(float minimum, float maximum, float exponent) {
+  // The shaders emit mask * saturate(min + (max - min) * (N.V)^exp): the mean
+  // of (N.V)^exp over the projected hemisphere is 2 / (exp + 2).
+  if (!std::isfinite(minimum) || !std::isfinite(maximum) || !std::isfinite(exponent) || exponent < 0)
+    return 1;
+  return std::clamp(minimum + (maximum - minimum) * 2 / (exponent + 2), 0.0f, 1.0f);
+}
+
+bool install(const void *const *shaderApiVtable) {
+  static std::atomic<bool> done{false};
+  if (done.exchange(true))
+    return g_installed;
+  char v[8] = {};
+  if (GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE", v, sizeof(v)) && v[0] == '0') {
+    g_status = "disabled (OPENREMIX_PROXY_EMISSIVE=0)";
+    return false;
+  }
+  if (!g_materialSystem.open(GetModuleHandleA("materialsystem.dll"))) {
+    g_status = "no materialsystem.dll";
+    return false;
+  }
+  HMODULE shaderApi = nullptr;
+  if (!shaderApiVtable ||
+      !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(shaderApiVtable), &shaderApi) ||
+      !g_shaderApi.open(shaderApi)) {
+    g_status = "no shader API module";
+    return false;
+  }
+  if (!g_shaderApi.inside(reinterpret_cast<uintptr_t>(shaderApiVtable), (kSlotBind + 1) * sizeof(void *)) ||
+      reinterpret_cast<uintptr_t>(shaderApiVtable[kSlotBind]) != g_shaderApi.base + kBind) {
+    g_status = "slot mismatch";
+    g_detail = "IShaderAPI::Bind";
+    return false;
+  }
+  struct Slot {
+    uintptr_t vtable;
+    unsigned slot;
+    uintptr_t rva;
+    const char *name;
+  };
+  const Slot slots[] = {
+      {kMaterialVtable, kSlotGetName, kGetName, "CMaterial::GetName"},
+      {kMaterialVtable, kSlotParamCount, kParamCount, "CMaterial::ShaderParamCount"},
+      {kMaterialVtable, kSlotParams, kParams, "CMaterial::GetShaderParams"},
+      {kMaterialVtable, kSlotShaderName, kShaderName, "CMaterial::GetShaderName"},
+      {kVarVtable, kVarGetName, kVarName, "CMaterialVar::GetName"},
+      {kVarVtable, kVarGetString, kVarString, "CMaterialVar::GetStringValue"},
+      {kVarVtable, kVarIsDefined, kVarDefined, "CMaterialVar::IsDefined"},
+      {kVarVtable, kVarGetInt, kVarInt, "CMaterialVar::GetIntValueInternal"},
+      {kVarVtable, kVarGetFloat, kVarFloat, "CMaterialVar::GetFloatValueInternal"},
+      {kVarVtable, kVarGetVec, kVarVec, "CMaterialVar::GetVecValueInternal"},
+  };
+  for (const Slot &s : slots) {
+    const uintptr_t entry = s.vtable + s.slot * sizeof(void *);
+    if (entry + sizeof(void *) > g_materialSystem.size ||
+        *reinterpret_cast<uintptr_t *>(g_materialSystem.base + entry) != g_materialSystem.base + s.rva) {
+      g_status = "slot mismatch";
+      g_detail = s.name;
+      return false;
+    }
+  }
+  for (const Expected &expected : kExpected)
+    if (!(expected.shaderApi ? g_shaderApi : g_materialSystem).bytesAt(expected.rva, expected.bytes)) {
+      g_status = "code mismatch";
+      g_detail = expected.what;
+      return false;
+    }
+  auto at = [](uintptr_t rva) { return reinterpret_cast<void *>(g_materialSystem.base + rva); };
+  g_materialName = reinterpret_cast<NameFn>(at(kGetName));
+  g_shaderName = reinterpret_cast<NameFn>(at(kShaderName));
+  g_varName = reinterpret_cast<NameFn>(at(kVarName));
+  g_varInt = reinterpret_cast<IntFn>(at(kVarInt));
+  g_varFloat = reinterpret_cast<FloatFn>(at(kVarFloat));
+  g_varVec = reinterpret_cast<VecFn>(at(kVarVec));
+  g_status = "ok (IShaderAPI::Bind read)";
+  g_installed = true;
+  return true;
+}
+
+void onBind(void *material) {
+  g_current = Shading{};
+  g_currentEntry = nullptr;
+  if (!g_installed.load(std::memory_order_relaxed) || !material)
+    return;
+  g_stats.binds.fetch_add(1, std::memory_order_relaxed);
+  // CMaterial only (not CMaterialSubRect, whose vars are its page's).
+  if (*static_cast<uintptr_t *>(material) != g_materialSystem.base + kMaterialVtable) {
+    g_stats.otherClass.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const auto *bytes = static_cast<const uint8_t *>(material);
+  void **params;
+  void *shader;
+  uint16_t nameSymbol;
+  std::memcpy(&params, bytes + kMaterialParams, sizeof(params));
+  std::memcpy(&shader, bytes + kMaterialShader, sizeof(shader));
+  std::memcpy(&nameSymbol, bytes + kMaterialName, sizeof(nameSymbol));
+  const uint8_t count = bytes[kMaterialCount];
+  if (!params || !count || !shader) {
+    g_stats.noParams.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (g_entries.size() > 32768)
+    g_entries.clear();
+  Entry &e = g_entries[material];
+  if (e.params != params || e.count != count || e.shader != shader || e.nameSymbol != nameSymbol) {
+    e = Entry{};
+    e.params = params;
+    e.count = count;
+    e.shader = shader;
+    e.nameSymbol = nameSymbol;
+    resolve(e, material);
+  }
+  g_currentEntry = &e;
+  if (e.kind == Shading::Lit)
+    return;
+  read(e, g_current);
+  if (g_current.mode == Shading::Lit)
+    return;
+  switch (g_current.mode) {
+  case Shading::Unlit: g_stats.unlit.fetch_add(1, std::memory_order_relaxed); break;
+  case Shading::SelfIllumBaseAlpha: g_stats.baseAlpha.fetch_add(1, std::memory_order_relaxed); break;
+  case Shading::SelfIllumMask: g_stats.mask.fetch_add(1, std::memory_order_relaxed); break;
+  default: g_stats.maskAlpha.fetch_add(1, std::memory_order_relaxed); break;
+  }
+  std::lock_guard<std::mutex> lock(g_stats.lock);
+  g_stats.entries = g_entries.size();
+  if (g_stats.seen.size() < 256 || g_stats.seen.count(e.name)) {
+    Seen &seen = g_stats.seen[e.name];
+    seen.shader = e.shaderName;
+    seen.mode = g_current.mode;
+    std::copy_n(g_current.tint, 3, seen.tint);
+    seen.maskScale = g_current.maskScale;
+    seen.mask = g_current.mask;
+    ++seen.binds;
+  }
+}
+
+const Shading &current() { return g_current; }
+
+const char *currentName() { return g_currentEntry ? g_currentEntry->name.c_str() : ""; }
+
+void dumpStatistics(FILE *out) {
+  const char *detail = g_detail.load();
+  fprintf(out, "engine materials: %s%s%s\n", g_status.load(), *detail ? ": " : "", detail);
+  if (!g_installed)
+    return;
+  static ULONGLONG last = GetTickCount64();
+  const ULONGLONG now = GetTickCount64();
+  const double seconds = now > last ? double(now - last) / 1000 : 1;
+  last = now;
+  const double baseAlpha = g_stats.baseAlpha.exchange(0) / seconds, mask = g_stats.mask.exchange(0) / seconds,
+               maskAlpha = g_stats.maskAlpha.exchange(0) / seconds;
+  fprintf(out,
+          "   binds per second %.0f: unlit %.1f, self-illuminated %.1f (base alpha %.1f, $selfillummask %.1f, envmap "
+          "mask alpha %.1f) | not read: other material classes %.1f, without params %.1f, foreign vars %.1f, mask "
+          "var without a texture %.1f\n",
+          double(g_stats.binds.exchange(0)) / seconds, double(g_stats.unlit.exchange(0)) / seconds,
+          baseAlpha + mask + maskAlpha, baseAlpha, mask, maskAlpha, double(g_stats.otherClass.exchange(0)) / seconds,
+          double(g_stats.noParams.exchange(0)) / seconds, double(g_stats.foreignVar.exchange(0)) / seconds,
+          double(g_stats.noMaskTexture.exchange(0)) / seconds);
+  std::lock_guard<std::mutex> lock(g_stats.lock);
+  fprintf(out, "   materials seen since launch, by shader (%zu known now):", g_stats.entries);
+  for (const auto &[shader, count] : g_stats.shaders)
+    fprintf(out, " %s %u", shader.empty() ? "(none)" : shader.c_str(), count);
+  fprintf(out, "\n");
+  // The most bound first.
+  std::vector<const std::pair<const std::string, Seen> *> order;
+  for (const auto &item : g_stats.seen)
+    order.push_back(&item);
+  std::sort(order.begin(), order.end(),
+            [](const auto *a, const auto *b) { return a->second.binds > b->second.binds; });
+  static const char *const modes[] = {"lit", "unlit", "selfillum base alpha", "selfillum mask", "selfillum envmap mask alpha"};
+  for (size_t i = 0; i < order.size() && i < 24; ++i) {
+    const Seen &s = order[i]->second;
+    fprintf(out, "     %s (%s): %s, tint %.2f %.2f %.2f", order[i]->first.c_str(), s.shader.c_str(), modes[s.mode],
+            s.tint[0], s.tint[1], s.tint[2]);
+    if (!s.mask.empty())
+      fprintf(out, ", mask %s x %.2f", s.mask.c_str(), s.maskScale);
+    fprintf(out, ", %.1f binds/s\n", double(s.binds) / seconds);
+  }
+  if (order.size() > 24)
+    fprintf(out, "     ... and %zu more\n", order.size() - 24);
+  g_stats.seen.clear();
+}
+
+} // namespace proxy::engine_materials

@@ -263,6 +263,12 @@ bool loadMaterial(const std::string &name, KeyValues &out, int depth = 0) {
   KeyValues kv;
   if (!parseKeyValues(std::string(bytes.begin(), bytes.end()), kv))
     return false;
+  // Hardware conditionals (">=dx90_20b" { ... }): every "at least" level holds
+  // here, as on any DX9 hardware; "<" blocks are for older hardware.
+  for (auto &[condition, block] : kv.blocks)
+    if (condition.size() > 3 && condition[0] == '>' && condition.find("dx") != std::string::npos)
+      for (auto &[k, v] : block)
+        kv.values[k] = v;
   if (kv.shader != "patch") {
     out = std::move(kv);
     return true;
@@ -361,10 +367,98 @@ std::vector<uint64_t> textureHashes(const std::string &name) {
   return hashes;
 }
 
+// Whether a texture has an alpha channel as the engine sees it
+// (ITexture::IsTranslucent: TEXTUREFLAGS_ONEBITALPHA | EIGHTBITALPHA).
+bool textureHasAlpha(const std::string &name) {
+  std::vector<uint8_t> header;
+  uint32_t flags = 0;
+  if (!fs::read("materials/" + lower(name) + ".vtf", header, 0, 64) || header.size() < 24 ||
+      std::memcmp(header.data(), "VTF", 4) != 0)
+    return false;
+  std::memcpy(&flags, header.data() + 20, 4);
+  return (flags & 0x3000) != 0;
+}
+
+// "[r g b]" (floats) or "{r g b}" (0..255), or one number for all three.
+bool parseColor(const std::string &text, float out[3]) {
+  const size_t digits = text.find_first_of("-.0123456789");
+  if (digits == std::string::npos)
+    return false;
+  float v[3];
+  const int n = std::sscanf(text.c_str() + digits, "%f %f %f", &v[0], &v[1], &v[2]);
+  if (n < 1)
+    return false;
+  const float scale = text.find('{') != std::string::npos ? 1.0f / 255 : 1.0f;
+  for (int c = 0; c < 3; ++c)
+    out[c] = (n >= 3 ? v[c] : v[0]) * scale;
+  return true;
+}
+
+// What a VMT's material does with its base texture besides being lit: the
+// engine's rules (engine_materials reads the same from live materials), with
+// the VMT's static values; material proxies do not run for the BSP world.
+// maskCandidates: the mask texture's hashes.
+engine_materials::Shading materialShading(KeyValues &kv, std::vector<uint64_t> &maskCandidates) {
+  using engine_materials::Shading;
+  Shading out;
+  auto number = [&](const char *k) { return kv.values.count(k) ? float(std::atof(kv.values[k].c_str())) : 0.0f; };
+  const Shading::Mode kind = engine_materials::shaderMode(kv.shader.c_str());
+  if (kind == Shading::Unlit) {
+    out.mode = Shading::Unlit;
+    out.luminous = number("$selfillum") != 0;
+    float color[3] = {1, 1, 1}, color2[3] = {1, 1, 1};
+    if (kv.values.count("$color"))
+      parseColor(kv.values["$color"], color);
+    if (kv.values.count("$color2"))
+      parseColor(kv.values["$color2"], color2);
+    for (int c = 0; c < 3; ++c)
+      out.tint[c] = std::pow(std::max(color[c] * color2[c], 0.0f), 2.2f);
+    return out;
+  }
+  if (kind != Shading::SelfIllumBaseAlpha || !kv.values.count("$basetexture"))
+    return out;
+  const bool vertexLit = kv.shader.rfind("vertexlitgeneric", 0) == 0;
+  if (kv.values.count("$selfillumtint"))
+    parseColor(kv.values["$selfillumtint"], out.tint);
+  for (float &c : out.tint)
+    c = std::max(c, 0.0f);
+  if (number("$selfillum") != 0) {
+    const bool fresnel = vertexLit && number("$selfillumfresnel") != 0;
+    if (vertexLit && kv.values.count("$selfillummask")) {
+      out.mode = Shading::SelfIllumMask;
+      out.mask = lower(kv.values["$selfillummask"]);
+      if (const float scale = number("$selfillummaskscale"); scale > 0)
+        out.maskScale = scale;
+    } else if (textureHasAlpha(kv.values["$basetexture"]) || fresnel) {
+      // Without an alpha channel the shaders drop $selfillum.
+      out.mode = Shading::SelfIllumBaseAlpha;
+    }
+    if (out.mode != Shading::Lit && fresnel) {
+      float range[3] = {0, 1, 1};
+      if (kv.values.count("$selfillumfresnelminmaxexp"))
+        parseColor(kv.values["$selfillumfresnelminmaxexp"], range);
+      out.maskScale *= engine_materials::fresnelShare(range[0], range[1], range[2]);
+      if (!(out.maskScale > 0))
+        out.mode = Shading::Lit;
+    }
+  } else if (vertexLit && number("$selfillum_envmapmask_alpha") != 0 && kv.values.count("$envmapmask")) {
+    out.mode = Shading::SelfIllumMaskAlpha;
+    out.mask = lower(kv.values["$envmapmask"]);
+    out.maskScale = 8;
+  }
+  if (!out.mask.empty())
+    maskCandidates = textureHashes(out.mask);
+  return out;
+}
+
 // --- World geometry -----------------------------------------------------------
 struct Material {
   std::string name;
   std::vector<uint64_t> candidates; // texture hashes, largest mip first
+  // Unlit or self-illuminated (materialShading), and its mask's hashes.
+  engine_materials::Shading shading;
+  std::vector<uint64_t> maskCandidates;
+  bool maskDropped = false; // the mask was never uploaded: lit instead
   uint32_t categories = 0;
   bool alphaTest = false, modulate = false;
   bool owned = false; // ref.handle created here (water)
@@ -802,6 +896,15 @@ void angleMatrix(const float angles[3], const float origin[3], float m[3][4]) {
     m[r][3] = origin[r];
 }
 
+// OPENREMIX_PROXY_EMISSIVE=0: every material lit, as before.
+bool emissiveEnabled() {
+  static const bool enabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE", v, sizeof(v)) && v[0] == '0');
+  }();
+  return enabled;
+}
+
 // Index into g_world.materials, or -1 for materials left to the engine
 // (translucent: its blended draws are kept) or ignored by rtx.conf. brush:
 // for the map's own faces, which rtx.conf does not remove (its ignore list
@@ -864,6 +967,8 @@ int materialByName(const std::string &name, bool brush) {
     }
     if (kv.values.count("$basetexture"))
       m.candidates = textureHashes(kv.values["$basetexture"]);
+    if (emissiveEnabled())
+      m.shading = materialShading(kv, m.maskCandidates);
   }
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
@@ -1880,7 +1985,20 @@ std::wstring gameRoot() {
   return root.substr(0, root.find_last_of(L"\\/"));
 }
 
+void ensureFileSystem() {
+  static bool initialized = false;
+  if (!initialized) {
+    fs::init(gameRoot());
+    initialized = true;
+  }
+}
+
 } // namespace
+
+std::vector<uint64_t> textureCandidates(const std::string &name) {
+  ensureFileSystem();
+  return textureHashes(name);
+}
 
 bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   std::string mapName = lower(requestedMap);
@@ -1903,11 +2021,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
     sendPartition(nullptr);
     return false;
   }
-  static bool initialized = false;
-  if (!initialized) {
-    fs::init(gameRoot());
-    initialized = true;
-  }
+  ensureFileSystem();
   Bsp bsp;
   // A loose map file, else through the file system (workshop addons, etc.).
   const std::string file = "maps/" + lower(mapName) + ".bsp";
@@ -1967,8 +2081,13 @@ void submit(MaterialLookup lookup) {
     for (auto &m : g_world.materials) {
       if (m.resolved)
         continue;
+      // A mask the engine never uploads (a format the proxy does not take)
+      // must not keep the surface untextured: lit after ten seconds.
+      const bool emissive = m.shading.mode != engine_materials::Shading::Lit && !m.maskDropped;
       for (uint64_t h : m.candidates) {
-        auto ref = lookup(h);
+        auto ref = lookup(h, emissive ? &m.shading : nullptr, &m.maskCandidates);
+        if (!ref.handle && emissive && frame >= 600 && (ref = lookup(h, nullptr, nullptr)).handle)
+          m.maskDropped = true;
         if (ref.handle) {
           m.ref = std::move(ref);
           m.resolved = true;
@@ -2379,6 +2498,36 @@ void dumpStatistics(FILE *out) {
     if (noCandidates + notUploaded)
       fprintf(out, "   BSP materials unresolved: %u without a texture hash, %u not uploaded\n%s", noCandidates,
               notUploaded, examples.c_str());
+  }
+  {
+    using engine_materials::Shading;
+    uint32_t modes[5] = {}, luminous = 0, waiting = 0, dropped = 0;
+    std::string examples;
+    for (const auto &m : g_world.materials) {
+      if (m.shading.mode == Shading::Lit)
+        continue;
+      ++modes[m.shading.mode];
+      luminous += m.shading.luminous;
+      waiting += !m.resolved;
+      dropped += m.maskDropped;
+      if (m.shading.mode != Shading::Unlit && examples.size() < 700) {
+        char line[320];
+        std::snprintf(line, sizeof(line), "      %s: %s%s%s, tint %.2f %.2f %.2f x %.2f%s\n", m.name.c_str(),
+                      m.shading.mode == Shading::SelfIllumBaseAlpha ? "base alpha"
+                      : m.shading.mode == Shading::SelfIllumMask    ? "mask "
+                                                                    : "envmap mask alpha ",
+                      m.shading.mask.c_str(), m.maskCandidates.empty() && !m.shading.mask.empty() ? " (no texture hash)" : "",
+                      m.shading.tint[0], m.shading.tint[1], m.shading.tint[2], m.shading.maskScale,
+                      m.maskDropped ? " -> lit (mask not uploaded)" : m.resolved ? "" : " (texture not uploaded yet)");
+        examples += line;
+      }
+    }
+    fprintf(out,
+            "   BSP emissive materials: unlit %u (%u marked $selfillum: lighting the scene), self-illuminated: base "
+            "alpha %u, $selfillummask %u, envmap mask alpha %u | waiting for textures %u, mask never uploaded (lit) "
+            "%u\n%s",
+            modes[Shading::Unlit], luminous, modes[Shading::SelfIllumBaseAlpha], modes[Shading::SelfIllumMask],
+            modes[Shading::SelfIllumMaskAlpha], waiting, dropped, examples.c_str());
   }
   fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
           int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
