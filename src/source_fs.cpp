@@ -295,6 +295,12 @@ bool size(const std::string &path, uint64_t &out) {
     out = it->second.second;
     return true;
   }
+  // The engine's file system decides which copy of a file is the game's: a
+  // workshop addon's replaces the stock one (seen: a map addon shipping its
+  // own gm_construct/grass1.vtf, whose hashes the stock file's never matched).
+  // The index below serves when the engine has none (early start, tools).
+  if (engineRead(key, nullptr, 0, 0, &out))
+    return true;
   for (const auto &p : g_paths) {
     WIN32_FILE_ATTRIBUTE_DATA attributes;
     if (!p.directory.empty() && GetFileAttributesExW((p.directory + widen(key)).c_str(), GetFileExInfoStandard, &attributes) &&
@@ -323,6 +329,8 @@ bool read(const std::string &path, std::vector<uint8_t> &out, uint64_t offset, u
     out.assign(g_pak.data.begin() + start + offset, g_pak.data.begin() + start + offset + length);
     return true;
   }
+  if (engineRead(key, &out, offset, length, nullptr)) // see size()
+    return true;
   for (const auto &p : g_paths) {
     if (!p.directory.empty() && readFile(p.directory + widen(key), out, offset, length))
       return true;
