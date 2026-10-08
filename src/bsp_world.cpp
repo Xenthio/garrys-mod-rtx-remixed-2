@@ -284,11 +284,13 @@ bool loadMaterial(const std::string &name, KeyValues &out, int depth = 0) {
 // dxvk hashes of a texture's three largest mips as D3D would receive them
 // (packed rows; the engine may skip top mips by quality settings). Formats the
 // proxy does not upload yield none.
-std::vector<uint64_t> textureHashes(const std::string &name) {
-  const std::string path = "materials/" + lower(name) + ".vtf";
+std::vector<uint64_t> textureHashes(const std::string &path, bool engine) {
+  const auto read = [engine](const std::string &file, std::vector<uint8_t> &out, uint64_t offset, uint64_t length) {
+    return engine ? fs::engineReadFile(file, out, offset, length) : fs::read(file, out, offset, length);
+  };
   std::vector<uint8_t> header;
   uint64_t total = 0;
-  if (!fs::size(path, total) || !fs::read(path, header, 0, 80) || header.size() < 64 ||
+  if (!(engine ? fs::engineSize(path, total) : fs::size(path, total)) || !read(path, header, 0, 80) || header.size() < 64 ||
       std::memcmp(header.data(), "VTF", 4) != 0)
     return {};
   uint16_t width, height, frames;
@@ -340,7 +342,7 @@ std::vector<uint64_t> textureHashes(const std::string &name) {
     if (block > end)
       break;
     std::vector<uint8_t> level;
-    if (!fs::read(path, level, end - block, bytes) || level.size() != bytes)
+    if (!read(path, level, end - block, bytes) || level.size() != bytes)
       break;
     if (!convert) {
       hashes.push_back(XXH3_64bits(level.data(), level.size()));
@@ -364,6 +366,17 @@ std::vector<uint64_t> textureHashes(const std::string &name) {
     }
     end -= block;
   }
+  return hashes;
+}
+
+// Of the index's copy and, when the engine has a different one (a workshop
+// addon replacing a stock texture), of that as well.
+std::vector<uint64_t> textureHashes(const std::string &name) {
+  const std::string path = "materials/" + lower(name) + ".vtf";
+  std::vector<uint64_t> hashes = textureHashes(path, false);
+  for (uint64_t hash : textureHashes(path, true))
+    if (std::find(hashes.begin(), hashes.end(), hash) == hashes.end())
+      hashes.push_back(hash);
   return hashes;
 }
 
