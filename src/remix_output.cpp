@@ -59,7 +59,8 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0};
+  std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
@@ -2643,22 +2644,42 @@ void onPresent() {
     std::lock_guard<std::mutex> lock(g_lightLock);
     // The engine's own light state (engine_lights), as sampled for this frame.
     const auto engineLights = engine_lights::current();
-    uint32_t styled = 0, styledOff = 0, duplicates = 0;
+    uint32_t styled = 0, styledOff = 0, duplicates = 0, projectedCopies = 0;
     g_lightDefinitions.clear();
     // Dlights the engine also handed to a model (SetLight): one light.
-    if (engineLights && !engineLights->dlights.empty())
+    // Likewise a projected texture (the flashlight) given to the models in
+    // its beam: that copy has no identity (it is keyed by its contents), so
+    // while the flashlight moved it was a new light every frame, on top of
+    // the tracked one. Its origin is the projected texture's, up to a frame
+    // of movement.
+    if (engineLights && (!engineLights->dlights.empty() || !engineLights->projected.empty()))
       for (auto it = g_frameLights.begin(); it != g_frameLights.end();) {
         bool duplicate = false;
-        for (const auto &d : engineLights->dlights)
-          if (it->second.type != 2 && std::fabs(it->second.position[0] - d.position[0]) < .1f &&
-              std::fabs(it->second.position[1] - d.position[1]) < .1f &&
-              std::fabs(it->second.position[2] - d.position[2]) < .1f) {
-            duplicate = true;
-            break;
-          }
+        const auto within = [&](const float *p, float distance) {
+          return std::fabs(it->second.position[0] - p[0]) < distance &&
+                 std::fabs(it->second.position[1] - p[1]) < distance &&
+                 std::fabs(it->second.position[2] - p[2]) < distance;
+        };
+        if (it->second.type != 2) {
+          for (const auto &d : engineLights->dlights)
+            if (within(d.position, .1f)) {
+              duplicate = true;
+              break;
+            }
+          for (const auto &d : engineLights->projected)
+            if (!duplicate && within(d.position, 64.0f)) {
+              duplicate = true;
+              ++projectedCopies;
+            }
+        }
         duplicates += duplicate;
         it = duplicate ? g_frameLights.erase(it) : std::next(it);
       }
+    // What is left of SetLight this frame, by type (statistics).
+    for (const auto &[hash, l] : g_frameLights)
+      if (l.type >= 1 && l.type <= 3)
+        ++g_stats.setLightKept[l.type];
+    g_stats.projectedCopies += projectedCopies;
     auto addDefined = [](uint64_t hash, const SourceLight &l) {
       g_frameLights[hash] = l;
       g_lightDefinitions[hash] = fnv(&l, sizeof(l)) | 1; // never 0 (a light without a definition)
@@ -3170,6 +3191,10 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "\n");
   fprintf(out, "   lights per frame %.1f (cached %zu); sky radiance %.3f %.3f %.3f\n", g_stats.lights.exchange(0) / f,
           g_lights.size(), g_lastSky[0], g_lastSky[1], g_lastSky[2]);
+  fprintf(out, "   engine per-model lights kept per frame: point %.2f, directional %.2f, spot %.2f; copies of projected "
+               "textures dropped %.2f\n",
+          g_stats.setLightKept[1].exchange(0) / f, g_stats.setLightKept[2].exchange(0) / f,
+          g_stats.setLightKept[3].exchange(0) / f, g_stats.projectedCopies.exchange(0) / f);
   {
     std::lock_guard<std::mutex> lock(g_lightLock);
     for (auto &[h, l] : g_lastLights)
