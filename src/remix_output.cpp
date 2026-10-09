@@ -65,6 +65,15 @@ struct Stats {
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
+  // Decals (onDraw): by kind (DecalKind order), by what marked them, and how
+  // they were lifted off their receiver.
+  std::atomic<uint32_t> decalKinds[5] = {};
+  std::atomic<uint32_t> decalByFlag{0}, decalByShader{0}, decalByBias{0}, decalByCategory{0}, decalBiasOnly{0},
+      decalMaterialOnly{0}, decalWorld{0}, decalSkinned{0}, decalVertexNormals{0}, decalFaceNormals{0},
+      decalVertexColors{0}, decalModulateFade{0}, decalOtherBlend{0}, decalNotItsBlend{0}, decalNoMesh{0};
+  // Winding of the meshes built with vertex normals under D3DCULL_CCW: their
+  // first triangle's e1 x e2 along / against its vertex normals (since launch).
+  std::atomic<uint32_t> windingAlong{0}, windingAgainst{0};
 } g_stats;
 
 // CPU time accounting (microseconds), reset with the statistics.
@@ -1189,14 +1198,18 @@ void captureUi(const Draw &d) {
 
 // Converts one indexed draw into a Remix mesh. Returns nullptr when the draw
 // cannot be represented yet.
-// `normalOffset` > 0 lifts the surface off its receiver (decals, see onDraw).
+// `normalOffset` > 0 lifts the surface off its receiver (decals, see onDraw):
+// along the vertex normals, or without them (DecalModulate's vertices are a
+// position and a texture coordinate) along the summed face normals, e1 x e2
+// times `faceNormalSign` (see faceNormalSign()). `usedFaceNormals`: which.
 // `vertexColors`: forward COLOR0 (additive raster-only draws: Source fades and
 // hides sprites and beams through it, e.g. a holstered gravity gun's beams
 // stay alive at brightness 0); such a draw that is all black adds nothing and
 // yields no mesh, unless `keepBlack` (unlit $vertexcolor surfaces: a black one
 // is still a surface).
 remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVertex, uint32_t *boneCount,
-                              float normalOffset = 0, bool vertexColors = false, bool keepBlack = false) {
+                              float normalOffset = 0, bool vertexColors = false, bool keepBlack = false,
+                              float faceNormalSign = 1, bool *usedFaceNormals = nullptr) {
   Timer timer(g_usBuild);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
@@ -1356,8 +1369,24 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     }
   }
 
+  // Which way triangles wind (faceNormalSign()): one vote per mesh that has
+  // vertex normals, from its first triangle.
+  if (nrm && d.cullMode == D3DCULL_CCW && indices.size() >= 3) {
+    const auto &a = vertices[indices[0]], &b = vertices[indices[1]], &c = vertices[indices[2]];
+    const float e1[3] = {b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]};
+    const float e2[3] = {c.position[0] - a.position[0], c.position[1] - a.position[1], c.position[2] - a.position[2]};
+    const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    float along = 0;
+    for (int j = 0; j < 3; ++j)
+      along += n[j] * (a.normal[j] + b.normal[j] + c.normal[j]);
+    if (along > 0)
+      ++g_stats.windingAlong;
+    else if (along < 0)
+      ++g_stats.windingAgainst;
+  }
   if (normalOffset > 0) {
     // Vertex normal where present, else the summed face normals.
+    bool anyFace = false;
     std::vector<float> faces(vertices.size() * 3, 0.0f);
     for (size_t i = 0; i + 2 < indices.size(); i += 3) {
       const float *a = vertices[indices[i]].position, *b = vertices[indices[i + 1]].position,
@@ -1374,10 +1403,14 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       const float flen = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
       const float *n = vlen > 1e-6f ? vn : fn;
       const float len = vlen > 1e-6f ? vlen : flen;
+      const float sign = vlen > 1e-6f ? 1.0f : faceNormalSign;
+      anyFace |= !(vlen > 1e-6f);
       if (len > 1e-12f)
         for (int j = 0; j < 3; ++j)
-          vertices[v].position[j] += n[j] / len * normalOffset;
+          vertices[v].position[j] += n[j] / len * normalOffset * sign;
     }
+    if (usedFaceNormals)
+      *usedFaceNormals = anyFace;
   }
 
   remixapi_MeshInfoSurfaceTriangles surface = {};
@@ -1769,6 +1802,32 @@ void census(const Draw &d) {
   row.primitives += d.primCount;
 }
 
+// Decals (see onDraw): what one paints, and what marked it.
+enum DecalKind : uint8_t { kDecalNone, kDecalAlpha, kDecalMod2x, kDecalMultiply, kDecalOpaque };
+enum : uint32_t { kDecalByFlag = 1, kDecalByShader = 2, kDecalByBias = 4, kDecalByCategory = 8 };
+struct DecalSeen {
+  uint32_t draws = 0, how = 0;
+  uint8_t kind = 0;
+  std::string shader;
+};
+std::map<std::string, DecalSeen> g_decalsSeen; // by material, this interval; under g_transientSampleLock
+
+// What to multiply the summed face normals (e1 x e2) of a draw by to point
+// out of its visible side, for lifting a decal that has no vertex normals.
+// D3D culls the triangles that run counter-clockwise on screen (D3DCULL_CCW,
+// Source's default) and Source's world space is right-handed, so e1 x e2 of a
+// visible triangle points away from the viewer: into the wall (as in the BSP
+// file, whose faces wind clockwise seen from their front). The meshes that do
+// file, whose faces wind clockwise seen from their front, and in the studio
+// models' strips). The meshes that do have vertex normals are the check: if
+// their triangles overwhelmingly wind the other way, that is what is used.
+float faceNormalSign(uint32_t cullMode) {
+  const uint32_t along = g_stats.windingAlong.load(std::memory_order_relaxed),
+                 against = g_stats.windingAgainst.load(std::memory_order_relaxed);
+  const float ccw = along > 64 && along / 8 > against ? 1.0f : -1.0f;
+  return cullMode == D3DCULL_CW ? -ccw : ccw;
+}
+
 void onDraw(const Draw &d) {
   Timer timer(g_usDraw);
   ++g_stats.draws;
@@ -1792,9 +1851,27 @@ void onDraw(const Draw &d) {
     ++g_stats.ignored;
     return;
   }
-  // Source depth-biases decals and overlays. Alpha-over and multiplicative
-  // ones (blood and dirt: DESTCOLOR*SRCCOLOR) paint the surface below; the
-  // runtime needs them lifted off it, since only D3D applied the bias.
+  // Decals: paint on the surface below. Source draws them coplanar with it,
+  // depth-biased (SHADER_POLYOFFSET_DECAL: every material with $decal, set by
+  // CBaseShader, and DecalModulate by itself) and without depth writes; the
+  // runtime composes tagged instances into their receiver's material
+  // (resolveDecals in pathtrace.comp) and needs them lifted off it, since only
+  // D3D applied the bias. A blended draw is one when its material says so
+  // (engine_materials: $decal, or a Decal* shader), when D3D's depth bias is
+  // set, or when rtx.conf tags its texture. What it paints follows from its
+  // blend state:
+  //   alpha    SRCALPHA / INVSRCALPHA (LightmappedGeneric, VertexLitGeneric,
+  //            UnlitGeneric with $decal and $translucent: scorch marks,
+  //            sprays, model decals, signs): covers by texture alpha x vertex
+  //            alpha, coloured by texture x vertex colour.
+  //   mod2x    DESTCOLOR / SRCCOLOR (DecalModulate: bullet holes, blood): the
+  //            game computes dst x src x 2 on gamma values, mid-grey neutral.
+  //            The runtime multiplies the receiver's linear albedo by
+  //            linear(src) x 4.634 = linear(src) / linear(0.5): the same
+  //            product taken to linear light, (2 src)^2.2, to within 8% from
+  //            quarter grey up (darker texels are near black either way).
+  //   multiply DESTCOLOR / ZERO or ZERO / SRCCOLOR (Modulate, the engine's
+  //            shadow decals when kept): dst x src, albedo x linear(src).
   // (Blending on: the factors stay set after a decal, and the opaque draws
   // that followed one, with them still DESTCOLOR/SRCCOLOR, counted as
   // multiplying: their unlit or self-illuminated materials were not applied.)
@@ -1804,31 +1881,80 @@ void onDraw(const Draw &d) {
   constexpr uint32_t kDecalCategories =
       REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC |
       REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET;
-  const bool decal = d.blend && d.blendOp == D3DBLENDOP_ADD &&
-                     ((d.srcBlend == D3DBLEND_SRCALPHA && d.dstBlend == D3DBLEND_INVSRCALPHA) || multiply) &&
-                     (d.depthBias || (categories & kDecalCategories));
+  const engine_materials::Bound &bound = engine_materials::bound();
+  DecalKind paint = kDecalNone; // what the blend state would paint
+  if (!d.blend)
+    paint = kDecalOpaque;
+  else if (d.blendOp != D3DBLENDOP_ADD)
+    paint = kDecalNone;
+  else if (d.srcBlend == D3DBLEND_DESTCOLOR && d.dstBlend == D3DBLEND_SRCCOLOR)
+    paint = kDecalMod2x;
+  else if (multiply)
+    paint = kDecalMultiply;
+  else if (d.srcBlend == D3DBLEND_SRCALPHA && d.dstBlend == D3DBLEND_INVSRCALPHA)
+    paint = kDecalAlpha;
+  // The material's word counts for the draws that are its own: DecalModulate
+  // only ever draws mod2x (a draw that reached D3D under it with another
+  // blend state belongs to another material, see shadingFor).
+  const bool ownDraw = bound.known && (!bound.modulate || paint == kDecalMod2x);
+  uint32_t decalHow = 0;
+  if (ownDraw && bound.decal)
+    decalHow |= kDecalByFlag;
+  if (ownDraw && bound.decalShader)
+    decalHow |= kDecalByShader;
+  if (d.depthBias)
+    decalHow |= kDecalByBias;
+  if (categories & kDecalCategories)
+    decalHow |= kDecalByCategory;
+  // Opaque and alpha-tested decals ($decal without $translucent) are not
+  // paint to the runtime (a decal category only counts on a blended
+  // instance): they are lifted like the others and stay ordinary surfaces.
+  // rtx.conf's tag alone does not make one of an opaque draw, as before.
+  // (An opaque draw is its bound $decal material's own only without depth
+  // writes, which $decal turns off.)
+  DecalKind decalKind = decalHow ? paint : kDecalNone;
+  if (decalKind == kDecalOpaque && !(d.depthBias || ((decalHow & kDecalByFlag) && !d.zWrite)))
+    decalKind = kDecalNone;
+  // A decal material's draw with a blend state that paints nothing here
+  // (additive: rasterized over the image like other glows; premultiplied).
+  if (decalHow && paint == kDecalNone)
+    ++g_stats.decalOtherBlend;
+  if (bound.known && !ownDraw && (bound.decal || bound.decalShader))
+    ++g_stats.decalNotItsBlend;
+  const bool decal = decalKind == kDecalAlpha || decalKind == kDecalMod2x || decalKind == kDecalMultiply;
+  const bool lifted = decalKind != kDecalNone;
   if (decal && !(categories & kDecalCategories))
     categories |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
-  // Dev aid (OPENREMIX_PROXY_DUMP_DECALS=1): each blended draw's state, once
-  // per texture, to bin/decals.txt.
+  // Dev aid (OPENREMIX_PROXY_DUMP_DECALS=1): each blended or depth-biased
+  // draw's state, once per texture and blend state, to bin/decals.txt.
   static const bool dumpDecals = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_DECALS", v, sizeof(v)) && v[0] == '1';
   }();
-  if (dumpDecals && d.blend) {
+  if (dumpDecals && (d.blend || lifted)) {
     static std::unordered_set<uint64_t> seen;
-    if (seen.insert(baseTextureHash ^ (uint64_t(d.srcBlend) << 56) ^ (uint64_t(d.dstBlend) << 48)).second)
+    if (seen.insert(baseTextureHash ^ (uint64_t(d.srcBlend) << 56) ^ (uint64_t(d.dstBlend) << 48) ^
+                    (uint64_t(d.blend) << 40) ^ (uint64_t(decalHow) << 32))
+            .second)
       if (FILE *f = _wfopen((g_moduleDir + L"\\decals.txt").c_str(), L"a")) {
-        fprintf(f, "tex %016llX %s decal %d multiply %d src %u dst %u op %u sepA %d srcA %u dstA %u depthBias %d alphaTest %d ref %u "
-                   "cats %08X color %d write %X cull %u\n",
-                (unsigned long long)baseTextureHash, bsp::materialName(baseTextureHash).c_str(), int(decal), int(multiply),
-                d.srcBlend, d.dstBlend, d.blendOp, int(d.separateAlpha), d.srcBlendAlpha, d.dstBlendAlpha,
-                int(d.depthBias), int(d.alphaTest), d.alphaRef, categories,
-                int(findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr), d.colorWrite, d.cullMode);
+        static const char *const kinds[] = {"-", "alpha", "mod2x", "multiply", "opaque"};
+        fprintf(f, "tex %016llX %s | material %s shader %s flags %08X%s | decal %s by%s%s%s%s | blend %d src %u dst %u op %u "
+                   "sepA %d srcA %u dstA %u depthBias %d zwrite %d alphaTest %d func %u ref %u cats %08X write %X cull %u | "
+                   "vertex normal %d color %d bones %d dynamic %d world lists %d\n",
+                (unsigned long long)baseTextureHash, bsp::materialName(baseTextureHash).c_str(),
+                engine_materials::currentName(), bound.shader, unsigned(bound.flags),
+                bound.known ? (bound.subRect ? " (sub-rectangle)" : "") : " (not read)", kinds[decalKind],
+                decalHow & kDecalByFlag ? " $decal" : "", decalHow & kDecalByShader ? " shader" : "",
+                decalHow & kDecalByBias ? " depth-bias" : "", decalHow & kDecalByCategory ? " rtx.conf" : "",
+                int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.separateAlpha), d.srcBlendAlpha, d.dstBlendAlpha,
+                int(d.depthBias), int(d.zWrite), int(d.alphaTest), d.alphaFunc, d.alphaRef, categories, d.colorWrite,
+                d.cullMode, int(findElement(d.elements, D3DDECLUSAGE_NORMAL, 0) != nullptr),
+                int(findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr),
+                int(findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr),
+                int(d.streams[0].dynamic || d.indices.dynamic), g_worldLists);
         fclose(f);
       }
   }
-  constexpr float kDecalOffset = 0.1f; // inches
   if (categories & (REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY |
                     REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL)) {
     // l4d2-rtx's player body for first-person shadows. The runtime has no
@@ -1973,8 +2099,29 @@ void onDraw(const Draw &d) {
     shading = shadingFor(d.texture0, engine_materials::current());
   // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
   // panels, sprites). Other COLOR0 streams (baked prop lighting) do not.
-  const bool unlitColors = shading.mode == engine_materials::Shading::Unlit && shading.vertexColor &&
-                           findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr;
+  const bool hasColors = findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr;
+  const bool unlitColors = shading.mode == engine_materials::Shading::Unlit && shading.vertexColor && hasColors;
+  // An alpha decal's vertices carry its colour and its fade ($vertexcolor,
+  // $vertexalpha: scorch marks and sprays fade out through vertex alpha; the
+  // world shaders read both with $vertexcolor alone). mod2x and multiply
+  // decals ignore vertex colours (DecalModulate fades towards grey by vertex
+  // alpha when both flags are set, which a texture stage cannot express: such
+  // a decal keeps its full strength until the engine removes it).
+  // OPENREMIX_PROXY_DECAL_COLORS=0: decals as their texture alone.
+  static const bool decalColorsEnabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_DECAL_COLORS", v, sizeof(v)) && v[0] == '0');
+  }();
+  const bool decalMaterial = (decalHow & (kDecalByFlag | kDecalByShader)) != 0;
+  const bool decalAlphaFade = decalColorsEnabled && decalKind == kDecalAlpha && decalMaterial && hasColors &&
+                              (bound.vertexAlpha || (bound.lightmapped && bound.vertexColor));
+  const bool decalColors = decalColorsEnabled && !unlitColors && decalKind == kDecalAlpha && decalMaterial && hasColors &&
+                           (bound.vertexColor || decalAlphaFade);
+  if (decalKind == kDecalMod2x && decalMaterial && bound.vertexColor && bound.vertexAlpha)
+    ++g_stats.decalModulateFade;
+  constexpr float kDecalOffset = 0.1f; // inches
+  const float lift = lifted ? kDecalOffset : 0;
+  const float windingSign = lifted ? faceNormalSign(d.cullMode) : 1;
 
   struct Key {
     const void *vb, *ib, *decl;
@@ -1983,24 +2130,31 @@ void onDraw(const Draw &d) {
     uint32_t minIndex, numVertices, startIndex, primCount, type, bonesPerVertex;
   } key = {ps.buffer, d.indices.buffer, d.declaration, ps.version, d.indices.version, ps.offset, ps.stride,
            d.baseVertex, d.minIndex, d.numVertices, d.startIndex, d.primCount, uint32_t(d.type), bonesPerVertex};
-  const uint64_t hash = fnv(&key, sizeof(key)) ^ (decal ? 0xdeca1deca1deca1ull : 0) ^
-                        (unlitColors ? 0xc0105c0105c0105ull : 0);
+  const uint64_t hash = fnv(&key, sizeof(key)) ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^
+                        (unlitColors ? 0xc0105c0105c0105ull : 0) ^ (decalColors ? 0x0decac0105c0105ull : 0) ^
+                        (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
 
   remixapi_MeshHandle mesh = nullptr;
   uint32_t boneCount = 0;
   uint64_t geometry = 0;
+  bool faceNormals = false, meshBuilt = false;
   if (ps.dynamic || d.indices.dynamic) {
     // Dynamic buffers are rewritten every frame: build, draw once, destroy.
+    // (Decals on the world, on displacements and on models all come this
+    // way: the engine rebuilds their batches every frame.)
     g_transientIndices += d.primCount * 3;
     {
       std::lock_guard<std::mutex> lock(g_transientSampleLock);
       ++g_transientDecls[d.declaration];
     }
     // Additive as onPresent classifies it (destination factor ONE): raster only.
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0, additiveDraw || unlitColors,
-                     unlitColors);
-    if (!mesh)
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, additiveDraw || unlitColors || decalColors,
+                     unlitColors || decalColors, windingSign, &faceNormals);
+    if (!mesh) {
+      g_stats.decalNoMesh += lifted;
       return;
+    }
+    meshBuilt = true;
     g_transient.push_back(mesh);
     // The replacement key only matters to mods.
     if (g_modsResult == REMIXAPI_ERROR_CODE_SUCCESS)
@@ -2012,11 +2166,39 @@ void onDraw(const Draw &d) {
     it->second.lastFrame = g_frame;
     ++g_stats.cacheHits;
   } else {
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, decal ? kDecalOffset : 0, unlitColors, unlitColors);
-    if (!mesh)
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, unlitColors || decalColors, unlitColors || decalColors,
+                     windingSign, &faceNormals);
+    if (!mesh) {
+      g_stats.decalNoMesh += lifted;
       return;
+    }
+    meshBuilt = true;
     geometry = dxvk::geometryHash(d);
     g_meshes[hash] = {mesh, g_frame, boneCount, geometry};
+  }
+  if (lifted) {
+    ++g_stats.decalKinds[decalKind];
+    g_stats.decalByFlag += (decalHow & kDecalByFlag) != 0;
+    g_stats.decalByShader += (decalHow & kDecalByShader) != 0;
+    g_stats.decalByBias += (decalHow & kDecalByBias) != 0;
+    g_stats.decalByCategory += (decalHow & kDecalByCategory) != 0;
+    g_stats.decalBiasOnly += decalHow == kDecalByBias;
+    g_stats.decalMaterialOnly += decalMaterial && !(decalHow & kDecalByBias);
+    g_stats.decalWorld += g_worldLists > 0;
+    g_stats.decalSkinned += bonesPerVertex != 0;
+    if (meshBuilt)
+      ++(faceNormals ? g_stats.decalFaceNormals : g_stats.decalVertexNormals);
+    g_stats.decalVertexColors += decalColors || (unlitColors && decal);
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    const char *name = engine_materials::currentName();
+    const std::string key = *name ? name : bound.known ? "(unnamed)" : "(material not read)";
+    if (g_decalsSeen.size() < 96 || g_decalsSeen.count(key)) {
+      DecalSeen &seen = g_decalsSeen[key];
+      ++seen.draws;
+      seen.how |= decalHow;
+      seen.kind = decalKind;
+      seen.shader = bound.shader;
+    }
   }
 
   Instance inst;
@@ -2035,6 +2217,19 @@ void onDraw(const Draw &d) {
       inst.blend.textureAlphaOperation = 3;
       inst.blend.textureAlphaArg1Source = 1;
       inst.blend.textureAlphaArg2Source = 2;
+    }
+  } else if (decalColors) {
+    // The runtime's default colour stage is texture x vertex colour, its
+    // alpha stage the texture alone.
+    if (decalAlphaFade) {
+      inst.blend.textureAlphaOperation = 3;
+      inst.blend.textureAlphaArg1Source = 1;
+      inst.blend.textureAlphaArg2Source = 2;
+    }
+    if (!bound.vertexColor) { // $vertexalpha alone: the texture's colour
+      inst.blend.textureColorOperation = 1;
+      inst.blend.textureColorArg1Source = 1;
+      inst.blend.textureColorArg2Source = 2;
     }
   }
   // Experiment (OPENREMIX_PROXY_CULL_BLENDED=1): blended surfaces keep D3D's
@@ -3318,6 +3513,46 @@ void dumpStatistics(FILE *out) {
           g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
           g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f,
           g_stats.flashlightLitPasses.exchange(0) / f, g_stats.additiveBlack.exchange(0) / f);
+  {
+    // Decals: per frame by what they paint and by what marked them (a draw
+    // can be marked several ways), then the materials that drew them.
+    const uint32_t along = g_stats.windingAlong.load(), against = g_stats.windingAgainst.load();
+    fprintf(out,
+            "   decals per frame: alpha %.1f, mod2x %.1f, multiply %.1f, opaque/alpha-tested (lifted only) %.1f | marked by: "
+            "$decal %.1f, Decal* shader %.1f, depth bias %.1f, rtx.conf %.1f (depth bias alone %.1f, material without "
+            "depth bias %.1f) | in world lists %.1f, on models (skinned) %.1f | lifted along vertex normals %.1f, face "
+            "normals %.1f | with vertex colours %.1f\n"
+            "     not painted: decal material with another blend state (additive, ...) %.1f, draw under a "
+            "DecalModulate material that is not mod2x %.1f, no mesh %.1f | DecalModulate with vertex-alpha fade (not "
+            "applied) %.1f | winding of meshes with normals (since launch): e1 x e2 along the normal %u, against %u -> "
+            "face-normal sign %+.0f\n",
+            g_stats.decalKinds[kDecalAlpha].exchange(0) / f, g_stats.decalKinds[kDecalMod2x].exchange(0) / f,
+            g_stats.decalKinds[kDecalMultiply].exchange(0) / f, g_stats.decalKinds[kDecalOpaque].exchange(0) / f,
+            g_stats.decalByFlag.exchange(0) / f, g_stats.decalByShader.exchange(0) / f,
+            g_stats.decalByBias.exchange(0) / f, g_stats.decalByCategory.exchange(0) / f,
+            g_stats.decalBiasOnly.exchange(0) / f, g_stats.decalMaterialOnly.exchange(0) / f,
+            g_stats.decalWorld.exchange(0) / f, g_stats.decalSkinned.exchange(0) / f,
+            g_stats.decalVertexNormals.exchange(0) / f, g_stats.decalFaceNormals.exchange(0) / f,
+            g_stats.decalVertexColors.exchange(0) / f, g_stats.decalOtherBlend.exchange(0) / f,
+            g_stats.decalNotItsBlend.exchange(0) / f, g_stats.decalNoMesh.exchange(0) / f,
+            g_stats.decalModulateFade.exchange(0) / f, along, against, faceNormalSign(D3DCULL_CCW));
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    std::vector<const std::pair<const std::string, DecalSeen> *> order;
+    for (const auto &item : g_decalsSeen)
+      order.push_back(&item);
+    std::sort(order.begin(), order.end(), [](const auto *a, const auto *b) { return a->second.draws > b->second.draws; });
+    static const char *const kinds[] = {"-", "alpha", "mod2x", "multiply", "opaque"};
+    for (size_t i = 0; i < order.size() && i < 16; ++i) {
+      const DecalSeen &seen = order[i]->second;
+      fprintf(out, "     decal %s (%s): %s, by%s%s%s%s, %.2f draws/frame\n", order[i]->first.c_str(), seen.shader.c_str(),
+              kinds[seen.kind], seen.how & kDecalByFlag ? " $decal" : "", seen.how & kDecalByShader ? " shader" : "",
+              seen.how & kDecalByBias ? " depth-bias" : "", seen.how & kDecalByCategory ? " rtx.conf" : "",
+              seen.draws / f);
+    }
+    if (order.size() > 16)
+      fprintf(out, "     ... and %zu more decal materials\n", order.size() - 16);
+    g_decalsSeen.clear();
+  }
   {
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
     if (!g_census.empty())

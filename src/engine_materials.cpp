@@ -39,7 +39,15 @@
 //     The getters forward to a queue-thread twin ([rcx+0x29]) only while the
 //     calling thread's render context has a call queue; on the thread that
 //     executes Bind they return the var's own value, as the shaders read it.
-//   CShaderAPIDx8 (IShaderAPI, ShaderApi030): 114 Bind(IMaterial *).
+//   CMaterialSubRect (a rectangle of an atlas material: the world's bullet
+//     holes, blood and scorch marks are "decals/x_subrect" in "decals/
+//     decals_mod2x" or "decals/decals_lit"): 0 GetName (its own name symbol at
+//     +0x14), 7 InMaterialPage (true), 10 GetMaterialPage (mov rax, [rcx+8]),
+//     the CMaterial every other call forwards to. Optional: without it such
+//     materials stay unread.
+//   CShaderAPIDx8 (IShaderAPI, ShaderApi030): 114 Bind(IMaterial *). Between
+//     two sub-rectangles of one page it neither flushes nor stores (they draw
+//     as one batch), but the hook still sees every call.
 namespace proxy::engine_materials {
 namespace {
 
@@ -50,6 +58,9 @@ constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarG
 constexpr uintptr_t kGetName = 0xe7e0, kParamCount = 0x11cd0, kParams = 0xf020, kShaderName = 0xefd0;
 constexpr uintptr_t kVarName = 0x26b10, kVarString = 0x26ba0, kVarDefined = 0x27080, kVarInt = 0x26840,
                     kVarFloat = 0x26720, kVarVec = 0x26f60;
+constexpr uintptr_t kSubRectVtable = 0xaf050, kSubRectName = 0x15420, kSubRectInPage = 0xfe50, kSubRectPage = 0x12980;
+constexpr unsigned kSlotInPage = 7, kSlotPage = 10;
+constexpr size_t kSubRectPageOffset = 0x8, kSubRectNameOffset = 0x14;
 constexpr unsigned kSlotBind = 114;
 constexpr uintptr_t kBind = 0x11540;
 
@@ -59,7 +70,8 @@ constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 constexpr uint8_t kTypeTexture = 3, kTypeUndefined = 6;
 // MaterialVarFlags_t.
-constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7;
+constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
+              kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagTranslucent = 1 << 21;
 
 struct Expected {
   bool shaderApi; // else materialsystem.dll
@@ -142,14 +154,14 @@ struct Module {
   }
 } g_materialSystem, g_shaderApi;
 
-std::atomic<bool> g_installed{false};
+std::atomic<bool> g_installed{false}, g_subRects{false};
 std::atomic<const char *> g_status{"not installed"}, g_detail{""};
 
 using NameFn = const char *(*)(void *);
 using IntFn = int (*)(void *);
 using FloatFn = float (*)(void *);
 using VecFn = const float *(*)(void *);
-NameFn g_materialName = nullptr, g_shaderName = nullptr, g_varName = nullptr;
+NameFn g_materialName = nullptr, g_shaderName = nullptr, g_varName = nullptr, g_subRectName = nullptr;
 IntFn g_varInt = nullptr;
 FloatFn g_varFloat = nullptr;
 VecFn g_varVec = nullptr;
@@ -173,6 +185,7 @@ struct Entry {
   int16_t flags = -1, color = -1, color2 = -1, tint = -1, mask = -1, maskScale = -1, envmapMask = -1,
           envmapMaskAlpha = -1, fresnel = -1, fresnelRange = -1, base = -1;
   std::string name, shaderName;
+  bool decalShader = false, modulate = false, lightmapped = false; // by shader name
   // A texture var's name, by the ITexture last seen in it.
   struct TextureName {
     void *texture = nullptr;
@@ -182,6 +195,14 @@ struct Entry {
 std::unordered_map<void *, Entry> g_entries; // render thread
 Shading g_current;                           // render thread
 const Entry *g_currentEntry = nullptr;       // render thread
+Bound g_bound;                               // render thread
+// Sub-rectangle materials' own names, while they keep their name symbol.
+struct SubRectName {
+  uint16_t symbol = 0;
+  std::string name;
+};
+std::unordered_map<void *, SubRectName> g_subRectNames; // render thread
+const char *g_currentName = "";                         // render thread
 
 struct Seen {
   std::string shader;
@@ -193,7 +214,8 @@ struct Seen {
 };
 struct Statistics {
   std::atomic<uint32_t> binds{0}, unlit{0}, baseAlpha{0}, mask{0}, maskAlpha{0};
-  std::atomic<uint32_t> otherClass{0}, noParams{0}, foreignVar{0}, noMaskTexture{0};
+  std::atomic<uint32_t> otherClass{0}, noParams{0}, foreignVar{0}, noMaskTexture{0}, subRects{0}, subRectNoPage{0},
+      decals{0};
   std::mutex lock;
   std::map<std::string, uint32_t> shaders; // distinct materials by shader name, since launch
   std::map<std::string, Seen> seen;        // unlit and self-illuminated materials bound this interval
@@ -242,6 +264,14 @@ void resolve(Entry &e, void *material) {
   const char *shader = g_shaderName(material);
   e.shaderName = shader ? shader : "";
   e.kind = shaderMode(e.shaderName.c_str());
+  {
+    // "DecalModulate_dx9", "DecalBaseTimesLightmapAlphaBlendSelfIllum_DX9", ...
+    const std::string shaderLower = lower(e.shaderName.c_str());
+    e.decalShader = shaderLower.compare(0, 5, "decal") == 0;
+    e.modulate = shaderLower.compare(0, 13, "decalmodulate") == 0;
+    for (const char *world : {"lightmappedgeneric", "worldvertextransition", "lightmapped_4wayblend", "decalbasetimeslightmap"})
+      e.lightmapped |= shaderLower.compare(0, std::strlen(world), world) == 0;
+  }
   {
     std::lock_guard<std::mutex> lock(g_stats.lock);
     ++g_stats.shaders[e.shaderName];
@@ -437,7 +467,24 @@ bool install(const void *const *shaderApiVtable) {
   g_varInt = reinterpret_cast<IntFn>(at(kVarInt));
   g_varFloat = reinterpret_cast<FloatFn>(at(kVarFloat));
   g_varVec = reinterpret_cast<VecFn>(at(kVarVec));
-  g_status = "ok (IShaderAPI::Bind read)";
+  // Sub-rectangle materials: their page is read instead. On another layout
+  // they stay unread, as before.
+  {
+    auto slot = [](unsigned index) {
+      const uintptr_t entry = kSubRectVtable + index * sizeof(void *);
+      return entry + sizeof(void *) <= g_materialSystem.size
+                 ? *reinterpret_cast<uintptr_t *>(g_materialSystem.base + entry) - g_materialSystem.base
+                 : 0;
+    };
+    if (slot(kSlotGetName) == kSubRectName && slot(kSlotInPage) == kSubRectInPage && slot(kSlotPage) == kSubRectPage &&
+        g_materialSystem.bytesAt(kSubRectName, "48 83 C1 14 E9") && g_materialSystem.bytesAt(kSubRectInPage, "B0 01 C3") &&
+        g_materialSystem.bytesAt(kSubRectPage, "48 8B 41 08 C3")) {
+      g_subRectName = reinterpret_cast<NameFn>(at(kSubRectName));
+      g_subRects = true;
+    }
+  }
+  g_status = g_subRects ? "ok (IShaderAPI::Bind read, sub-rectangle materials through their page)"
+                        : "ok (IShaderAPI::Bind read; CMaterialSubRect layout not recognized: decal atlases unread)";
   g_installed = true;
   return true;
 }
@@ -445,10 +492,35 @@ bool install(const void *const *shaderApiVtable) {
 void onBind(void *material) {
   g_current = Shading{};
   g_currentEntry = nullptr;
+  g_bound = Bound{};
+  g_currentName = "";
   if (!g_installed.load(std::memory_order_relaxed) || !material)
     return;
   g_stats.binds.fetch_add(1, std::memory_order_relaxed);
-  // CMaterial only (not CMaterialSubRect, whose vars are its page's).
+  // A sub-rectangle of an atlas: its page is the material the draw uses.
+  const char *subRectName = nullptr;
+  if (g_subRects.load(std::memory_order_relaxed) &&
+      *static_cast<uintptr_t *>(material) == g_materialSystem.base + kSubRectVtable) {
+    void *page;
+    uint16_t symbol;
+    std::memcpy(&page, static_cast<const uint8_t *>(material) + kSubRectPageOffset, sizeof(page));
+    std::memcpy(&symbol, static_cast<const uint8_t *>(material) + kSubRectNameOffset, sizeof(symbol));
+    if (!page) {
+      g_stats.subRectNoPage.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (g_subRectNames.size() > 4096)
+      g_subRectNames.clear();
+    SubRectName &own = g_subRectNames[material];
+    if (own.name.empty() || own.symbol != symbol) {
+      own.symbol = symbol;
+      own.name = lower(g_subRectName(material));
+    }
+    subRectName = own.name.c_str();
+    material = page;
+    g_stats.subRects.fetch_add(1, std::memory_order_relaxed);
+  }
+  // CMaterial only (its vars are its own).
   if (*static_cast<uintptr_t *>(material) != g_materialSystem.base + kMaterialVtable) {
     g_stats.otherClass.fetch_add(1, std::memory_order_relaxed);
     return;
@@ -477,6 +549,26 @@ void onBind(void *material) {
     resolve(e, material);
   }
   g_currentEntry = &e;
+  g_currentName = subRectName ? subRectName : e.name.c_str();
+  {
+    void *flagsVar = paramAt(e, e.flags);
+    const int flags = flagsVar ? g_varInt(flagsVar) : 0;
+    g_bound.known = true;
+    g_bound.flags = flags;
+    g_bound.decal = (flags & kFlagDecal) != 0;
+    g_bound.decalShader = e.decalShader;
+    g_bound.modulate = e.modulate;
+    g_bound.lightmapped = e.lightmapped;
+    g_bound.vertexColor = (flags & kFlagVertexColor) != 0;
+    g_bound.vertexAlpha = (flags & kFlagVertexAlpha) != 0;
+    g_bound.translucent = (flags & kFlagTranslucent) != 0;
+    g_bound.additive = (flags & kFlagAdditive) != 0;
+    g_bound.alphaTest = (flags & kFlagAlphaTest) != 0;
+    g_bound.subRect = subRectName != nullptr;
+    g_bound.shader = e.shaderName.c_str();
+    if (g_bound.decal || g_bound.decalShader)
+      g_stats.decals.fetch_add(1, std::memory_order_relaxed);
+  }
   if (e.kind != Shading::Lit)
     read(e, g_current);
   // Draws are matched to the material by its base texture as well
@@ -508,7 +600,9 @@ void onBind(void *material) {
 
 const Shading &current() { return g_current; }
 
-const char *currentName() { return g_currentEntry ? g_currentEntry->name.c_str() : ""; }
+const char *currentName() { return g_currentName; }
+
+const Bound &bound() { return g_bound; }
 
 bool currentIsLitOpaque() {
   const Entry *e = g_currentEntry;
@@ -537,11 +631,15 @@ void dumpStatistics(FILE *out) {
   fprintf(out,
           "   binds per second %.0f: unlit %.1f, self-illuminated %.1f (base alpha %.1f, $selfillummask %.1f, envmap "
           "mask alpha %.1f) | not read: other material classes %.1f, without params %.1f, foreign vars %.1f, mask "
-          "var without a texture %.1f\n",
+          "var without a texture %.1f\n"
+          "   decal materials bound per second ($decal or a Decal* shader) %.1f | sub-rectangle materials (decal "
+          "atlases) %.1f, read through their page: %s; without a page %.1f\n",
           double(g_stats.binds.exchange(0)) / seconds, double(g_stats.unlit.exchange(0)) / seconds,
           baseAlpha + mask + maskAlpha, baseAlpha, mask, maskAlpha, double(g_stats.otherClass.exchange(0)) / seconds,
           double(g_stats.noParams.exchange(0)) / seconds, double(g_stats.foreignVar.exchange(0)) / seconds,
-          double(g_stats.noMaskTexture.exchange(0)) / seconds);
+          double(g_stats.noMaskTexture.exchange(0)) / seconds, double(g_stats.decals.exchange(0)) / seconds,
+          double(g_stats.subRects.exchange(0)) / seconds, g_subRects ? "yes" : "no (layout not recognized)",
+          double(g_stats.subRectNoPage.exchange(0)) / seconds);
   std::lock_guard<std::mutex> lock(g_stats.lock);
   fprintf(out, "   materials seen since launch, by shader (%zu known now):", g_stats.entries);
   for (const auto &[shader, count] : g_stats.shaders)

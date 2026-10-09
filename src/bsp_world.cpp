@@ -3,6 +3,7 @@
 #include "engine_lights.h"
 #include "source_fs.h"
 #include "texture_categories.h"
+#include "texture_formats.h"
 
 #define XXH_INLINE_ALL
 #include "xxhash.h"
@@ -392,6 +393,68 @@ bool textureHasAlpha(const std::string &name) {
   return (flags & 0x3000) != 0;
 }
 
+// A texture's mean colour, as stored (0..1, no gamma): its smallest mip, or
+// the whole image of one without mips. False for a missing file or a format
+// not read here.
+bool textureMean(const std::string &name, float rgba[4]) {
+  const std::string path = "materials/" + lower(name) + ".vtf";
+  std::vector<uint8_t> header;
+  uint64_t total = 0;
+  if (!fs::size(path, total) || !fs::read(path, header, 0, 80) || header.size() < 64 ||
+      std::memcmp(header.data(), "VTF", 4) != 0)
+    return false;
+  uint16_t width, height, frames;
+  uint32_t flags;
+  int32_t format;
+  std::memcpy(&width, header.data() + 16, 2);
+  std::memcpy(&height, header.data() + 18, 2);
+  std::memcpy(&flags, header.data() + 20, 4);
+  std::memcpy(&frames, header.data() + 24, 2);
+  std::memcpy(&format, header.data() + 52, 4);
+  const uint32_t mips = std::max<uint32_t>(header[56], 1);
+  uint32_t blockBytes = 0, pixelBytes = 0;
+  int order[4] = {0, 1, 2, 3}; // where r, g, b, a are in a pixel (-1: none)
+  switch (format) {
+  case 0: pixelBytes = 4; break;                                             // RGBA8888
+  case 2: pixelBytes = 3; order[3] = -1; break;                              // RGB888
+  case 3: pixelBytes = 3; order[0] = 2; order[2] = 0; order[3] = -1; break;  // BGR888
+  case 12: pixelBytes = 4; order[0] = 2; order[2] = 0; break;                // BGRA8888
+  case 16: pixelBytes = 4; order[0] = 2; order[2] = 0; order[3] = -1; break; // BGRX8888
+  case 13: case 20: blockBytes = 8; break;                                   // DXT1
+  case 15: blockBytes = 16; break;                                           // DXT5
+  default: return false;
+  }
+  if (!width || !height || mips > 16)
+    return false;
+  const uint32_t faces = (flags & 0x4000) ? 6 : 1;
+  auto bytesOf = [&](uint32_t mip) {
+    const uint32_t w = std::max(1u, uint32_t(width) >> mip), h = std::max(1u, uint32_t(height) >> mip);
+    return blockBytes ? uint64_t((w + 3) / 4) * ((h + 3) / 4) * blockBytes : uint64_t(w) * h * pixelBytes;
+  };
+  // The mips end the file, smallest first.
+  uint64_t all = 0;
+  for (uint32_t mip = 0; mip < mips; ++mip)
+    all += bytesOf(mip) * std::max<uint16_t>(frames, 1) * faces;
+  const uint32_t last = mips - 1;
+  const uint32_t w = std::max(1u, uint32_t(width) >> last), h = std::max(1u, uint32_t(height) >> last);
+  std::vector<uint8_t> level;
+  if (all > total || bytesOf(last) > (64u << 20) || !fs::read(path, level, total - all, bytesOf(last)) ||
+      level.size() != bytesOf(last))
+    return false;
+  if (blockBytes) {
+    level = blockBytes == 8 ? formats::decodeBC1(level.data(), w, h) : formats::decodeBC3(level.data(), w, h);
+    pixelBytes = 4;
+  }
+  double sum[4] = {};
+  const size_t pixels = size_t(w) * h;
+  for (size_t i = 0; i < pixels; ++i)
+    for (int c = 0; c < 4; ++c)
+      sum[c] += order[c] < 0 ? 255.0 : double(level[i * pixelBytes + size_t(order[c])]);
+  for (int c = 0; c < 4; ++c)
+    rgba[c] = float(sum[c] / (255.0 * double(pixels)));
+  return true;
+}
+
 // "[r g b]" (floats) or "{r g b}" (0..255), or one number for all three.
 bool parseColor(const std::string &text, float out[3]) {
   const size_t digits = text.find_first_of("-.0123456789");
@@ -528,6 +591,28 @@ struct OverlayGroup {
   uint32_t builtResolved = ~0u;
 };
 
+// The second texture of a two-layer world material (WorldVertexTransition, or
+// LightmappedGeneric with $basetexture2), which a displacement's per-vertex
+// alpha blends over the first: result = lerp(base, base2, blend). See build().
+struct SecondLayer {
+  bool present = false;  // the material has a $basetexture2
+  bool prepared = false; // material and blend modulation looked up
+  int material = -1;    // g_world.materials index of the layer (-1: its texture has no hash)
+  // $blendmodulatetexture: blend = smoothstep(g - r, g + r, alpha) per pixel
+  // in the game, here per vertex with the texture's mean g (centre) and r
+  // (half width). $maskedblending: the texture's g alone.
+  bool modulate = false, masked = false;
+  float centre = 0.5f, halfWidth = 0.5f;
+};
+struct LayerStatistics {
+  uint32_t materials = 0, noHash = 0, fourWay = 0, modulated = 0, modulateUnread = 0;
+  uint32_t displacements = 0, layered = 0, flat = 0, withoutTexture = 0;
+  uint32_t baseTriangles = 0, secondTriangles = 0, blendedTriangles = 0;
+  uint32_t brushFaces = 0; // two-layer materials on faces without a displacement (no alpha: the first texture)
+  float alphaMin = 255, alphaMax = 0;
+  std::string names;
+};
+
 struct World {
   const remixapi_Interface *api = nullptr;
   std::string map;
@@ -542,6 +627,10 @@ struct World {
   std::vector<uint8_t> leafPlayable; // empty, in a cluster, outside the 3D skybox
   int skyArea = -1;
   std::map<std::array<int32_t, 5>, OverlayGroup> overlayGroups;
+  // Blended second layers of displacements: decal sheets with per-vertex alpha.
+  std::map<std::array<int32_t, 5>, OverlayGroup> layerGroups;
+  std::unordered_map<int, SecondLayer> secondLayers; // by base material index
+  LayerStatistics layers;
   std::unordered_map<std::string, int> overlayMaterialIndex;
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0;
   // Prop placements by 64-unit cell of their origin, for matching engine draws.
@@ -998,6 +1087,80 @@ int materialByName(const std::string &name, bool brush) {
   return slot;
 }
 
+// Whether a world material (by its g_world.materials index) has a second
+// layer; `use`: one of its displacements blends it in, so its material and
+// its blend modulation are needed too.
+SecondLayer secondLayer(int base, bool use) {
+  auto found = g_world.secondLayers.find(base);
+  if (found == g_world.secondLayers.end()) {
+    SecondLayer out;
+    KeyValues kv;
+    bool world = false;
+    if (loadMaterial(g_world.materials[base].name, kv))
+      for (const char *shader : {"worldvertextransition", "lightmappedgeneric", "lightmapped_4wayblend"})
+        world |= kv.shader.rfind(shader, 0) == 0;
+    // OPENREMIX_PROXY_BSP_LAYERS=0: the first texture alone, as before.
+    static const bool enabled = [] {
+      char v[8] = {};
+      return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_LAYERS", v, sizeof(v)) && v[0] == '0');
+    }();
+    out.present = enabled && world && kv.values.count("$basetexture2") && !kv.values["$basetexture2"].empty();
+    found = g_world.secondLayers.emplace(base, out).first;
+  }
+  if (!use || !found->second.present || found->second.prepared)
+    return found->second;
+  SecondLayer out = found->second;
+  out.prepared = true;
+  const std::string name = g_world.materials[base].name;
+  KeyValues kv;
+  loadMaterial(name, kv);
+  auto &stats = g_world.layers;
+  ++stats.materials;
+  // Layers 3 and 4 of a 4-way blend need the multiblend lump (not written
+  // for these maps): its second layer by alpha, as the shader falls back to.
+  stats.fourWay += kv.shader.rfind("lightmapped_4wayblend", 0) == 0;
+  Material m;
+  m.name = name + " ($basetexture2 " + lower(kv.values["$basetexture2"]) + ")";
+  m.candidates = textureHashes(kv.values["$basetexture2"]);
+  for (uint64_t h : m.candidates)
+    m.categories |= categories::lookup(h);
+  m.categories &= ~uint32_t(REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE | REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN);
+  if (m.candidates.empty()) {
+    ++stats.noHash;
+  } else {
+    out.material = int(g_world.materials.size());
+    g_world.materials.push_back(std::move(m));
+  }
+  if (kv.values.count("$blendmodulatetexture")) {
+    float mean[4];
+    if (textureMean(kv.values["$blendmodulatetexture"], mean)) {
+      out.modulate = true;
+      out.masked = std::atoi(kv.values["$maskedblending"].c_str()) != 0;
+      out.centre = mean[1];
+      out.halfWidth = mean[0];
+      ++stats.modulated;
+    } else {
+      ++stats.modulateUnread;
+    }
+  }
+  if (stats.names.size() < 700) {
+    char line[400];
+    std::snprintf(line, sizeof(line), "      %s (%s): $basetexture2 %s%s", name.c_str(), kv.shader.c_str(),
+                  lower(kv.values["$basetexture2"]).c_str(), out.material < 0 ? " (no texture hash: not layered)" : "");
+    stats.names += line;
+    if (out.modulate) {
+      std::snprintf(line, sizeof(line), ", $blendmodulatetexture mean centre %.2f half width %.2f%s", out.centre,
+                    out.halfWidth, out.masked ? " ($maskedblending)" : "");
+      stats.names += line;
+    } else if (kv.values.count("$blendmodulatetexture")) {
+      stats.names += ", $blendmodulatetexture not read (plain alpha)";
+    }
+    stats.names += "\n";
+  }
+  g_world.secondLayers[base] = out;
+  return out;
+}
+
 constexpr uint64_t kBatchId = 0x42535057; // "BSPW"
 
 void destroyMeshes() {
@@ -1011,6 +1174,9 @@ void destroyMeshes() {
     if (m.owned && m.ref.handle && g_world.api)
       g_world.api->DestroyMaterial(m.ref.handle);
   for (auto &[key, group] : g_world.overlayGroups)
+    if (group.mesh && g_world.api)
+      g_world.api->DestroyMesh(group.mesh);
+  for (auto &[key, group] : g_world.layerGroups)
     if (group.mesh && g_world.api)
       g_world.api->DestroyMesh(group.mesh);
   for (auto &[key, model] : g_world.propModels)
@@ -1742,9 +1908,13 @@ bool build(const Bsp &bsp) {
     if (m < 0)
       continue;
     const TexData &td = texDatas[ti.texData];
+    // The face's plane is already the one it faces along (dface_t::side says
+    // which of a node's two planes that is; it does not flip the normal: on
+    // these maps every face winds clockwise seen from its plane's front, with
+    // empty space there, whatever its side).
     float normal[3];
     for (int k = 0; k < 3; ++k)
-      normal[k] = planes[face.plane].normal[k] * (face.side ? -1.0f : 1.0f);
+      normal[k] = planes[face.plane].normal[k];
     std::vector<std::array<float, 3>> corners;
     for (int e = 0; e < face.numEdges; ++e) {
       const size_t se = size_t(face.firstEdge + e);
@@ -1765,11 +1935,15 @@ bool build(const Bsp &bsp) {
     for (auto &c : corners)
       for (int k = 0; k < 3; ++k)
         centroid[k] += c[k] / float(corners.size());
-    // Into the leaf in front of the face.
+    // Into the leaf in front of the face, and the one behind it: a
+    // displacement's brush is not solid, and its base face may lie flush
+    // against another brush (the skybox floor under a terrain block), so
+    // either side can be the one that is in the skybox's area.
     const float probe[3] = {centroid[0] + normal[0], centroid[1] + normal[1], centroid[2] + normal[2]};
+    const float behind[3] = {centroid[0] - normal[0], centroid[1] - normal[1], centroid[2] - normal[2]};
     // The 3D skybox: path traced in world space, or left to the engine's
     // sky view (l4d2-rtx keeps its draws).
-    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe);
+    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe) || inSky(behind);
     if (skyboxFace) {
       ++g_world.skyFaces;
       if (!g_world.skyTraced)
@@ -1781,7 +1955,7 @@ bool build(const Bsp &bsp) {
     const bool sky = false;
     // Bakes a skybox face's vertices (from `base`, indices from `firstIndex`)
     // into world space and drops triangles inside the playable map.
-    auto toWorld = [&](Geometry &g, size_t base, size_t firstIndex) {
+    auto toWorld = [&](Geometry &g, size_t base, size_t firstIndex, bool count = true) {
       if (!skyboxFace)
         return;
       for (size_t v = base; v < g.vertices.size(); ++v) {
@@ -1806,20 +1980,20 @@ bool build(const Bsp &bsp) {
         pieces.erase(std::remove_if(pieces.begin(), pieces.end(),
                                     [&](const auto &piece) {
                                       const bool coplanar = onWorldFace(piece);
-                                      g_world.skyCoplanarPieces += coplanar;
+                                      g_world.skyCoplanarPieces += coplanar && count;
                                       split |= coplanar;
                                       return coplanar;
                                     }),
                      pieces.end());
         if (!split) {
           g.indices.insert(g.indices.end(), triangles.begin() + i, triangles.begin() + i + 3);
-          ++g_world.skyTracedTriangles;
+          g_world.skyTracedTriangles += count;
           continue;
         }
         if (pieces.empty())
-          ++g_world.skyStandInTriangles;
+          g_world.skyStandInTriangles += count;
         else
-          ++g_world.skyClippedTriangles;
+          g_world.skyClippedTriangles += count;
         for (const auto &piece : pieces) {
           const uint32_t first = uint32_t(g.vertices.size());
           g.vertices.insert(g.vertices.end(), piece.begin(), piece.end());
@@ -1850,9 +2024,11 @@ bool build(const Bsp &bsp) {
       const int size = (1 << di.power) + 1;
       if (di.power < 2 || di.power > 4 || di.firstVert < 0 || size_t(di.firstVert + size * size) > dispVertCount)
         continue;
-      Geometry &g = groupFor(centroid, sky, m);
-      const uint32_t base = uint32_t(g.vertices.size());
-      const size_t firstIndex = g.indices.size();
+      // The grid, then its triangles (indices into it).
+      std::vector<remixapi_HardcodedVertex> grid;
+      std::vector<float> alpha; // DISP_VERTS alpha, 0..255
+      grid.reserve(size_t(size) * size);
+      alpha.reserve(size_t(size) * size);
       for (int v = 0; v < size; ++v) {
         const float t = float(v) / float(size - 1);
         float left[3], right[3];
@@ -1872,21 +2048,23 @@ bool build(const Bsp &bsp) {
           auto out = vertex(flat, normal, ti, td);
           std::memcpy(out.position, pos, 12);
           std::memset(out.normal, 0, 12);
-          g.vertices.push_back(out);
+          grid.push_back(out);
+          alpha.push_back(std::isfinite(dv.alpha) ? std::clamp(dv.alpha, 0.0f, 255.0f) : 0.0f);
         }
       }
+      std::vector<uint32_t> triangles;
+      triangles.reserve(size_t(size - 1) * (size - 1) * 6);
       for (int v = 0; v + 1 < size; ++v)
         for (int u = 0; u + 1 < size; ++u) {
-          const uint32_t i = base + uint32_t(v * size + u), right = i + 1, down = i + uint32_t(size),
-                         diagonal = down + 1;
+          const uint32_t i = uint32_t(v * size + u), right = i + 1, down = i + uint32_t(size), diagonal = down + 1;
           if ((v * size + u) % 2)
-            g.indices.insert(g.indices.end(), {i, down, right, right, down, diagonal});
+            triangles.insert(triangles.end(), {i, down, right, right, down, diagonal});
           else
-            g.indices.insert(g.indices.end(), {i, down, diagonal, i, diagonal, right});
+            triangles.insert(triangles.end(), {i, down, diagonal, i, diagonal, right});
         }
       // Smooth normals from the triangles, facing the base surface's side.
-      for (size_t i = g.indices.size() - size_t(size - 1) * (size - 1) * 6; i + 2 < g.indices.size(); i += 3) {
-        auto &a = g.vertices[g.indices[i]], &b = g.vertices[g.indices[i + 1]], &c = g.vertices[g.indices[i + 2]];
+      for (size_t i = 0; i + 2 < triangles.size(); i += 3) {
+        auto &a = grid[triangles[i]], &b = grid[triangles[i + 1]], &c = grid[triangles[i + 2]];
         const float e1[3] = {b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]};
         const float e2[3] = {c.position[0] - a.position[0], c.position[1] - a.position[1], c.position[2] - a.position[2]};
         float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
@@ -1897,16 +2075,102 @@ bool build(const Bsp &bsp) {
           for (int k = 0; k < 3; ++k)
             vtx->normal[k] += n[k];
       }
-      for (size_t v = base; v < g.vertices.size(); ++v) {
-        float *n = g.vertices[v].normal;
+      for (auto &vtx : grid) {
+        float *n = vtx.normal;
         const float len = std::sqrt(dot(n, n));
         for (int k = 0; k < 3; ++k)
           n[k] = len > 1e-12f ? n[k] / len : normal[k];
       }
-      toWorld(g, base, firstIndex);
+      // Adds triangles of the grid to a geometry. sheet: as a layer lifted off
+      // the surface whose vertex alpha is `blend`.
+      constexpr float kLayerOffset = 0.05f; // below the overlays and the engine's decals (0.1)
+      std::vector<float> blend;
+      auto emit = [&](Geometry &g, const std::vector<uint32_t> &indices, bool sheet) {
+        if (indices.empty())
+          return;
+        const uint32_t base = uint32_t(g.vertices.size());
+        const size_t firstIndex = g.indices.size();
+        g.vertices.insert(g.vertices.end(), grid.begin(), grid.end());
+        if (sheet)
+          for (size_t v = 0; v < grid.size(); ++v) {
+            auto &vtx = g.vertices[base + v];
+            for (int k = 0; k < 3; ++k)
+              vtx.position[k] += vtx.normal[k] * kLayerOffset;
+            vtx.color = 0x00ffffffu | uint32_t(std::lround(std::clamp(blend[v], 0.0f, 1.0f) * 255)) << 24;
+          }
+        for (uint32_t i : indices)
+          g.indices.push_back(base + i);
+        toWorld(g, base, firstIndex, !sheet);
+      };
+      // A two-layer material ($basetexture2): the displacement's alpha blends
+      // the second texture over the first, lerp(base, base2, alpha / 255) (the
+      // engine bakes the alpha into the lightmap's alpha channel, which the
+      // shaders read as the blend factor). Triangles whose blend is 1 at
+      // every vertex are drawn with the second texture alone, those at 0 with
+      // the first; across the others the second texture is a decal sheet over
+      // the first with the blend as its vertex alpha, which the runtime
+      // composes into the surface below like the overlays.
+      bool anyAlpha = false;
+      for (float a : alpha)
+        anyAlpha |= a > 0;
+      const bool twoLayers = secondLayer(m, false).present;
+      // (Looked up for every such displacement: $maskedblending blends
+      // without alpha.)
+      const SecondLayer layer = twoLayers ? secondLayer(m, true) : SecondLayer{};
+      if (twoLayers) {
+        ++g_world.layers.displacements;
+        for (float a : alpha) {
+          g_world.layers.alphaMin = std::min(g_world.layers.alphaMin, a);
+          g_world.layers.alphaMax = std::max(g_world.layers.alphaMax, a);
+        }
+      }
+      if (layer.material < 0 || (!anyAlpha && !layer.masked)) {
+        if (twoLayers)
+          ++(layer.material < 0 ? g_world.layers.withoutTexture : g_world.layers.flat);
+        emit(groupFor(centroid, sky, m), triangles, false);
+      } else {
+        blend.resize(alpha.size());
+        const float low = std::clamp(layer.centre - layer.halfWidth, 0.0f, 1.0f),
+                    high = std::clamp(layer.centre + layer.halfWidth, 0.0f, 1.0f);
+        for (size_t v = 0; v < alpha.size(); ++v) {
+          const float a = alpha[v] / 255;
+          if (layer.masked) {
+            blend[v] = layer.centre;
+          } else if (layer.modulate) {
+            const float x = high > low ? std::clamp((a - low) / (high - low), 0.0f, 1.0f) : (a >= high ? 1.0f : 0.0f);
+            blend[v] = x * x * (3 - 2 * x);
+          } else {
+            blend[v] = a;
+          }
+        }
+        std::vector<uint32_t> first, second, mixed;
+        for (size_t i = 0; i + 2 < triangles.size(); i += 3) {
+          const float b[3] = {blend[triangles[i]], blend[triangles[i + 1]], blend[triangles[i + 2]]};
+          const bool none = std::max({b[0], b[1], b[2]}) < 0.002f, all = std::min({b[0], b[1], b[2]}) > 0.998f;
+          auto &to = all ? second : first;
+          to.insert(to.end(), triangles.begin() + i, triangles.begin() + i + 3);
+          if (!all && !none)
+            mixed.insert(mixed.end(), triangles.begin() + i, triangles.begin() + i + 3);
+        }
+        emit(groupFor(centroid, sky, m), first, false);
+        emit(groupFor(centroid, sky, layer.material), second, false);
+        if (!mixed.empty()) {
+          std::array<int32_t, 5> key = {int32_t(std::floor(centroid[0] / kCell)), int32_t(std::floor(centroid[1] / kCell)),
+                                        int32_t(std::floor(centroid[2] / kCell)), 2, sky};
+          auto &group = g_world.layerGroups[key];
+          group.sky = sky;
+          group.id = XXH3_64bits_withSeed(key.data(), sizeof(key), 0x6c61796572ull) | 1;
+          emit(group.surfaces[uint32_t(layer.material)], mixed, true);
+        }
+        ++g_world.layers.layered;
+        g_world.layers.baseTriangles += uint32_t((first.size() - mixed.size()) / 3);
+        g_world.layers.secondTriangles += uint32_t(second.size() / 3);
+        g_world.layers.blendedTriangles += uint32_t(mixed.size() / 3);
+      }
       g_world.triangles += uint32_t((size - 1) * (size - 1) * 2);
       ++g_world.displacements;
     } else if (face.dispInfo < 0) {
+      g_world.layers.brushFaces += secondLayer(m, false).present;
       Geometry &g = groupFor(centroid, sky, m);
       const uint32_t base = uint32_t(g.vertices.size());
       const size_t firstIndex = g.indices.size();
@@ -2117,16 +2381,20 @@ void submit(MaterialLookup lookup) {
     }
   // Meshes are built when their materials are known (or after a grace
   // period, with the default material), and rebuilt as late ones resolve.
-  auto build = [&](auto &group) {
+  auto build = [&](auto &group, bool resolvedOnly = false) {
     uint32_t resolved = 0;
     for (auto &[index, geometry] : group.surfaces)
       resolved += g_world.materials[index].resolved;
     if (group.mesh && resolved == group.builtResolved)
       return;
-    if (!group.mesh && resolved < group.surfaces.size() && frame < 30)
+    // resolvedOnly (second layers): a sheet without its texture would paint
+    // the default material over the first layer; it waits for the texture.
+    if (resolvedOnly ? resolved == 0 : !group.mesh && resolved < group.surfaces.size() && frame < 30)
       return;
     std::vector<remixapi_MeshInfoSurfaceTriangles> surfaces;
     for (auto &[index, geometry] : group.surfaces) {
+      if (resolvedOnly && !g_world.materials[index].resolved)
+        continue;
       remixapi_MeshInfoSurfaceTriangles s = {};
       s.vertices_values = geometry.vertices.data();
       s.vertices_count = geometry.vertices.size();
@@ -2153,6 +2421,8 @@ void submit(MaterialLookup lookup) {
     build(group);
   for (auto &[key, group] : g_world.overlayGroups)
     build(group);
+  for (auto &[key, group] : g_world.layerGroups)
+    build(group, true);
   // The instances below change rarely: once the submission has been stable
   // for a while it is recorded as a bridge batch (openremix_bridge_*) and
   // replayed with one command per frame instead of thousands of DrawInstance
@@ -2183,6 +2453,29 @@ void submit(MaterialLookup lookup) {
   const bool record = beginRecording && endRecording && replayBatch && frame - g_world.stableSince >= 30 &&
                       g_world.batchVersion != g_world.submitVersion &&
                       beginRecording() == REMIXAPI_ERROR_CODE_SUCCESS;
+  // Second layers of displacements: decal sheets over the first layer, their
+  // coverage the vertex alpha alone (the texture's own alpha is not opacity).
+  for (auto &[key, group] : g_world.layerGroups) {
+    if (!group.mesh)
+      continue;
+    remixapi_InstanceInfoBlendEXT blend = {};
+    blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+    blend.alphaTestCompareOp = 7;
+    blend.alphaBlendEnabled = 1;
+    blend.srcColorBlendFactor = blend.srcAlphaBlendFactor = 6; // SRC_ALPHA
+    blend.dstColorBlendFactor = blend.dstAlphaBlendFactor = 7; // ONE_MINUS_SRC_ALPHA
+    blend.writeMask = 15;
+    blend.textureAlphaOperation = 1; // select argument 1: the vertex alpha
+    blend.textureAlphaArg1Source = 2;
+    remixapi_InstanceInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+    info.pNext = &blend;
+    info.mesh = group.mesh;
+    info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
+    info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
+    info.doubleSided = 1;
+    api.DrawInstance(&info);
+  }
   // Overlays: static decals, blended over the surface below.
   for (auto &[key, group] : g_world.overlayGroups) {
     if (!group.mesh)
@@ -2493,6 +2786,23 @@ void dumpStatistics(FILE *out) {
           int(g_world.skyCamera), g_world.props.size(), g_world.skyProps, g_world.propModels.size(),
           g_world.propModelsFailed, g_world.propParts, g_world.overlays, g_world.overlayTriangles,
           g_world.overlayGroups.size(), g_world.waterMaterials);
+  {
+    const auto &l = g_world.layers;
+    uint32_t meshes = 0, waiting = 0;
+    for (auto &[key, group] : g_world.layerGroups)
+      meshes += group.mesh != nullptr;
+    for (auto &[base, layer] : g_world.secondLayers)
+      waiting += layer.material >= 0 && !g_world.materials[layer.material].resolved;
+    fprintf(out,
+            "   BSP second layers ($basetexture2): %u materials on %u displacements (alpha %.0f..%.0f) | layered %u: "
+            "triangles first texture %u, second texture %u, blended (decal sheet, vertex alpha) %u in %zu groups (%u "
+            "meshes) | not layered: alpha 0 everywhere %u, second texture without a hash %u (%u materials) | second "
+            "textures not uploaded yet %u | $blendmodulatetexture: %u by its mean per vertex, %u not read | 4-way "
+            "blend materials (layers 3-4 not drawn) %u | on %u faces without a displacement (first texture only)\n%s",
+            l.materials, l.displacements, l.displacements ? l.alphaMin : 0.0f, l.alphaMax, l.layered, l.baseTriangles,
+            l.secondTriangles, l.blendedTriangles, g_world.layerGroups.size(), meshes, l.flat, l.withoutTexture,
+            l.noHash, waiting, l.modulated, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
+  }
   if (g_world.skyTraced)
     fprintf(out, "   3D skybox path traced: %u triangles, %u clipped at the map, %u props (in playable space: %u "
             "triangles, %u props; pieces on world faces %u), reach %.0f\n",

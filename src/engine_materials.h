@@ -50,8 +50,26 @@ void onBind(void *material);
 
 // The bound material's shading (render thread; valid until the next onBind).
 const Shading &current();
-// Its name, for statistics ("" when unknown).
+// Its name, for statistics ("" when unknown): of the material bound, which
+// for decals is often a sub-rectangle of an atlas ("decals/concrete/
+// shot1_subrect", a CMaterialSubRect: everything else is read from its page,
+// "decals/decals_mod2x", the material the draw is made with).
 const char *currentName();
+
+// What the bound material says about being a decal (MaterialVarFlags_t, and
+// its shader), for remix::onDraw.
+struct Bound {
+  bool known = false;       // a material was read (else nothing below is set)
+  bool decal = false;       // $decal
+  bool decalShader = false; // a shader named Decal* (DecalModulate, DecalBaseTimesLightmapAlphaBlendSelfIllum)
+  bool modulate = false;    // DecalModulate: dst x src x 2
+  bool lightmapped = false; // LightmappedGeneric and the other world shaders
+  bool vertexColor = false, vertexAlpha = false, translucent = false, additive = false, alphaTest = false;
+  bool subRect = false;     // bound through a CMaterialSubRect
+  int flags = 0;
+  const char *shader = "";
+};
+const Bound &bound();
 // The bound material is a lit surface shader (LightmappedGeneric,
 // VertexLitGeneric, WorldVertexTransition, Lightmapped_4WayBlend) without
 // $additive: drawn additively, it is the engine's flashlight pass.
