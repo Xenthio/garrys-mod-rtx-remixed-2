@@ -75,6 +75,13 @@ const Bound &bound();
 // $additive: drawn additively, it is the engine's flashlight pass.
 bool currentIsLitOpaque();
 
+// A numeric parameter of the bound material by name ("$overbrightfactor": a
+// float or int, or a vector's first component). False when the material was
+// not read or does not define it.
+bool currentFloat(const char *name, float &out);
+// The bound material's defined parameters, one per line (dev dumps).
+void describeCurrent(FILE *out, const char *indent);
+
 void dumpStatistics(FILE *out);
 
 } // namespace proxy::engine_materials

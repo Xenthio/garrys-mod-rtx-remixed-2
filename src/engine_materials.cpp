@@ -68,7 +68,8 @@ constexpr uintptr_t kBind = 0x11540;
 constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 0x28, kMaterialShader = 0x20;
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
-constexpr uint8_t kTypeTexture = 3, kTypeUndefined = 6;
+// MaterialVarType_t: float 0, string 1, vector 2, texture 3, int 4, fourcc 5, undefined 6, matrix 7, material 8.
+constexpr uint8_t kTypeFloat = 0, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
 // MaterialVarFlags_t.
 constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
               kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagTranslucent = 1 << 21;
@@ -615,6 +616,57 @@ bool currentIsLitOpaque() {
     return false;
   void *flags = paramAt(*e, e->flags);
   return flags && !(g_varInt(flags) & kFlagAdditive);
+}
+
+bool currentFloat(const char *name, float &out) {
+  const Entry *e = g_currentEntry;
+  if (!e)
+    return false;
+  for (int i = 0; i < e->count; ++i) {
+    void *var = paramAt(*e, i);
+    if (!var)
+      continue;
+    const uint8_t type = varType(var);
+    if (type != kTypeFloat && type != kTypeVector && type != kTypeInt)
+      continue;
+    const char *varName = g_varName(var);
+    if (!varName || _stricmp(varName, name) != 0)
+      continue;
+    const float value = g_varFloat(var); // a vector's first component, an int as a float
+    if (!std::isfinite(value))
+      return false;
+    out = value;
+    return true;
+  }
+  return false;
+}
+
+void describeCurrent(FILE *out, const char *indent) {
+  const Entry *e = g_currentEntry;
+  if (!e) {
+    fprintf(out, "%s(material not read)\n", indent);
+    return;
+  }
+  Entry::TextureName texture;
+  for (int i = 0; i < e->count; ++i) {
+    void *var = paramAt(*e, i);
+    if (!var)
+      continue;
+    const uint8_t type = varType(var);
+    const char *name = g_varName(var);
+    if (!name || type == kTypeUndefined)
+      continue;
+    if (type == kTypeFloat) {
+      fprintf(out, "%s%s %g\n", indent, name, g_varFloat(var));
+    } else if (type == kTypeInt) {
+      fprintf(out, "%s%s %d\n", indent, name, g_varInt(var));
+    } else if (type == kTypeVector) {
+      const float *v = g_varVec(var);
+      fprintf(out, "%s%s [%g %g %g %g]\n", indent, name, v[0], v[1], v[2], v[3]);
+    } else if (type == kTypeTexture) {
+      fprintf(out, "%s%s texture %s\n", indent, name, textureName(texture, var).c_str());
+    }
+  }
 }
 
 void dumpStatistics(FILE *out) {

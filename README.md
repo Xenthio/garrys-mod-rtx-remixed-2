@@ -22,6 +22,18 @@ needs the l4d2-rtx client markers and stays inactive. Launch with `-nod3d9ex`:
 SDK 2013 otherwise takes `Direct3DCreate9Ex` through GetProcAddress, past the
 import the proxy patches.
 
+Particles: the vertex shaders of particle draws are run on the CPU
+(`src/vertex_program.cpp`, decoded at `CreateVertexShader`), since Spritecard
+and SplineCard build their billboards and ribbons in the vertex shader, and
+the result is rasterized over the traced image with the draw's blend state
+(`submitParticles` in `src/remix_output.cpp`). The client particle manager's
+camera-space draws (identity view matrix) are placed by the view drawn before
+them. `OPENREMIX_PROXY_PARTICLES=0` turns it off,
+`OPENREMIX_PROXY_PARTICLES_TRACED=1` traces the non-additive ones,
+`OPENREMIX_PROXY_PARTICLE_PATHS=dir/;dir2/` adds material directories, and
+`OPENREMIX_PROXY_DUMP_PARTICLES=1` writes each kind of particle draw once to
+`bin/win64/particles.txt`.
+
 ## x64 notes
 
 - Wrapper thunks swap RCX (`this`) and jump through the real vtable; typed

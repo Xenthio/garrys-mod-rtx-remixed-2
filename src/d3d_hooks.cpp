@@ -7,12 +7,14 @@
 
 #include "bsp_world.h"
 #include "remix_output.h"
+#include "vertex_program.h"
 
 #include <algorithm>
 #include <psapi.h>
 
 #include <atomic>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,6 +45,8 @@ enum : unsigned {
   kDrawPrimitiveUP = 83,
   kDrawIndexedPrimitiveUP = 84,
   kSetVertexDeclaration = 87,
+  kCreateVertexShader = 91,
+  kSetVertexShader = 92,
   kSetVertexShaderConstantF = 94,
   kSetStreamSource = 100,
   kSetIndices = 104,
@@ -93,6 +97,7 @@ struct Stats {
   std::atomic<uint64_t> usPresent{0}, usLock{0};
   std::atomic<uint32_t> frames{0}, dip{0}, dp{0}, dipUP{0}, dpUP{0}, depthDraws{0}, occlusionQueries{0}, occluderDraws{0}, queriesVisible{0}, queriesHidden{0}, rtChanges{0}, textureBinds{0};
   std::atomic<uint32_t> vsConstCalls{0}, streamSets{0}, partialTextureLocks{0};
+  std::atomic<uint32_t> vertexPrograms{0}; // vertex shaders decoded since launch
   std::atomic<uint64_t> dipPrims{0};
   std::atomic<uint64_t> shadowBytes{0}, shadowCopies{0}, wholeLocks{0}, usShadow{0};
   std::atomic<uint32_t> skyDraws{0}, skyCaptures{0}, skyUpdates{0}, skyFailures{0};
@@ -410,6 +415,15 @@ IDirect3DSurface9 *g_backBuffer = nullptr;
 IDirect3DSurface9 *g_renderTarget0 = nullptr;
 IDirect3DBaseTexture9 *g_texture0 = nullptr;
 DWORD g_renderStates[256] = {};
+// Vertex shaders decoded at creation (vsprog): the draws whose shader builds
+// the geometry (particles) are run through it on the CPU. A shader object's
+// address is reused after its release, by a shader created anew.
+std::mutex g_vertexProgramLock;
+std::unordered_map<IDirect3DVertexShader9 *, std::shared_ptr<const vsprog::Program>> g_vertexPrograms;
+IDirect3DVertexShader9 *g_vertexShader = nullptr;
+std::shared_ptr<const vsprog::Program> g_vertexProgram; // of g_vertexShader (nullptr: unknown)
+std::atomic<uint32_t> g_vertexProgramsCreated{0};       // changes g_vertexProgram may have missed
+uint32_t g_vertexProgramSeen = 0;
 
 using CreateFn = IDirect3D9 *(WINAPI *)(UINT);
 using CreateDeviceFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD,
@@ -438,6 +452,8 @@ using DrawPrimitiveUPFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, D3DPR
 using DrawIndexedPrimitiveUPFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, D3DPRIMITIVETYPE, UINT, UINT, UINT,
                                                               const void *, D3DFORMAT, const void *, UINT);
 using SetVertexDeclarationFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DVertexDeclaration9 *);
+using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const DWORD *, IDirect3DVertexShader9 **);
+using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DVertexShader9 *);
 using SetVertexShaderConstantFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const float *, UINT);
 using SetStreamSourceFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, IDirect3DVertexBuffer9 *, UINT,
                                                        UINT);
@@ -463,6 +479,8 @@ DrawIndexedPrimitiveFn g_drawIndexedPrimitive = nullptr;
 DrawPrimitiveUPFn g_drawPrimitiveUP = nullptr;
 DrawIndexedPrimitiveUPFn g_drawIndexedPrimitiveUP = nullptr;
 SetVertexDeclarationFn g_setVertexDeclaration = nullptr;
+CreateVertexShaderFn g_createVertexShader = nullptr;
+SetVertexShaderFn g_setVertexShader = nullptr;
 SetVertexShaderConstantFFn g_setVertexShaderConstantF = nullptr;
 SetStreamSourceFn g_setStreamSource = nullptr;
 SetIndicesFn g_setIndices = nullptr;
@@ -664,6 +682,32 @@ HRESULT STDMETHODCALLTYPE setVertexDeclaration(IDirect3DDevice9 *dev, IDirect3DV
   return g_setVertexDeclaration(dev, decl);
 }
 
+HRESULT STDMETHODCALLTYPE createVertexShader(IDirect3DDevice9 *dev, const DWORD *function,
+                                             IDirect3DVertexShader9 **out) {
+  const HRESULT hr = g_createVertexShader(dev, function, out);
+  if (SUCCEEDED(hr) && out && *out && function) {
+    static_assert(sizeof(DWORD) == sizeof(uint32_t));
+    auto program = vsprog::compile(reinterpret_cast<const uint32_t *>(function));
+    std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+    g_stats.vertexPrograms += program != nullptr;
+    g_vertexPrograms[*out] = std::move(program);
+    ++g_vertexProgramsCreated;
+  }
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE setVertexShader(IDirect3DDevice9 *dev, IDirect3DVertexShader9 *shader) {
+  if (const uint32_t created = g_vertexProgramsCreated.load(std::memory_order_relaxed);
+      shader != g_vertexShader || created != g_vertexProgramSeen) {
+    g_vertexProgramSeen = created;
+    std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+    const auto found = shader ? g_vertexPrograms.find(shader) : g_vertexPrograms.end();
+    g_vertexProgram = found == g_vertexPrograms.end() ? nullptr : found->second;
+    g_vertexShader = shader;
+  }
+  return g_setVertexShader(dev, shader);
+}
+
 HRESULT STDMETHODCALLTYPE setVertexShaderConstantF(IDirect3DDevice9 *dev, UINT start, const float *data, UINT count) {
   ++g_stats.vsConstCalls;
   if (data && start < 256)
@@ -747,7 +791,7 @@ void drawOccluders(IDirect3DDevice9 *dev) {
     for (int c = 0; c < 4; ++c)
       projection.m[r][c] = g_vsConstants[(8 + c) * 4 + r];
   }
-  dev->SetVertexShader(nullptr);
+  g_setVertexShader(dev, nullptr); // past the hook: the state block restores the shader, and its tracking would not see that
   dev->SetPixelShader(nullptr);
   dev->SetFVF(D3DFVF_XYZ);
   dev->SetTransform(D3DTS_WORLD, &identity);
@@ -830,6 +874,8 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.startIndex = startIndex;
   d.primCount = primCount;
   d.vsConstants = g_vsConstants;
+  d.vertexShader = g_vertexShader;
+  d.vertexProgram = g_vertexProgram.get();
   d.mainTarget = g_renderTarget0 == g_backBuffer;
   d.texture0 = g_texture0;
   d.colorWrite = g_renderStates[D3DRS_COLORWRITEENABLE];
@@ -1318,6 +1364,8 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kDrawPrimitiveUP, &drawPrimitiveUP, g_drawPrimitiveUP);
   hookSlot(vt, kDrawIndexedPrimitiveUP, &drawIndexedPrimitiveUP, g_drawIndexedPrimitiveUP);
   hookSlot(vt, kSetVertexDeclaration, &setVertexDeclaration, g_setVertexDeclaration);
+  hookSlot(vt, kCreateVertexShader, &createVertexShader, g_createVertexShader);
+  hookSlot(vt, kSetVertexShader, &setVertexShader, g_setVertexShader);
   hookSlot(vt, kSetVertexShaderConstantF, &setVertexShaderConstantF, g_setVertexShaderConstantF);
   hookSlot(vt, kSetStreamSource, &setStreamSource, g_setStreamSource);
   hookSlot(vt, kSetIndices, &setIndices, g_setIndices);
@@ -1438,6 +1486,18 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
           g_stats.vsConstCalls.exchange(0) / f);
+  {
+    std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+    size_t runnable = 0, expanding = 0;
+    for (const auto &[shader, program] : g_vertexPrograms)
+      if (program) {
+        runnable += vsprog::info(*program).supported;
+        expanding += vsprog::info(*program).expands;
+      }
+    fprintf(out, "   vertex shaders decoded since launch %u; live %zu: %zu the proxy can run (the others skin), %zu "
+                 "build their geometry (particles)\n",
+            g_stats.vertexPrograms.load(), g_vertexPrograms.size(), runnable, expanding);
+  }
   size_t shadowBytes = 0, shadowCount = 0;
   {
     std::lock_guard<std::mutex> lock(g_shadowLock);

@@ -7,6 +7,7 @@
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
+#include "particles.h"
 #include "texture_categories.h"
 #include <unordered_set>
 
@@ -725,6 +726,10 @@ struct Instance {
   int stencilGroup = -1;
   uint8_t stencilRole = 0;
   bool depthTest = true, depthWrite = true;
+  // A particle draw (submitParticles): rasterized over the traced image with
+  // its blend state, whatever that is (rasterOnly), unless particles are
+  // traced; its depth state is the draw's.
+  bool particle = false, rasterOnly = false;
 };
 std::vector<Instance> g_instances;
 
@@ -806,8 +811,26 @@ struct View {
   uint32_t draws = 0;
   uint32_t order = 0; // first use within the frame
   bool perspective = false;
+  // Perspective with an identity view matrix: the draw's positions are in
+  // camera space (see CameraSpace). Never a camera of its own.
+  bool cameraSpace = false;
   float view[16], projection[16];
+  float cameraToWorld[3][4] = {}; // a view with a camera: its camera space (as the engine has it) to world
 };
+// Source's client-side particle manager (CParticleMgr: the emitters of FX_
+// effects, env_smokestack, Lua's ParticleEmitter, ...) transforms its
+// particles to camera space on the CPU and draws them with the view (and
+// model) matrix set to identity (CParticleEffectBinding::RenderStart, unless
+// the effect opts out). Such a draw arrives with a view-projection that is
+// the projection alone: as a view of its own it matched no camera and
+// everything in it was skipped. Its geometry belongs to the view the engine
+// was rendering, the last one drawn with a camera: it is placed in the world
+// by that view's inverse and submitted with it.
+struct CameraSpace {
+  uint64_t key = 0; // g_views key of the view last drawn with a camera this frame
+  bool valid = false;
+} g_cameraSpace; // render thread
+std::atomic<uint32_t> g_cameraSpaceParticles{0}, g_cameraSpaceOther{0}, g_cameraSpaceLeft{0}, g_cameraSpaceNoView{0};
 uint32_t g_viewOrder = 0;
 // The views the engine drew a world for this frame (the matrices in effect at
 // each outermost "world_lists 1" marker, in order): the main view and, before
@@ -1830,6 +1853,628 @@ float faceNormalSign(uint32_t cullMode) {
   return cullMode == D3DCULL_CW ? -ccw : ccw;
 }
 
+// A draw's part in the stencil emulation (see StencilGroup), from its stencil
+// state. False: the draw shows nothing (it writes nothing the emulation uses,
+// or tests a value nothing marked).
+bool stencilRole(const Draw &d, Instance &inst) {
+  if (d.stencil) { // see StencilGroup
+    const uint32_t value = d.stencilRef & d.stencilMask & 0xff, written = d.stencilRef & d.stencilWriteMask & 0xff;
+    inst.depthTest = d.depthTest;
+    inst.depthWrite = d.zWrite;
+    if (d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
+      inst.stencilGroup = stencilWriter(written);
+      g_stencilGroups[inst.stencilGroup].glassSources += !d.zWrite;
+      // A render-target texture without contents (not read back, see
+      // d3d::requestTargetContents): such a writer only marks.
+      inst.stencilRole = d.texture0Target && !inst.material ? kStencilSourceOnly : kStencilSource;
+      g_stencilGroups[inst.stencilGroup].ignoreZ |= !d.depthTest;
+    } else if (d.stencilFunc == D3DCMP_NEVER) {
+      if (d.stencilFail != D3DSTENCILOP_REPLACE)
+        return false;
+      inst.stencilGroup = stencilWriter(written);
+      inst.stencilRole = kStencilSourceOnly;
+      inst.depthTest = false; // fails before the depth test: marks through anything
+    } else if (d.stencilFunc == D3DCMP_EQUAL &&
+               (d.stencilPass == D3DSTENCILOP_INCR || d.stencilPass == D3DSTENCILOP_INCRSAT)) {
+      const int parent = stencilReader(value);
+      if (parent < 0)
+        return false;
+      inst.stencilGroup = stencilWriter(value + 1);
+      g_stencilGroups[inst.stencilGroup].within = parent;
+      inst.stencilRole = kStencilSourceOnly;
+    } else if (d.stencilFunc == D3DCMP_EQUAL || d.stencilFunc == D3DCMP_LESS) {
+      inst.stencilGroup = stencilReader(d.stencilFunc == D3DCMP_LESS ? value + 1 : value);
+      if (inst.stencilGroup < 0)
+        return false; // nothing marked: not visible
+      inst.stencilRole = kStencilInside;
+    }
+    else if (d.stencilFunc == D3DCMP_NOTEQUAL) {
+      // A scope's body around its lens opening: a scene instance as ever,
+      // which the camera does not see inside the group.
+      inst.stencilGroup = stencilReader(value);
+      inst.stencilRole = inst.stencilGroup >= 0 ? kStencilCut : kStencilNone;
+    }
+  }
+  return true;
+}
+
+// --- Particles ---------------------------------------------------------------
+// Source's particle systems (render_animated_sprites, render_sprite_trail,
+// render_rope, ... with the Spritecard shader) build their billboards in the
+// vertex shader: the four vertices of a particle all carry its centre as
+// POSITION; the corner (TEXCOORD3), radius, roll and yaw (TEXCOORD2), sheet
+// frames (TEXCOORD0/1) and, per orientation mode, a normal come from other
+// elements, the camera and size limits from constants. Ropes and trails with
+// $splinetype (splinecard_vs20) carry a curve parameter as POSITION and four
+// control points as texture coordinates. Taken by POSITION alone such draws
+// are degenerate: nothing showed.
+//
+// The proxy runs the draw's own vertex shader on the CPU instead (vsprog,
+// decoded at CreateVertexShader) and takes its clip-space positions back to
+// world space, so the geometry is the shader's whatever its mode, and the
+// colour and texture coordinates are the ones the shader hands its pixel
+// shader (distance fades, $color modulation, texture transforms). That also
+// serves the particles Source expands on the CPU (CParticleMgr effects,
+// sprites, beams: UnlitGeneric, Sprite), whose vertex shader is a plain
+// transform: their colour modulation and scrolling textures come out of it.
+//
+// A draw is a particle draw when
+//   expanded  its vertex shader's position depends on texture coordinates or
+//             colours, from dynamic buffers and not skinned: Spritecard,
+//             SplineCard, and whatever else builds geometry that way;
+//   shader    it is blended, from dynamic buffers, and its material's shader
+//             is Spritecard, SplineCard, Sprite or ParticleSphere;
+//   additive  blended with destination ONE, dynamic, an unlit material
+//             (glows, beams, tracers: raster overlays before, too);
+//   path      blended, dynamic, unlit, and the material lies under
+//             particle/, particles/, effects/, sprites/ or trails/ (smoke and
+//             dust of the old particle system; OPENREMIX_PROXY_PARTICLE_PATHS
+//             adds prefixes, ';'-separated). Other unlit blended surfaces
+//             (3D2D panels, world text) stay traced surfaces.
+// Particles are unlit in Source (texture x vertex colour): they are
+// rasterized over the traced image with their blend state and depth test
+// (REMIXAPI_INSTANCE_RASTER_ONLY_EXT), additive or not. Traced, a smoke puff
+// would be a stack of lit, shadowed sheets, black in a dark room, or with an
+// emissive material thousands of flickering emitters. They take no part in
+// the flashlight-pass, decal, emissive or identity logic of onDraw.
+// OPENREMIX_PROXY_PARTICLES=0 turns all of this off (draws as before);
+// OPENREMIX_PROXY_PARTICLES_TRACED=1 submits the ones that are not additive
+// as traced unlit surfaces instead (emitters only with
+// OPENREMIX_PROXY_EMISSIVE_LIGHTS=3).
+//
+// What the pixel shader does beyond texture x colour is taken from the
+// material (Spritecard): $overbrightfactor scales the colour (up to 4x, a
+// modulate-2x/4x stage); $addself and $addbasetexture2 blend ONE /
+// INVSRCALPHA with a colour the shader multiplied by its alpha, drawn here
+// as SRCALPHA / INVSRCALPHA with the $addself gain (1 + addself x overbright
+// x vertex alpha) in the vertex colour (the second texture of
+// $addbasetexture2 is left out); of two blended sheet frames the leading one
+// shows; $depthblend (soft particles) is ignored.
+enum ParticleKind : uint8_t { kNotParticle, kParticleExpanded, kParticleShader, kParticleAdditive, kParticlePath };
+const char *const kParticleKindNames[] = {"-", "vertex-shader expanded", "particle shader", "additive unlit",
+                                          "unlit by material path"};
+enum ParticleOutcome : uint8_t {
+  kParticleRasterAdditive,
+  kParticleRasterBlended,
+  kParticleRasterOther,
+  kParticleTraced,
+  kParticleFaded,
+  kParticleStencil,
+  kParticleFailed,
+  kParticleOutcomes
+};
+const char *const kParticleOutcomeNames[] = {"raster additive", "raster blended", "raster other blend", "traced",
+                                             "faded out",       "stencil only",   "not understood"};
+
+struct ParticleRow {
+  std::string shader, declaration, material;
+  uint64_t program = 0;
+  uint8_t kind = 0;
+  uint32_t draws = 0, vertices = 0, triangles = 0, premultiplied = 0, overbright = 0, secondFrames = 0;
+  uint32_t outcomes[kParticleOutcomes] = {};
+  const char *failure = "";
+  bool dumped = false;
+};
+std::unordered_map<uint64_t, ParticleRow> g_particleRows; // per interval; under g_transientSampleLock
+std::unordered_set<uint64_t> g_particlesDumped;           // under g_transientSampleLock
+struct ParticleLeft {
+  std::string shader;
+  uint32_t draws = 0, srcBlend = 0, dstBlend = 0;
+};
+// Blended draws from dynamic buffers that are not particles by the rules
+// above, by material; per interval, under g_transientSampleLock.
+std::map<std::string, ParticleLeft> g_particlesLeft;
+std::atomic<uint32_t> g_usParticles{0};
+
+bool nameStarts(const char *name, const char *prefix) { return _strnicmp(name, prefix, std::strlen(prefix)) == 0; }
+
+bool particlesEnabled() {
+  static const bool enabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_PARTICLES", v, sizeof(v)) && v[0] == '0');
+  }();
+  return enabled;
+}
+
+// The material lies in one of the particle directories.
+bool particleMaterialPath(const char *material) {
+  static const std::vector<std::string> prefixes = [] {
+    std::vector<std::string> list = {"particle/", "particles/", "effects/", "sprites/", "trails/"};
+    char extra[1024] = {};
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_PARTICLE_PATHS", extra, sizeof(extra)))
+      for (char *token = std::strtok(extra, ";"); token; token = std::strtok(nullptr, ";")) {
+        std::string prefix = token;
+        for (char &c : prefix)
+          c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+        if (!prefix.empty())
+          list.push_back(prefix);
+      }
+    return list;
+  }();
+  for (const auto &prefix : prefixes)
+    if (std::strncmp(material, prefix.c_str(), prefix.size()) == 0)
+      return true;
+  return false;
+}
+
+bool particleShader(const char *shader) {
+  return nameStarts(shader, "spritecard") || nameStarts(shader, "splinecard") || nameStarts(shader, "sprite") ||
+         nameStarts(shader, "particlesphere");
+}
+
+ParticleKind particleKind(const Draw &d, const engine_materials::Bound &bound, bool skinned, bool dynamic) {
+  if (!particlesEnabled() || skinned)
+    return kNotParticle;
+  if (!dynamic) // particles are rebuilt every frame
+    return kNotParticle;
+  if (d.vertexProgram && vsprog::info(*d.vertexProgram).expands)
+    return kParticleExpanded;
+  if (!d.blend)
+    return kNotParticle;
+  if (bound.known && particleShader(bound.shader))
+    return kParticleShader;
+  if (engine_materials::current().mode != engine_materials::Shading::Unlit)
+    return kNotParticle;
+  if (d.dstBlend == D3DBLEND_ONE)
+    return kParticleAdditive;
+  return particleMaterialPath(engine_materials::currentName()) ? kParticlePath : kNotParticle;
+}
+
+// "POSITION0 float3 +0, COLOR0 d3dcolor +12, ...".
+std::string describeDeclaration(const D3DVERTEXELEMENT9 *elements) {
+  static const char *const usages[] = {"POSITION", "BLENDWEIGHT", "BLENDINDICES", "NORMAL",  "PSIZE",
+                                       "TEXCOORD", "TANGENT",     "BINORMAL",     "TESSFACTOR", "POSITIONT",
+                                       "COLOR",    "FOG",         "DEPTH",        "SAMPLE"};
+  static const char *const types[] = {"float1",  "float2",  "float3",   "float4",   "d3dcolor", "ubyte4",
+                                      "short2",  "short4",  "ubyte4n",  "short2n",  "short4n",  "ushort2n",
+                                      "ushort4n", "udec3",  "dec3n",    "float16_2", "float16_4"};
+  std::string out;
+  for (const D3DVERTEXELEMENT9 *e = elements; e->Stream != 0xff; ++e) {
+    char item[64];
+    std::snprintf(item, sizeof(item), "%s%s%u %s s%u+%u", out.empty() ? "" : ", ", e->Usage < 14 ? usages[e->Usage] : "?",
+                  e->UsageIndex, e->Type < 17 ? types[e->Type] : "?", e->Stream, e->Offset);
+    out += item;
+  }
+  return out;
+}
+
+// The draw's triangles as a list of vertex indices relative to its lowest
+// (`low`, itself relative to minIndex), `count` vertices in all.
+bool particleTriangles(const Draw &d, std::vector<uint32_t> &indices, uint32_t &low, uint32_t &count) {
+  indices.clear();
+  const uint32_t width = d.indices.is32 ? 4 : 2;
+  auto index = [&](uint32_t i, uint32_t &out) {
+    const uint64_t at = uint64_t(d.startIndex + i) * width;
+    if (at + width > d.indices.size)
+      return false;
+    uint32_t value = 0;
+    std::memcpy(&value, d.indices.data + at, width);
+    if (value < d.minIndex || value - d.minIndex >= d.numVertices)
+      return false;
+    out = value - d.minIndex;
+    return true;
+  };
+  if (d.type == D3DPT_TRIANGLELIST) {
+    indices.resize(size_t(d.primCount) * 3);
+    for (size_t i = 0; i < indices.size(); ++i)
+      if (!index(uint32_t(i), indices[i]))
+        return false;
+  } else if (d.type == D3DPT_TRIANGLESTRIP) {
+    for (uint32_t i = 0; i < d.primCount; ++i) {
+      uint32_t a, b, c;
+      if (!index(i, a) || !index(i + 1, b) || !index(i + 2, c))
+        return false;
+      if (a == b || b == c || a == c)
+        continue;
+      if (i & 1)
+        std::swap(a, b);
+      indices.insert(indices.end(), {a, b, c});
+    }
+  } else {
+    return false;
+  }
+  if (indices.empty())
+    return false;
+  const auto [lo, hi] = std::minmax_element(indices.begin(), indices.end());
+  low = *lo;
+  count = *hi - *lo + 1;
+  for (auto &i : indices)
+    i -= low;
+  return true;
+}
+
+// Dev aid (OPENREMIX_PROXY_DUMP_PARTICLES=1): everything about a particle
+// draw, once per (declaration, vertex shader, material shader, kind), to
+// bin/particles.txt.
+void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, const char *failure, bool cameraSpace,
+                      const vsprog::Stream *streams, uint32_t first, uint32_t count, const particles::Vertex *expanded,
+                      const particles::Result *result) {
+  static bool truncate = true;
+  FILE *f = _wfopen((g_moduleDir + L"\\particles.txt").c_str(), truncate ? L"w" : L"a");
+  truncate = false;
+  if (!f)
+    return;
+  const engine_materials::Bound &bound = engine_materials::bound();
+  fprintf(f, "== %s | material %s shader %s flags %08X%s\n", kParticleKindNames[kind], engine_materials::currentName(),
+          bound.shader, unsigned(bound.flags), bound.known ? "" : " (not read)");
+  fprintf(f, "   outcome: %s%s%s | positions in %s\n", outcome, failure && *failure ? ": " : "", failure ? failure : "",
+          cameraSpace ? "camera space (identity view matrix: placed by the view drawn before)" : "world space");
+  fprintf(f, "   primitive type %u, %u primitives, base vertex %d, min index %u, %u vertices, start index %u; vertices used "
+             "%u..%u\n",
+          unsigned(d.type), d.primCount, d.baseVertex, d.minIndex, d.numVertices, d.startIndex, first,
+          count ? first + count - 1 : first);
+  fprintf(f, "   blend %d src %u dst %u op %u sepA %d srcA %u dstA %u | alphaTest %d func %u ref %u | z enable %d func %u "
+             "write %d bias %d | cull %u | stencil %d func %u | colour write %X | texture0 %016llX %s%s\n",
+          int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.separateAlpha), d.srcBlendAlpha, d.dstBlendAlpha,
+          int(d.alphaTest), d.alphaFunc, d.alphaRef, int(d.zEnable), d.zFunc, int(d.zWrite), int(d.depthBias), d.cullMode,
+          int(d.stencil), d.stencilFunc, d.colorWrite, static_cast<unsigned long long>(textureHash(d.texture0)),
+          bsp::materialName(textureHash(d.texture0)).c_str(), d.texture0 ? "" : "(none)");
+  fprintf(f, "   declaration: %s\n", describeDeclaration(d.elements).c_str());
+  for (int i = 0; i < 4; ++i)
+    if (d.streams[i].data)
+      fprintf(f, "   stream %d: stride %u offset %u size %u dynamic %d\n", i, d.streams[i].stride, d.streams[i].offset,
+              d.streams[i].size, int(d.streams[i].dynamic));
+  fprintf(f, "   material parameters:\n");
+  engine_materials::describeCurrent(f, "     ");
+  if (!d.vertexProgram) {
+    fprintf(f, "   vertex shader %p: not seen at creation\n", d.vertexShader);
+  } else {
+    const vsprog::Info &info = vsprog::info(*d.vertexProgram);
+    fprintf(f, "   vertex shader %p: vs_%u_%u hash %016llX, %u tokens, %u instructions; runnable %d%s%s; builds geometry "
+               "%d; outputs written %04X; colour output %d%s\n",
+            d.vertexShader, info.version >> 8, info.version & 0xff, static_cast<unsigned long long>(info.hash),
+            info.tokens, info.instructions, int(info.supported), *info.reason ? ": " : "", info.reason,
+            int(info.expands), info.written, info.colorSlot,
+            info.colorSlot < 0 ? " (none: white)" : info.colorLinear ? " (converted to linear by the shader)" : "");
+    fprintf(f, "   alpha output %d%s\n", info.alphaSlot, info.alphaSlot < 0 ? " (none: opaque)" : "");
+    fprintf(f, "   inputs:");
+    for (const auto &input : info.inputs)
+      fprintf(f, " v%u=usage %u index %u", input.reg, input.usage, input.usageIndex);
+    fprintf(f, "\n   constants read:\n");
+    for (uint16_t reg : info.constants) {
+      const float *c = d.vsConstants + size_t(reg) * 4;
+      fprintf(f, "     c%u = %.9g %.9g %.9g %.9g\n", reg, c[0], c[1], c[2], c[3]);
+    }
+    fprintf(f, "   tokens:");
+    const auto &tokens = vsprog::tokens(*d.vertexProgram);
+    for (size_t i = 0; i < tokens.size(); ++i)
+      fprintf(f, "%s%08X", i % 12 ? " " : "\n     ", tokens[i]);
+    fprintf(f, "\n");
+  }
+  // The first vertices: raw elements, the shader's outputs, the result.
+  const uint32_t shown = std::min(count, 8u);
+  std::vector<float> outputs(size_t(vsprog::kSlots) * shown * 4);
+  const bool ran = shown && d.vertexProgram && streams &&
+                   vsprog::run(*d.vertexProgram, d.vsConstants, reinterpret_cast<const vsprog::Element *>(d.elements),
+                               streams, first, shown, (1u << vsprog::kSlots) - 1, outputs.data());
+  for (uint32_t v = 0; v < shown; ++v) {
+    fprintf(f, "   vertex %u:\n", first + v);
+    for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff; ++e) {
+      if (e->Stream >= 4 || !streams || !streams[e->Stream].data)
+        continue;
+      const vsprog::Stream &stream = streams[e->Stream];
+      const uint64_t at = uint64_t(first + v) * stream.stride + e->Offset;
+      if (at + 16 > stream.size)
+        continue;
+      const uint8_t *raw = stream.data + at;
+      fprintf(f, "     usage %u index %u:", e->Usage, e->UsageIndex);
+      if (e->Type <= D3DDECLTYPE_FLOAT4) {
+        float values[4];
+        std::memcpy(values, raw, 16);
+        for (unsigned k = 0; k <= e->Type; ++k)
+          fprintf(f, " %.9g", values[k]);
+      } else {
+        const unsigned bytes = e->Type == D3DDECLTYPE_SHORT4 || e->Type == D3DDECLTYPE_SHORT4N ||
+                                       e->Type == D3DDECLTYPE_USHORT4N || e->Type == D3DDECLTYPE_FLOAT16_4
+                                   ? 8
+                                   : 4;
+        for (unsigned k = 0; k < bytes; ++k)
+          fprintf(f, " %02X", raw[k]);
+      }
+      fprintf(f, "\n");
+    }
+    if (ran) {
+      const uint32_t written = vsprog::info(*d.vertexProgram).written;
+      static const char *const names[vsprog::kSlots] = {"oPos", "oFog", "oPts", "oD0", "oD1", "oT0", "oT1",
+                                                        "oT2",  "oT3",  "oT4",  "oT5", "oT6", "oT7"};
+      for (unsigned slot = 0; slot < vsprog::kSlots; ++slot)
+        if (written >> slot & 1) {
+          const float *o = &outputs[(size_t(slot) * shown + v) * 4];
+          fprintf(f, "     %s = %.9g %.9g %.9g %.9g\n", names[slot], o[0], o[1], o[2], o[3]);
+        }
+    }
+    if (expanded)
+      fprintf(f, "     -> %s %.4f %.4f %.4f uv %.5f %.5f colour (A R G B, sRGB bytes%s) %08X\n",
+              cameraSpace ? "camera" : "world", expanded[v].position[0], expanded[v].position[1], expanded[v].position[2], expanded[v].uv[0], expanded[v].uv[1],
+              result && result->gain > 1 ? (result->gain == 4 ? ", / 4" : ", / 2") : "", expanded[v].color);
+  }
+  fprintf(f, "\n");
+  fclose(f);
+}
+
+// Builds and queues a particle draw (see above). False: the draw is not
+// handled here and goes on through onDraw as before.
+bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const float (*cameraToWorld)[4],
+                     uint32_t categories, const float eye[3]) {
+  Timer timer(g_usParticles);
+  using engine_materials::Shading;
+  const engine_materials::Bound &bound = engine_materials::bound();
+  static const bool dumpAll = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_PARTICLES", v, sizeof(v)) && v[0] == '1';
+  }();
+  static const bool traceBlended = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_PARTICLES_TRACED", v, sizeof(v)) && v[0] == '1';
+  }();
+
+  // Statistics row (and dump key): declaration, vertex shader, material shader, kind.
+  size_t elementCount = 1;
+  while (d.elements[elementCount - 1].Stream != 0xff)
+    ++elementCount;
+  const uint64_t programHash = d.vertexProgram ? vsprog::info(*d.vertexProgram).hash : 0;
+  uint64_t rowKey = fnv(d.elements, elementCount * sizeof(D3DVERTEXELEMENT9), programHash + kind);
+  rowKey = fnv(bound.shader, std::strlen(bound.shader), rowKey);
+
+  thread_local std::vector<uint32_t> indices;
+  thread_local std::vector<particles::Vertex> expanded;
+  thread_local std::vector<remixapi_HardcodedVertex> vertices;
+  vsprog::Stream streams[4];
+  uint32_t low = 0, count = 0, first = 0;
+  particles::Result result;
+  const char *failure = "";
+  ParticleOutcome outcome = kParticleFailed;
+  bool premultiplied = false, built = false;
+  remixapi_MeshHandle mesh = nullptr;
+  const bool additive = d.blend && d.dstBlend == D3DBLEND_ONE;
+  const bool traced = traceBlended && d.blend && !additive;
+  const bool spritecard = nameStarts(bound.shader, "spritecard");
+
+  do {
+    if (!d.vertexProgram) {
+      failure = "vertex shader not seen at creation";
+      break;
+    }
+    if (!vsprog::info(*d.vertexProgram).supported) {
+      failure = vsprog::info(*d.vertexProgram).reason;
+      break;
+    }
+    if (!particleTriangles(d, indices, low, count)) {
+      failure = "primitive type or index range";
+      break;
+    }
+    const int64_t firstVertex = int64_t(d.baseVertex) + d.minIndex + low;
+    if (firstVertex < 0) {
+      failure = "vertex range";
+      break;
+    }
+    first = uint32_t(firstVertex);
+    for (int i = 0; i < 4; ++i) {
+      const VertexStream &s = d.streams[i];
+      if (s.data && s.offset <= s.size)
+        streams[i] = {s.data + s.offset, s.size - s.offset, s.stride};
+    }
+    particles::Request request;
+    request.program = d.vertexProgram;
+    request.constants = d.vsConstants;
+    static_assert(sizeof(vsprog::Element) == sizeof(D3DVERTEXELEMENT9));
+    request.elements = reinterpret_cast<const vsprog::Element *>(d.elements);
+    request.streams = streams;
+    request.first = first;
+    request.count = count;
+    if (spritecard) {
+      float value = 1;
+      // $blendframes (default on): the pixel shader blends two sheet frames.
+      request.frameBlend = !engine_materials::currentFloat("$blendframes", value) || value != 0;
+      float overbright = 1, addSelf = 0, second = 0;
+      if (engine_materials::currentFloat("$overbrightfactor", overbright) && overbright >= 0)
+        for (float &c : request.colorScale)
+          c = overbright;
+      else
+        overbright = 1;
+      engine_materials::currentFloat("$addself", addSelf);
+      engine_materials::currentFloat("$addbasetexture2", second);
+      // Both shader variants multiply the colour by its alpha and blend
+      // ONE / INVSRCALPHA.
+      if (d.blend && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_INVSRCALPHA && (addSelf > 0 || second > 0)) {
+        premultiplied = true;
+        if (addSelf > 0)
+          request.addSelf = addSelf * overbright;
+      }
+    } else if (const Shading &shading = engine_materials::current(); shading.mode == Shading::Unlit) {
+      // UnlitGeneric, Sprite: the material's modulation ($color x $color2,
+      // $alpha: a sprite's render colour, set by the engine per draw) reaches
+      // the pixel shader as a constant, unless the vertex shader took it
+      // (c47, the modulation register: it is in the colour output then).
+      // UnlitGeneric's pixel shader takes the vertex colour's rgb only with
+      // $vertexcolor and its alpha only with $vertexalpha (its vertex shader
+      // passes the whole colour on, in a texture coordinate, with either).
+      if (bound.known && !particleShader(bound.shader) &&
+          vsprog::info(*d.vertexProgram).colorSlot >= int(vsprog::kTex0)) {
+        request.useColor = bound.vertexColor;
+        request.useAlpha = bound.vertexAlpha;
+      }
+      const auto &constants = vsprog::info(*d.vertexProgram).constants;
+      if (!std::binary_search(constants.begin(), constants.end(), uint16_t(47))) {
+        for (int c = 0; c < 3; ++c)
+          request.colorScale[c] = std::max(shading.tint[c], 0.0f); // linear, as the unlit surfaces take it
+        float alpha = 1;
+        if (engine_materials::currentFloat("$alpha", alpha))
+          request.alphaScale = std::clamp(alpha, 0.0f, 1.0f);
+      }
+    }
+    if (expanded.size() < count)
+      expanded.resize(count);
+    if (!particles::expand(request, expanded.data(), result, &failure))
+      break;
+    built = true;
+
+    // What the blend state makes of a black or transparent draw: Source
+    // fades particles out through their colour and keeps drawing them.
+    const bool usesAlpha = d.blend && (d.srcBlend == D3DBLEND_SRCALPHA || premultiplied);
+    if (d.blend && ((additive && (!result.anyColor || (usesAlpha && !result.anyAlpha))) ||
+                    (!additive && usesAlpha && d.dstBlend == D3DBLEND_INVSRCALPHA && !result.anyAlpha) ||
+                    (!additive && !usesAlpha && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_INVSRCALPHA &&
+                     !result.anyColor && !result.anyAlpha))) {
+      outcome = kParticleFaded;
+      break;
+    }
+
+    // Facing the eye, for the traced variant (the raster overlays have no lighting).
+    float normal[3] = {eye[0] - (result.low[0] + result.high[0]) * 0.5f, eye[1] - (result.low[1] + result.high[1]) * 0.5f,
+                       eye[2] - (result.low[2] + result.high[2]) * 0.5f};
+    const float length = std::sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+    for (float &n : normal)
+      n = length > 1e-6f ? n / length : 0.0f;
+    if (!(length > 1e-6f))
+      normal[2] = 1;
+    if (vertices.size() < count)
+      vertices.resize(count);
+    for (uint32_t v = 0; v < count; ++v) {
+      remixapi_HardcodedVertex &out = vertices[v];
+      std::memcpy(out.position, expanded[v].position, sizeof(out.position));
+      std::memcpy(out.normal, normal, sizeof(out.normal));
+      std::memcpy(out.texcoord, expanded[v].uv, sizeof(out.texcoord));
+      out.color = expanded[v].color;
+    }
+    remixapi_MeshInfoSurfaceTriangles surface = {};
+    surface.vertices_values = vertices.data();
+    surface.vertices_count = count;
+    surface.indices_values = indices.data();
+    surface.indices_count = indices.size();
+    struct {
+      const void *vb, *ib;
+      uint32_t vbVersion, ibVersion, offset, startIndex, primCount, minIndex;
+      int baseVertex;
+      uint32_t sequence;
+      uint64_t view;
+    } key = {d.streams[0].buffer, d.indices.buffer, d.streams[0].version, d.indices.version, d.streams[0].offset,
+             d.startIndex,        d.primCount,      d.minIndex,           d.baseVertex,      uint32_t(g_instances.size()),
+             viewKey};
+    remixapi_MeshInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+    info.hash = fnv(&key, sizeof(key), 0x9a471c1e5ull) | 1;
+    info.surfaces_values = &surface;
+    info.surfaces_count = 1;
+    if (g_api.CreateMesh(&info, &mesh) != REMIXAPI_ERROR_CODE_SUCCESS) {
+      ++g_stats.rejected;
+      mesh = nullptr;
+      failure = "mesh rejected by the runtime";
+      break;
+    }
+    ++g_stats.created;
+    g_transient.push_back(mesh);
+    g_transientVerts += count;
+    g_transientIndices += indices.size();
+
+    Instance inst;
+    inst.mesh = mesh;
+    inst.texture0 = d.texture0;
+    if (d.texture0Target)
+      d3d::requestTargetContents(d.texture0);
+    inst.blend = blendState(d);
+    if (premultiplied) { // see above: the alpha factor moves from the shader to the blend
+      inst.blend.srcColorBlendFactor = vkBlendFactor(D3DBLEND_SRCALPHA);
+      inst.blend.srcAlphaBlendFactor = vkBlendFactor(D3DBLEND_SRCALPHA);
+    }
+    // Colour: texture x vertex colour (x 2 or 4: overbright); alpha: texture x vertex alpha.
+    inst.blend.textureColorOperation = result.gain == 4 ? 5 : result.gain == 2 ? 4 : 3;
+    inst.blend.textureColorArg1Source = 1;
+    inst.blend.textureColorArg2Source = 2;
+    inst.blend.textureAlphaOperation = 3;
+    inst.blend.textureAlphaArg1Source = 1;
+    inst.blend.textureAlphaArg2Source = 2;
+    if (traced) {
+      Shading shading;
+      shading.mode = Shading::Unlit;
+      shading.vertexColor = shading.vertexAlpha = true;
+      inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+    } else {
+      inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+      inst.rasterOnly = true;
+    }
+    inst.particle = true;
+    inst.categories = categories;
+    inst.replacementHash = 0;
+    inst.persistent = false;
+    // The mesh is in the space of the draw's view-projection: the world, or
+    // the camera's (CameraSpace).
+    static const float identity[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    std::memcpy(inst.transform, cameraToWorld ? cameraToWorld : identity, sizeof(inst.transform));
+    inst.view = viewKey;
+    const bool marks = stencilRole(d, inst); // sets the depth state of stencil draws
+    inst.depthTest = d.depthTest && inst.depthTest;
+    inst.depthWrite = d.zWrite && !d.blend;
+    if (!marks) {
+      outcome = kParticleStencil;
+      break;
+    }
+    g_instances.push_back(inst);
+    ++g_stats.accepted;
+    outcome = traced ? kParticleTraced
+              : additive ? kParticleRasterAdditive
+              : !d.blend || (d.dstBlend == D3DBLEND_INVSRCALPHA && (d.srcBlend == D3DBLEND_SRCALPHA || d.srcBlend == D3DBLEND_ONE))
+                  ? kParticleRasterBlended
+                  : kParticleRasterOther;
+  } while (false);
+
+  bool dump = false;
+  {
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    ++g_transientDecls[d.declaration];
+    if (g_particleRows.size() < 64 || g_particleRows.count(rowKey)) {
+      ParticleRow &row = g_particleRows[rowKey];
+      if (!row.draws) {
+        row.shader = bound.known ? bound.shader : "(material not read)";
+        row.declaration = describeDeclaration(d.elements);
+        row.program = programHash;
+        row.kind = kind;
+      }
+      ++row.draws;
+      ++row.outcomes[outcome];
+      if (outcome == kParticleFailed)
+        row.failure = failure;
+      else if (outcome != kParticleFaded && outcome != kParticleStencil) {
+        row.vertices += count;
+        row.triangles += uint32_t(indices.size() / 3);
+        row.premultiplied += premultiplied;
+        row.overbright += result.gain > 1;
+        row.secondFrames += result.secondFrames;
+      }
+      if (row.material.empty() || outcome == kParticleFailed)
+        row.material = engine_materials::currentName();
+    }
+    if (dumpAll && g_particlesDumped.size() < 512)
+      dump = g_particlesDumped.insert(rowKey ^ (outcome == kParticleFailed ? 0x5a5a5a5a5a5a5a5aull : 0)).second;
+  }
+  if (dump)
+    dumpParticleDraw(d, kind, kParticleOutcomeNames[outcome], failure, cameraToWorld != nullptr, streams, first, count,
+                     built ? expanded.data() : nullptr, built ? &result : nullptr);
+  // A draw whose shader builds its geometry has nothing to offer the general
+  // path (degenerate quads); the others fall back to it.
+  return outcome != kParticleFailed || kind == kParticleExpanded;
+}
+
 void onDraw(const Draw &d) {
   Timer timer(g_usDraw);
   ++g_stats.draws;
@@ -1969,12 +2614,19 @@ void onDraw(const Draw &d) {
   if (d.blend)
     ++(d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE ? g_stats.additive : g_stats.blended);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
-  if (!pos || pos->Type != D3DDECLTYPE_FLOAT3) {
+  const bool skinnedDraw = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr;
+  // Particles (see submitParticles). A shader that builds its geometry reads
+  // POSITION as it likes (a curve parameter, any type).
+  const ParticleKind particle =
+      pos && pos->Stream < 4
+          ? particleKind(d, bound, skinnedDraw, d.streams[pos->Stream].dynamic || d.indices.dynamic)
+          : kNotParticle;
+  if (!pos || pos->Stream >= 4 || (pos->Type != D3DDECLTYPE_FLOAT3 && particle != kParticleExpanded)) {
     ++g_stats.noPosition;
     return;
   }
   uint32_t bonesPerVertex = 0;
-  if (findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0)) {
+  if (skinnedDraw) {
     bonesPerVertex = uint32_t(std::clamp(currentNumBones(), 1, 3));
     ++g_stats.skinned;
   }
@@ -1995,6 +2647,19 @@ void onDraw(const Draw &d) {
     // (negate the view's third column and the projection's third row) keeps
     // view * projection and yields the left-handed form the runtime expects.
     view.perspective = std::fabs(std::fabs(view.projection[11]) - 1.0f) < 1e-3f && std::fabs(view.projection[15]) < 1e-3f;
+    static const float identityView[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    view.cameraSpace = view.perspective;
+    for (int i = 0; i < 16 && view.cameraSpace; ++i)
+      view.cameraSpace = std::fabs(view.view[i] - identityView[i]) < 1e-6f;
+    if (view.perspective && !view.cameraSpace) {
+      // Row vectors, rigid: camera = world * R + t, world = (camera - t) * R^T.
+      const float *v = view.view;
+      for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j)
+          view.cameraToWorld[i][j] = v[i * 4 + j];
+        view.cameraToWorld[i][3] = -(v[i * 4] * v[12] + v[i * 4 + 1] * v[13] + v[i * 4 + 2] * v[14]);
+      }
+    }
     if (view.perspective && view.projection[11] < 0) {
       for (int r = 0; r < 4; ++r)
         view.view[r * 4 + 2] = -view.view[r * 4 + 2];
@@ -2006,6 +2671,26 @@ void onDraw(const Draw &d) {
     ++g_stats.flat; // HUD / VGUI
     captureUi(d);
     return;
+  }
+  // Camera-space draws (see CameraSpace) belong to the view drawn before them.
+  if (!view.cameraSpace) {
+    g_cameraSpace.key = viewKey;
+    g_cameraSpace.valid = true;
+  }
+  const bool dynamicDraw = ps.dynamic || d.indices.dynamic;
+  uint64_t instanceView = viewKey;
+  const float (*cameraToWorld)[4] = nullptr;
+  if (view.cameraSpace) {
+    // Particles, and whatever else is blended and rebuilt every frame; the
+    // rest stays out as before (a view without a camera).
+    const bool placed = particle != kNotParticle || (d.blend && dynamicDraw && !skinnedDraw);
+    if (placed && g_cameraSpace.valid) {
+      instanceView = g_cameraSpace.key;
+      cameraToWorld = g_views[instanceView].cameraToWorld;
+      ++(particle != kNotParticle ? g_cameraSpaceParticles : g_cameraSpaceOther);
+    } else {
+      ++(placed ? g_cameraSpaceNoView : g_cameraSpaceLeft);
+    }
   }
   // The BSP world replaces the engine's opaque world surfaces (static vertex
   // buffers; their index buffers are rebuilt per frame); its blended draws
@@ -2021,6 +2706,27 @@ void onDraw(const Draw &d) {
   for (int i = 0; i < 3; ++i)
     eye[i] = -(view.view[12] * view.view[i * 4] + view.view[13] * view.view[i * 4 + 1] +
                view.view[14] * view.view[i * 4 + 2]);
+  // Particles leave here: before the flashlight-pass filter (an additive
+  // Spritecard or unlit draw is never that pass, whatever texture it holds),
+  // and outside the decal, emissive and mesh-cache logic below.
+  if (particle != kNotParticle &&
+      submitParticles(d, particle, instanceView, cameraToWorld, categories & ~kDecalCategories, eye))
+    return;
+  // What else is blended and rebuilt every frame, for the statistics: the
+  // candidates the particle rules above did not take.
+  if (particle == kNotParticle && particlesEnabled() && d.blend && !skinnedDraw && dynamicDraw) {
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    const char *name = engine_materials::currentName();
+    const std::string key = *name ? name : bound.known ? "(unnamed)" : "(material not read)";
+    if (g_particlesLeft.size() < 64 || g_particlesLeft.count(key)) {
+      ParticleLeft &left = g_particlesLeft[key];
+      if (!left.draws)
+        left.shader = bound.shader;
+      ++left.draws;
+      left.srcBlend = d.srcBlend;
+      left.dstBlend = d.dstBlend;
+    }
+  }
   if (!d.blend && bsp::isStaticProp(d.vsConstants + kRegModel * 4, eye)) {
     // Their ambient cubes still feed the sky light estimate (onPresent).
     if (findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0))
@@ -2286,45 +2992,16 @@ void onDraw(const Draw &d) {
     std::memcpy(inst.transform, d.vsConstants + kRegModel * 4, sizeof(inst.transform));
     g_stats.rigidModels += boneCount == 1;
   }
-  inst.view = viewKey;
-  if (d.stencil) { // see StencilGroup
-    const uint32_t value = d.stencilRef & d.stencilMask & 0xff, written = d.stencilRef & d.stencilWriteMask & 0xff;
-    inst.depthTest = d.depthTest;
-    inst.depthWrite = d.zWrite;
-    if (d.stencilFunc == D3DCMP_ALWAYS && d.stencilPass == D3DSTENCILOP_REPLACE) {
-      inst.stencilGroup = stencilWriter(written);
-      g_stencilGroups[inst.stencilGroup].glassSources += !d.zWrite;
-      // A render-target texture without contents (not read back, see
-      // d3d::requestTargetContents): such a writer only marks.
-      inst.stencilRole = d.texture0Target && !inst.material ? kStencilSourceOnly : kStencilSource;
-      g_stencilGroups[inst.stencilGroup].ignoreZ |= !d.depthTest;
-    } else if (d.stencilFunc == D3DCMP_NEVER) {
-      if (d.stencilFail != D3DSTENCILOP_REPLACE)
-        return;
-      inst.stencilGroup = stencilWriter(written);
-      inst.stencilRole = kStencilSourceOnly;
-      inst.depthTest = false; // fails before the depth test: marks through anything
-    } else if (d.stencilFunc == D3DCMP_EQUAL &&
-               (d.stencilPass == D3DSTENCILOP_INCR || d.stencilPass == D3DSTENCILOP_INCRSAT)) {
-      const int parent = stencilReader(value);
-      if (parent < 0)
-        return;
-      inst.stencilGroup = stencilWriter(value + 1);
-      g_stencilGroups[inst.stencilGroup].within = parent;
-      inst.stencilRole = kStencilSourceOnly;
-    } else if (d.stencilFunc == D3DCMP_EQUAL || d.stencilFunc == D3DCMP_LESS) {
-      inst.stencilGroup = stencilReader(d.stencilFunc == D3DCMP_LESS ? value + 1 : value);
-      if (inst.stencilGroup < 0)
-        return; // nothing marked: not visible
-      inst.stencilRole = kStencilInside;
-    }
-    else if (d.stencilFunc == D3DCMP_NOTEQUAL) {
-      // A scope's body around its lens opening: a scene instance as ever,
-      // which the camera does not see inside the group.
-      inst.stencilGroup = stencilReader(value);
-      inst.stencilRole = inst.stencilGroup >= 0 ? kStencilCut : kStencilNone;
-    }
+  inst.view = instanceView;
+  if (cameraToWorld) { // see CameraSpace
+    if (inst.bones.empty())
+      premultiply(cameraToWorld, inst.transform);
+    else
+      for (auto &bone : inst.bones)
+        premultiply(cameraToWorld, bone.matrix);
   }
+  if (!stencilRole(d, inst))
+    return;
   g_instances.push_back(inst);
   if (inst.stencilRole == kStencilSourceOnly || inst.stencilRole == kStencilInside)
     return; // marks and overlays: no part in lighting estimates
@@ -2450,7 +3127,7 @@ void onPresent() {
   // (another field of view). Other views (monitors, reflections) are skipped.
   std::unordered_map<int, uint32_t> fovDraws;
   for (auto &[key, v] : g_views)
-    if (v.perspective)
+    if (v.perspective && !v.cameraSpace)
       fovDraws[int(std::lround(v.projection[5] * 1000))] += v.draws;
   int worldFov = 0;
   uint32_t best = 0;
@@ -2462,7 +3139,8 @@ void onPresent() {
   const View *main = nullptr;
   uint64_t mainKey = 0;
   for (auto &[key, v] : g_views) {
-    if (v.perspective && int(std::lround(v.projection[5] * 1000)) == worldFov && (!main || v.draws > main->draws)) {
+    if (v.perspective && !v.cameraSpace && int(std::lround(v.projection[5] * 1000)) == worldFov &&
+        (!main || v.draws > main->draws)) {
       main = &v;
       mainKey = key;
     }
@@ -2856,7 +3534,8 @@ void onPresent() {
       // have no surface to trace; the path tracer would show them as opaque
       // sheets. They are rasterized over the traced image with their D3D
       // blend state instead.
-      const bool isAdditive = inst.blend.alphaBlendEnabled && inst.blend.dstColorBlendFactor == 1;
+      // Particles likewise, whatever their blend mode (see submitParticles).
+      const bool isAdditive = (inst.blend.alphaBlendEnabled && inst.blend.dstColorBlendFactor == 1) || inst.rasterOnly;
       const bool isTracked = !isStatic && !isAdditive && inst.persistent && role != Role::Sky;
       if (isAdditive) {
         identity.instanceId = 0;
@@ -2890,6 +3569,29 @@ void onPresent() {
         cameraCulling.flags = REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT;
         info.pNext = &cameraCulling;
         ++g_stats.cameraCulledModels;
+      }
+      // Raster-only overlays keep the order the engine drew them in: it sorts
+      // its translucent renderables back to front and draws a particle
+      // system's layers in the order that composes them, which the depth of
+      // their meshes' centres (the runtime's order otherwise) does not tell
+      // for layers that share a place, like smoke and the fire inside it.
+      // (A runtime without the extension ignores it.)
+      remixapi_InstanceInfoRasterOrderEXT overlayOrder = {};
+      if (isAdditive) {
+        overlayOrder.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_RASTER_ORDER_EXT;
+        overlayOrder.pNext = info.pNext;
+        overlayOrder.order = uint32_t(&inst - g_instances.data()) + 1;
+        info.pNext = &overlayOrder;
+      }
+      // A particle's depth state is its draw's ($ignorez glows).
+      remixapi_InstanceRasterStateEXT overlayState = {};
+      if (inst.particle && inst.rasterOnly) {
+        overlayState.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_RASTER_STATE_EXT;
+        overlayState.pNext = info.pNext;
+        overlayState.depthTest = inst.depthTest;
+        overlayState.depthWrite = inst.depthWrite;
+        overlayState.depthCompare = 3; // LESS_OR_EQUAL
+        info.pNext = &overlayState;
       }
       remixapi_InstanceInfoMaskEXT cut = {};
       if (inst.stencilRole == kStencilCut) {
@@ -3088,6 +3790,7 @@ void onPresent() {
   g_stencilCurrent.clear();
   g_stencilMasksAssigned = false;
   g_views.clear();
+  g_cameraSpace.valid = false;
   g_worldViews.clear();
   g_viewOrder = 0;
 
@@ -3550,6 +4253,79 @@ void dumpStatistics(FILE *out) {
           g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
           g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f,
           g_stats.flashlightLitPasses.exchange(0) / f, g_stats.additiveBlack.exchange(0) / f);
+  {
+    // Particles (submitParticles): per frame in all, then per combination of
+    // material shader, vertex shader and declaration, the most drawn first.
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    uint32_t draws = 0, expandedDraws = 0, vertices = 0, triangles = 0, premultiplied = 0, overbright = 0;
+    uint32_t outcomes[kParticleOutcomes] = {};
+    std::vector<const ParticleRow *> rows;
+    for (const auto &[key, row] : g_particleRows) {
+      draws += row.draws;
+      expandedDraws += row.kind == kParticleExpanded ? row.draws : 0;
+      vertices += row.vertices;
+      triangles += row.triangles;
+      premultiplied += row.premultiplied;
+      overbright += row.overbright;
+      for (int i = 0; i < kParticleOutcomes; ++i)
+        outcomes[i] += row.outcomes[i];
+      rows.push_back(&row);
+    }
+    std::sort(rows.begin(), rows.end(), [](const ParticleRow *a, const ParticleRow *b) {
+      // What was not understood first, then by draws.
+      const bool af = a->outcomes[kParticleFailed] != 0, bf = b->outcomes[kParticleFailed] != 0;
+      return af != bf ? af : a->draws > b->draws;
+    });
+    const double ms = g_usParticles.exchange(0) / f / 1000;
+    fprintf(out,
+            "   particles per frame%s: draws %.2f (vertex-shader expanded %.2f, CPU expanded %.2f), %.1f quads (%.0f "
+            "triangles, %.0f vertices), %.3f ms (%.3f ms per 1000 quads) | submitted: raster additive %.2f, raster "
+            "blended %.2f, raster other blend %.2f, traced %.2f ($addself / $addbasetexture2 as alpha blend %.2f, "
+            "overbright %.2f) | dropped: faded out %.2f, stencil only %.2f, not understood %.2f\n",
+            particlesEnabled() ? "" : " (OPENREMIX_PROXY_PARTICLES=0: off)", draws / f, expandedDraws / f,
+            (draws - expandedDraws) / f, triangles / 2 / f, triangles / f, vertices / f, ms,
+            triangles ? ms / (triangles / 2 / f) * 1000 : 0.0, outcomes[kParticleRasterAdditive] / f,
+            outcomes[kParticleRasterBlended] / f, outcomes[kParticleRasterOther] / f, outcomes[kParticleTraced] / f,
+            premultiplied / f, overbright / f, outcomes[kParticleFaded] / f, outcomes[kParticleStencil] / f,
+            outcomes[kParticleFailed] / f);
+    for (size_t i = 0; i < rows.size() && i < 16; ++i) {
+      const ParticleRow &row = *rows[i];
+      fprintf(out, "     %s, %s, vs %016llX: draws %.2f, %.1f quads |", row.shader.c_str(), kParticleKindNames[row.kind],
+              static_cast<unsigned long long>(row.program), row.draws / f, row.triangles / 2 / f);
+      for (int k = 0; k < kParticleOutcomes; ++k)
+        if (row.outcomes[k])
+          fprintf(out, " %s %.2f", kParticleOutcomeNames[k], row.outcomes[k] / f);
+      if (row.outcomes[kParticleFailed])
+        fprintf(out, " (%s)", row.failure);
+      if (row.secondFrames)
+        fprintf(out, " | second sheet frame on %.0f%% of vertices", 100.0 * row.secondFrames / std::max(row.vertices, 1u));
+      fprintf(out, " | %s %s | [%s]\n", row.outcomes[kParticleFailed] ? "last failing material" : "first material",
+              row.material.c_str(), row.declaration.c_str());
+    }
+    if (rows.size() > 16)
+      fprintf(out, "     ... and %zu more combinations\n", rows.size() - 16);
+    g_particleRows.clear();
+    // Blended draws from dynamic buffers the particle rules did not take
+    // (general path: traced surfaces; additive ones rasterized as before).
+    std::vector<const std::pair<const std::string, ParticleLeft> *> left;
+    for (const auto &item : g_particlesLeft)
+      left.push_back(&item);
+    std::sort(left.begin(), left.end(), [](const auto *a, const auto *b) { return a->second.draws > b->second.draws; });
+    if (!left.empty()) {
+      fprintf(out, "     blended dynamic draws left to the general path (not particles by shader or material path), by "
+                   "material:");
+      for (size_t i = 0; i < left.size() && i < 12; ++i)
+        fprintf(out, " %s (%s, blend %u/%u) %.2f;", left[i]->first.c_str(), left[i]->second.shader.c_str(),
+                left[i]->second.srcBlend, left[i]->second.dstBlend, left[i]->second.draws / f);
+      fprintf(out, "%s\n", left.size() > 12 ? " ..." : "");
+    }
+    g_particlesLeft.clear();
+    fprintf(out, "     camera-space draws (identity view matrix: the client particle manager's) per frame: particles %.2f, "
+                 "other blended dynamic draws %.2f, both placed in the world by the view drawn before; left out: other "
+                 "draws %.2f, without a view before them %.2f\n",
+            g_cameraSpaceParticles.exchange(0) / f, g_cameraSpaceOther.exchange(0) / f, g_cameraSpaceLeft.exchange(0) / f,
+            g_cameraSpaceNoView.exchange(0) / f);
+  }
   {
     // Decals: per frame by what they paint and by what marked them (a draw
     // can be marked several ways), then the materials that drew them.

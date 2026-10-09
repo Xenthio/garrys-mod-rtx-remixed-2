@@ -11,6 +11,9 @@
 namespace proxy::engine_materials {
 struct Shading;
 }
+namespace proxy::vsprog {
+struct Program;
+}
 namespace proxy::remix {
 
 struct VertexStream {
@@ -42,6 +45,8 @@ struct Draw {
   const D3DVERTEXELEMENT9 *elements = nullptr; // terminated by D3DDECL_END
   const void *declaration = nullptr;
   const float *vsConstants = nullptr;          // 256 float4 registers
+  const void *vertexShader = nullptr;          // IDirect3DVertexShader9 identity
+  const vsprog::Program *vertexProgram = nullptr; // it, decoded (nullptr: not seen at creation)
   const void *texture0 = nullptr;              // texture bound to sampler 0 (base texture)
   bool mainTarget = false;                     // render target 0 is the back buffer
   uint32_t colorWrite = 0xf;                   // D3DRS_COLORWRITEENABLE
