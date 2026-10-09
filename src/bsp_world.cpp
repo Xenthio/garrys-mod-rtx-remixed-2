@@ -573,7 +573,7 @@ struct World {
   bool batchValid = false;
   uint64_t replayedFrames = 0;
   uint32_t recordings = 0;
-  uint32_t styledLights = 0, skyboxLights = 0, otherLights = 0;
+  uint32_t styledLights = 0, skyboxLights = 0, otherLights = 0, surfaceLights = 0;
   uint32_t styleDrivenLights = 0; // of lights: scaled by their lightstyle
 } g_world;
 bool g_active = false;
@@ -1449,7 +1449,7 @@ struct WorldLight {
   int32_t flags, texinfo, owner;
 };
 static_assert(sizeof(WorldLight) == 100);
-enum { kEmitPoint = 1, kEmitSpot = 2, kEmitSky = 3 };
+enum { kEmitSurface = 0, kEmitPoint = 1, kEmitSpot = 2, kEmitSky = 3 };
 
 // The map's static lights (HDR worldlights; LDR when the map has no HDR
 // lighting). Lights with a light style (switchable, flickering) keep it: the
@@ -1484,10 +1484,11 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
   const size_t count = lights.size();
   for (size_t i = 0; i < count; ++i) {
     const WorldLight &w = lights[i];
-    if (w.type != kEmitPoint && w.type != kEmitSpot && w.type != kEmitSky) {
-      ++g_world.otherLights; // surface, Quake and sky ambient lights
+    if (w.type != kEmitSurface && w.type != kEmitPoint && w.type != kEmitSpot && w.type != kEmitSky) {
+      ++g_world.otherLights; // Quake and sky ambient lights
       continue;
     }
+    g_world.surfaceLights += w.type == kEmitSurface;
     // The sun keeps its light (GMod's light_environment often has a style,
     // e.g. 33 on gm_construct, for day/night control).
     const bool styled = w.style != 0 && w.type != kEmitSky;
@@ -1501,13 +1502,18 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     }
     // As the engine passes it to models (WorldLightToMaterialLight).
     Light l;
-    l.type = w.type == kEmitPoint ? 1 : w.type == kEmitSpot ? 3 : 2;
+    // Surface lights (texture lights: lights.rad, a store's ceiling panels)
+    // reach models as point lights with inverse-square falloff. Left to the
+    // engine they existed only while it lit a model near them.
+    l.type = w.type == kEmitPoint || w.type == kEmitSurface ? 1 : w.type == kEmitSpot ? 3 : 2;
     std::memcpy(l.color, w.intensity, 12);
     std::memcpy(l.position, w.origin, 12);
     std::memcpy(l.direction, w.normal, 12);
     l.attenuation[0] = w.constantAttn;
     l.attenuation[1] = w.linearAttn;
     l.attenuation[2] = w.quadraticAttn;
+    if (w.type == kEmitSurface)
+      l.attenuation[0] = l.attenuation[1] = 0, l.attenuation[2] = 1;
     l.thetaDot = w.stopdot;
     l.phiDot = w.stopdot2;
     l.hash = 0x6c696768745f6273ull ^ (uint64_t(i) * 0x9e3779b97f4a7c15ull);
@@ -2544,9 +2550,9 @@ void dumpStatistics(FILE *out) {
   }
   fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
           int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
-  fprintf(out, "   BSP lights: %zu static, %u of them styled (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
-          g_world.lights.size(), g_world.styleDrivenLights, g_world.styledLights, g_world.skyboxLights,
-          g_world.otherLights);
+  fprintf(out, "   BSP lights: %zu static, %u of them styled, %u surface (texture) lights (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
+          g_world.lights.size(), g_world.styleDrivenLights, g_world.surfaceLights, g_world.styledLights,
+          g_world.skyboxLights, g_world.otherLights);
   for (auto &path : g_world.failedModels)
     fprintf(out, "     prop model left to the engine: %s\n", path.c_str());
   for (auto &m : g_world.materials)
