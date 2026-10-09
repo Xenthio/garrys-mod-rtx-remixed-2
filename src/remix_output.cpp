@@ -730,6 +730,10 @@ struct Instance {
   // its blend state, whatever that is (rasterOnly), unless particles are
   // traced; its depth state is the draw's.
   bool particle = false, rasterOnly = false;
+  // What its pixel shader does beyond texture x colour, for the runtime's
+  // sprite overlays (remixapi_InstanceInfoSpriteEXT flags; 0: nothing).
+  uint32_t spriteFlags = 0;
+  float spriteSoft[3] = {}; // soft distance, fade start, fade end (view-space units)
 };
 std::vector<Instance> g_instances;
 
@@ -1923,7 +1927,9 @@ bool stencilRole(const Draw &d, Instance &inst) {
 //             colours, from dynamic buffers and not skinned: Spritecard,
 //             SplineCard, and whatever else builds geometry that way;
 //   shader    it is blended, from dynamic buffers, and its material's shader
-//             is Spritecard, SplineCard, Sprite or ParticleSphere;
+//             is Spritecard, SplineCard, Sprite or ParticleSphere, or Modulate
+//             with a multiplying blend, a material under the particle
+//             directories and nothing that makes it a decal;
 //   additive  blended with destination ONE, dynamic, an unlit material
 //             (glows, beams, tracers: raster overlays before, too);
 //   path      blended, dynamic, unlit, and the material lies under
@@ -1948,8 +1954,27 @@ bool stencilRole(const Draw &d, Instance &inst) {
 // INVSRCALPHA with a colour the shader multiplied by its alpha, drawn here
 // as SRCALPHA / INVSRCALPHA with the $addself gain (1 + addself x overbright
 // x vertex alpha) in the vertex colour (the second texture of
-// $addbasetexture2 is left out); of two blended sheet frames the leading one
-// shows; $depthblend (soft particles) is ignored.
+// $addbasetexture2 is left out). The rest is the runtime's sprite overlay
+// (remixapi_InstanceInfoSpriteEXT), fed with the vertex shader's other
+// outputs (remixapi_MeshInfoSpriteVerticesEXT):
+//   frames     TEXCOORD1 and TEXCOORD2.x are the second sheet frame and its
+//              weight: blended ($blendframes, the default), or the brighter
+//              one ($maxlumframeblend1), or with $extractgreenalpha four
+//              alpha-only images in the green and alpha of the two frames;
+//   sequences  $dualsequence: TEXCOORD5/6 and TEXCOORD2.z are a second
+//              sequence, averaged with the first, replacing its colour or
+//              laid over it ($sequence_blend_mode 0/1/2), the brighter of
+//              its frames with $maxlumframeblend2;
+//   soft       $depthblend: alpha x saturate(max(smoothstep(0.75, 1, scene /
+//              range), |scene - particle| / $depthblendscale)) on projected
+//              z, range 192 units (the depth Source keeps in its frame
+//              buffer's alpha): the distance and range go over in view-space
+//              units;
+//   modulate   the Modulate shader (blood: dst x src, or x 2 with $mod2x,
+//              on frame-buffer values, the source fading to neutral with its
+//              alpha), and other draws that blend that way (without the
+//              fade).
+// $ramptexture and $addbasetexture2's second texture are not reproduced.
 enum ParticleKind : uint8_t { kNotParticle, kParticleExpanded, kParticleShader, kParticleAdditive, kParticlePath };
 const char *const kParticleKindNames[] = {"-", "vertex-shader expanded", "particle shader", "additive unlit",
                                           "unlit by material path"};
@@ -1971,6 +1996,10 @@ struct ParticleRow {
   uint64_t program = 0;
   uint8_t kind = 0;
   uint32_t draws = 0, vertices = 0, triangles = 0, premultiplied = 0, overbright = 0, secondFrames = 0;
+  // Sprite overlay features (draws): soft depth (of them: scale confirmed by
+  // the pixel shader's constants), frame blend, brighter frame, green/alpha,
+  // second sequence, modulate.
+  uint32_t soft = 0, softConfirmed = 0, frameBlend = 0, frameMax = 0, greenAlpha = 0, sequence = 0, modulate = 0;
   uint32_t outcomes[kParticleOutcomes] = {};
   const char *failure = "";
   bool dumped = false;
@@ -2022,7 +2051,9 @@ bool particleShader(const char *shader) {
          nameStarts(shader, "particlesphere");
 }
 
-ParticleKind particleKind(const Draw &d, const engine_materials::Bound &bound, bool skinned, bool dynamic) {
+// `multiplies`: blended dst x src (x 2) and not a decal by any sign.
+ParticleKind particleKind(const Draw &d, const engine_materials::Bound &bound, bool skinned, bool dynamic,
+                          bool multiplies) {
   if (!particlesEnabled() || skinned)
     return kNotParticle;
   if (!dynamic) // particles are rebuilt every frame
@@ -2032,6 +2063,9 @@ ParticleKind particleKind(const Draw &d, const engine_materials::Bound &bound, b
   if (!d.blend)
     return kNotParticle;
   if (bound.known && particleShader(bound.shader))
+    return kParticleShader;
+  if (bound.known && multiplies && nameStarts(bound.shader, "modulate") &&
+      particleMaterialPath(engine_materials::currentName()))
     return kParticleShader;
   if (engine_materials::current().mode != engine_materials::Shading::Unlit)
     return kNotParticle;
@@ -2107,7 +2141,8 @@ bool particleTriangles(const Draw &d, std::vector<uint32_t> &indices, uint32_t &
 // draw, once per (declaration, vertex shader, material shader, kind), to
 // bin/particles.txt.
 void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, const char *failure, bool cameraSpace,
-                      const vsprog::Stream *streams, uint32_t first, uint32_t count, const particles::Vertex *expanded,
+                      uint32_t spriteFlags, const float *spriteSoft, bool softConfirmed,
+                      const particles::SpriteVertex *sprites, const vsprog::Stream *streams, uint32_t first, uint32_t count, const particles::Vertex *expanded,
                       const particles::Result *result) {
   static bool truncate = true;
   FILE *f = _wfopen((g_moduleDir + L"\\particles.txt").c_str(), truncate ? L"w" : L"a");
@@ -2119,6 +2154,30 @@ void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, con
           bound.shader, unsigned(bound.flags), bound.known ? "" : " (not read)");
   fprintf(f, "   outcome: %s%s%s | positions in %s\n", outcome, failure && *failure ? ": " : "", failure ? failure : "",
           cameraSpace ? "camera space (identity view matrix: placed by the view drawn before)" : "world space");
+  fprintf(f, "   sprite overlay:%s%s%s%s%s%s%s%s%s", spriteFlags ? "" : " none",
+          spriteFlags & REMIXAPI_SPRITE_FRAME_BLEND_EXT ? " frames blended" : "",
+          spriteFlags & REMIXAPI_SPRITE_FRAME_MAX_LUMINANCE_EXT ? " brighter frame" : "",
+          spriteFlags & REMIXAPI_SPRITE_GREEN_ALPHA_EXT ? " green/alpha" : "",
+          (spriteFlags & REMIXAPI_SPRITE_SEQUENCE_OVER_EXT) == REMIXAPI_SPRITE_SEQUENCE_ADD_EXT ? " second sequence added" : "",
+          (spriteFlags & REMIXAPI_SPRITE_SEQUENCE_OVER_EXT) == REMIXAPI_SPRITE_SEQUENCE_REPLACE_EXT ? " second sequence replaces colour" : "",
+          (spriteFlags & REMIXAPI_SPRITE_SEQUENCE_OVER_EXT) == REMIXAPI_SPRITE_SEQUENCE_OVER_EXT ? " second sequence over" : "",
+          spriteFlags & REMIXAPI_SPRITE_SEQUENCE_MAX_LUMINANCE_EXT ? " (its brighter frame)" : "",
+          spriteFlags & REMIXAPI_SPRITE_MODULATE_EXT
+              ? (spriteFlags & REMIXAPI_SPRITE_MODULATE_FADE_EXT ? " modulate, fading to neutral" : " modulate")
+              : "");
+  if (spriteFlags & REMIXAPI_SPRITE_SOFT_DEPTH_EXT)
+    fprintf(f, " soft depth over %.3f units of view depth, removed between depths %.2f and %.2f (%s)", spriteSoft[0],
+            spriteSoft[1], spriteSoft[2],
+            softConfirmed ? "from the pixel shader's c2.x and c29.w" : "from $depthblendscale: the registers disagree");
+  fprintf(f, "\n");
+  if (d.psConstants) {
+    fprintf(f, "   pixel shader constants:");
+    for (int reg : {0, 1, 2, 3, 29, 30}) {
+      const float *c = d.psConstants + reg * 4;
+      fprintf(f, " c%d = %.6g %.6g %.6g %.6g;", reg, c[0], c[1], c[2], c[3]);
+    }
+    fprintf(f, "\n");
+  }
   fprintf(f, "   primitive type %u, %u primitives, base vertex %d, min index %u, %u vertices, start index %u; vertices used "
              "%u..%u\n",
           unsigned(d.type), d.primCount, d.baseVertex, d.minIndex, d.numVertices, d.startIndex, first,
@@ -2207,6 +2266,10 @@ void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, con
       fprintf(f, "     -> %s %.4f %.4f %.4f uv %.5f %.5f colour (A R G B, sRGB bytes%s) %08X\n",
               cameraSpace ? "camera" : "world", expanded[v].position[0], expanded[v].position[1], expanded[v].position[2], expanded[v].uv[0], expanded[v].uv[1],
               result && result->gain > 1 ? (result->gain == 4 ? ", / 4" : ", / 2") : "", expanded[v].color);
+    if (expanded && sprites)
+      fprintf(f, "     -> second frame uv %.5f %.5f weight %.4f; second sequence uv %.5f %.5f / %.5f %.5f weight %.4f\n",
+              sprites[v].frame[0], sprites[v].frame[1], sprites[v].frame[2], sprites[v].sequence[0],
+              sprites[v].sequence[1], sprites[v].sequence[2], sprites[v].sequence[3], sprites[v].weight2);
   }
   fprintf(f, "\n");
   fclose(f);
@@ -2214,8 +2277,10 @@ void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, con
 
 // Builds and queues a particle draw (see above). False: the draw is not
 // handled here and goes on through onDraw as before.
+// `projection`: the draw's (left-handed form: view depth d projects to z =
+// d projection[10] + projection[14]).
 bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const float (*cameraToWorld)[4],
-                     uint32_t categories, const float eye[3]) {
+                     uint32_t categories, const float eye[3], const float *projection) {
   Timer timer(g_usParticles);
   using engine_materials::Shading;
   const engine_materials::Bound &bound = engine_materials::bound();
@@ -2239,6 +2304,10 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
   thread_local std::vector<uint32_t> indices;
   thread_local std::vector<particles::Vertex> expanded;
   thread_local std::vector<remixapi_HardcodedVertex> vertices;
+  thread_local std::vector<particles::SpriteVertex> sprites;
+  uint32_t spriteFlags = 0;
+  float spriteSoft[3] = {};
+  bool softConfirmed = false;
   vsprog::Stream streams[4];
   uint32_t low = 0, count = 0, first = 0;
   particles::Result result;
@@ -2249,6 +2318,17 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
   const bool additive = d.blend && d.dstBlend == D3DBLEND_ONE;
   const bool traced = traceBlended && d.blend && !additive;
   const bool spritecard = nameStarts(bound.shader, "spritecard");
+  // dst x src (x 2): the frame buffer multiplied.
+  const bool multiplies = d.blend && d.blendOp == D3DBLENDOP_ADD &&
+                          ((d.srcBlend == D3DBLEND_DESTCOLOR && (d.dstBlend == D3DBLEND_SRCCOLOR || d.dstBlend == D3DBLEND_ZERO)) ||
+                           (d.srcBlend == D3DBLEND_ZERO && d.dstBlend == D3DBLEND_SRCCOLOR));
+  // The runtime's sprite overlay does the per-pixel part; the traced variant
+  // has none (it shows the leading frame).
+  static const bool spriteOverlays = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_PARTICLE_SPRITES", v, sizeof(v)) && v[0] == '0');
+  }();
+  const bool overlay = spriteOverlays && !traced && d.blend;
 
   do {
     if (!d.vertexProgram) {
@@ -2282,10 +2362,69 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     request.streams = streams;
     request.first = first;
     request.count = count;
+    auto parameter = [](const char *name, float fallback) {
+      float value = fallback;
+      return engine_materials::currentFloat(name, value) ? value : fallback;
+    };
+    if (multiplies && overlay) {
+      // Modulate's pixel shader: lerp(neutral, texture x colour, alpha).
+      spriteFlags |= REMIXAPI_SPRITE_MODULATE_EXT;
+      if (nameStarts(bound.shader, "modulate"))
+        spriteFlags |= REMIXAPI_SPRITE_MODULATE_FADE_EXT;
+    }
+    if (spritecard && overlay) {
+      const bool green = parameter("$extractgreenalpha", 0) != 0, brighter = parameter("$maxlumframeblend1", 0) != 0;
+      spriteFlags |= green      ? REMIXAPI_SPRITE_GREEN_ALPHA_EXT
+                     : brighter ? REMIXAPI_SPRITE_FRAME_MAX_LUMINANCE_EXT
+                     : parameter("$blendframes", 1) != 0 ? REMIXAPI_SPRITE_FRAME_BLEND_EXT : 0u;
+      if (parameter("$dualsequence", 0) != 0) {
+        const int mode = int(parameter("$sequence_blend_mode", 0));
+        spriteFlags |= mode == 1 ? REMIXAPI_SPRITE_SEQUENCE_REPLACE_EXT
+                       : mode == 2 ? REMIXAPI_SPRITE_SEQUENCE_OVER_EXT : REMIXAPI_SPRITE_SEQUENCE_ADD_EXT;
+        if (parameter("$maxlumframeblend2", 0) != 0)
+          spriteFlags |= REMIXAPI_SPRITE_SEQUENCE_MAX_LUMINANCE_EXT;
+      }
+      // Soft particles. The pixel shader computes, on projected z over the
+      // range it keeps in the frame buffer's alpha (c29.w = 1 / 192),
+      //   saturate(max(smoothstep(0.75, 1, scene c29.w), |scene - z| c29.w c2.x))
+      // with c2.x = 192 / $depthblendscale. The registers are taken when they
+      // agree with the material (they may be another shader's), else the
+      // material's scale and the 192 units.
+      if (parameter("$depthblend", 0) != 0 && projection && projection[10] > 0) {
+        const float scale = parameter("$depthblendscale", 50);
+        float distance = scale > 0 ? scale : 50, range = 192;
+        if (d.psConstants) {
+          const float perUnit = d.psConstants[29 * 4 + 3], feather = d.psConstants[2 * 4];
+          if (std::isfinite(perUnit) && std::isfinite(feather) && perUnit > 1e-5f && perUnit < 1 && feather > 0) {
+            const float fromShader = 1 / (perUnit * feather);
+            if (fromShader > distance * 0.5f && fromShader < distance * 2) {
+              distance = fromShader;
+              range = 1 / perUnit;
+              softConfirmed = true;
+            }
+          }
+        }
+        // Projected z to view depth: z = depth a + b.
+        const float a = projection[10], b = projection[14];
+        spriteFlags |= REMIXAPI_SPRITE_SOFT_DEPTH_EXT;
+        spriteSoft[0] = distance / a;
+        spriteSoft[1] = (0.75f * range - b) / a;
+        spriteSoft[2] = (range - b) / a;
+      }
+    }
+    constexpr uint32_t kSpriteVertexFlags =
+        REMIXAPI_SPRITE_FRAME_BLEND_EXT | REMIXAPI_SPRITE_FRAME_MAX_LUMINANCE_EXT | REMIXAPI_SPRITE_GREEN_ALPHA_EXT |
+        REMIXAPI_SPRITE_SEQUENCE_OVER_EXT | REMIXAPI_SPRITE_SEQUENCE_MAX_LUMINANCE_EXT;
+    if (spriteFlags & kSpriteVertexFlags) {
+      if (sprites.size() < count)
+        sprites.resize(count);
+      request.sprites = sprites.data();
+    }
     if (spritecard) {
       float value = 1;
-      // $blendframes (default on): the pixel shader blends two sheet frames.
-      request.frameBlend = !engine_materials::currentFloat("$blendframes", value) || value != 0;
+      // $blendframes (default on): the pixel shader blends two sheet frames
+      // (the leading one shows where the sprite overlay does not blend them).
+      request.frameBlend = !request.sprites && (!engine_materials::currentFloat("$blendframes", value) || value != 0);
       float overbright = 1, addSelf = 0, second = 0;
       if (engine_materials::currentFloat("$overbrightfactor", overbright) && overbright >= 0)
         for (float &c : request.colorScale)
@@ -2328,6 +2467,13 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     if (!particles::expand(request, expanded.data(), result, &failure))
       break;
     built = true;
+    // What the vertex shader does not write is not there to combine.
+    if (!result.frames)
+      spriteFlags &= ~(REMIXAPI_SPRITE_FRAME_BLEND_EXT | REMIXAPI_SPRITE_FRAME_MAX_LUMINANCE_EXT |
+                       REMIXAPI_SPRITE_GREEN_ALPHA_EXT);
+    if (!result.sequences)
+      spriteFlags &= ~(REMIXAPI_SPRITE_SEQUENCE_OVER_EXT | REMIXAPI_SPRITE_SEQUENCE_MAX_LUMINANCE_EXT);
+    const bool spriteVertices = (spriteFlags & kSpriteVertexFlags) != 0;
 
     // What the blend state makes of a black or transparent draw: Source
     // fades particles out through their colour and keeps drawing them.
@@ -2335,7 +2481,8 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     if (d.blend && ((additive && (!result.anyColor || (usesAlpha && !result.anyAlpha))) ||
                     (!additive && usesAlpha && d.dstBlend == D3DBLEND_INVSRCALPHA && !result.anyAlpha) ||
                     (!additive && !usesAlpha && d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_INVSRCALPHA &&
-                     !result.anyColor && !result.anyAlpha))) {
+                     !result.anyColor && !result.anyAlpha) ||
+                    ((spriteFlags & REMIXAPI_SPRITE_MODULATE_FADE_EXT) && !result.anyAlpha))) {
       outcome = kParticleFaded;
       break;
     }
@@ -2356,7 +2503,19 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
       std::memcpy(out.normal, normal, sizeof(out.normal));
       std::memcpy(out.texcoord, expanded[v].uv, sizeof(out.texcoord));
       out.color = expanded[v].color;
+      if (spriteVertices) { // remixapi_MeshInfoSpriteVerticesEXT: instead of a normal, and in the padding
+        const particles::SpriteVertex &sprite = sprites[v];
+        std::memcpy(out.normal, sprite.frame, sizeof(out.normal));
+        std::memcpy(&out._pad0, &sprite.sequence[0], 4);
+        std::memcpy(&out._pad1, &sprite.sequence[1], 4);
+        std::memcpy(&out._pad2, &sprite.sequence[2], 4);
+        std::memcpy(&out._pad3, &sprite.sequence[3], 4);
+        std::memcpy(&out._pad4, &sprite.weight2, 4);
+      }
     }
+    remixapi_MeshInfoSpriteVerticesEXT spriteMesh = {};
+    spriteMesh.sType = REMIXAPI_STRUCT_TYPE_MESH_SPRITE_VERTICES_EXT;
+    spriteMesh.enabled = 1;
     remixapi_MeshInfoSurfaceTriangles surface = {};
     surface.vertices_values = vertices.data();
     surface.vertices_count = count;
@@ -2374,6 +2533,8 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     remixapi_MeshInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
     info.hash = fnv(&key, sizeof(key), 0x9a471c1e5ull) | 1;
+    if (spriteVertices)
+      info.pNext = &spriteMesh;
     info.surfaces_values = &surface;
     info.surfaces_count = 1;
     if (g_api.CreateMesh(&info, &mesh) != REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -2414,6 +2575,12 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
       inst.rasterOnly = true;
     }
     inst.particle = true;
+    if (inst.rasterOnly) {
+      inst.spriteFlags = spriteFlags;
+      std::memcpy(inst.spriteSoft, spriteSoft, sizeof(spriteSoft));
+    } else {
+      spriteFlags = 0;
+    }
     inst.categories = categories;
     inst.replacementHash = 0;
     inst.persistent = false;
@@ -2460,6 +2627,13 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
         row.premultiplied += premultiplied;
         row.overbright += result.gain > 1;
         row.secondFrames += result.secondFrames;
+        row.soft += (spriteFlags & REMIXAPI_SPRITE_SOFT_DEPTH_EXT) != 0;
+        row.softConfirmed += (spriteFlags & REMIXAPI_SPRITE_SOFT_DEPTH_EXT) && softConfirmed;
+        row.frameBlend += (spriteFlags & REMIXAPI_SPRITE_FRAME_BLEND_EXT) != 0;
+        row.frameMax += (spriteFlags & REMIXAPI_SPRITE_FRAME_MAX_LUMINANCE_EXT) != 0;
+        row.greenAlpha += (spriteFlags & REMIXAPI_SPRITE_GREEN_ALPHA_EXT) != 0;
+        row.sequence += (spriteFlags & REMIXAPI_SPRITE_SEQUENCE_OVER_EXT) != 0;
+        row.modulate += (spriteFlags & REMIXAPI_SPRITE_MODULATE_EXT) != 0;
       }
       if (row.material.empty() || outcome == kParticleFailed)
         row.material = engine_materials::currentName();
@@ -2468,7 +2642,8 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
       dump = g_particlesDumped.insert(rowKey ^ (outcome == kParticleFailed ? 0x5a5a5a5a5a5a5a5aull : 0)).second;
   }
   if (dump)
-    dumpParticleDraw(d, kind, kParticleOutcomeNames[outcome], failure, cameraToWorld != nullptr, streams, first, count,
+    dumpParticleDraw(d, kind, kParticleOutcomeNames[outcome], failure, cameraToWorld != nullptr, spriteFlags, spriteSoft,
+                     softConfirmed, built && (spriteFlags & 0x3f) ? sprites.data() : nullptr, streams, first, count,
                      built ? expanded.data() : nullptr, built ? &result : nullptr);
   // A draw whose shader builds its geometry has nothing to offer the general
   // path (degenerate quads); the others fall back to it.
@@ -2619,7 +2794,8 @@ void onDraw(const Draw &d) {
   // POSITION as it likes (a curve parameter, any type).
   const ParticleKind particle =
       pos && pos->Stream < 4
-          ? particleKind(d, bound, skinnedDraw, d.streams[pos->Stream].dynamic || d.indices.dynamic)
+          ? particleKind(d, bound, skinnedDraw, d.streams[pos->Stream].dynamic || d.indices.dynamic,
+                         multiply && !decalHow)
           : kNotParticle;
   if (!pos || pos->Stream >= 4 || (pos->Type != D3DDECLTYPE_FLOAT3 && particle != kParticleExpanded)) {
     ++g_stats.noPosition;
@@ -2710,7 +2886,7 @@ void onDraw(const Draw &d) {
   // Spritecard or unlit draw is never that pass, whatever texture it holds),
   // and outside the decal, emissive and mesh-cache logic below.
   if (particle != kNotParticle &&
-      submitParticles(d, particle, instanceView, cameraToWorld, categories & ~kDecalCategories, eye))
+      submitParticles(d, particle, instanceView, cameraToWorld, categories & ~kDecalCategories, eye, view.projection))
     return;
   // What else is blended and rebuilt every frame, for the statistics: the
   // candidates the particle rules above did not take.
@@ -3593,6 +3769,16 @@ void onPresent() {
         overlayState.depthCompare = 3; // LESS_OR_EQUAL
         info.pNext = &overlayState;
       }
+      remixapi_InstanceInfoSpriteEXT sprite = {};
+      if (inst.rasterOnly && inst.spriteFlags) {
+        sprite.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_SPRITE_EXT;
+        sprite.pNext = info.pNext;
+        sprite.flags = inst.spriteFlags;
+        sprite.softDistance = inst.spriteSoft[0];
+        sprite.softFadeStart = inst.spriteSoft[1];
+        sprite.softFadeEnd = inst.spriteSoft[2];
+        info.pNext = &sprite;
+      }
       remixapi_InstanceInfoMaskEXT cut = {};
       if (inst.stencilRole == kStencilCut) {
         assignStencilMasks();
@@ -4258,6 +4444,7 @@ void dumpStatistics(FILE *out) {
     // material shader, vertex shader and declaration, the most drawn first.
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
     uint32_t draws = 0, expandedDraws = 0, vertices = 0, triangles = 0, premultiplied = 0, overbright = 0;
+    uint32_t soft = 0, softConfirmed = 0, frameBlend = 0, frameMax = 0, greenAlpha = 0, sequence = 0, modulate = 0;
     uint32_t outcomes[kParticleOutcomes] = {};
     std::vector<const ParticleRow *> rows;
     for (const auto &[key, row] : g_particleRows) {
@@ -4267,6 +4454,8 @@ void dumpStatistics(FILE *out) {
       triangles += row.triangles;
       premultiplied += row.premultiplied;
       overbright += row.overbright;
+      soft += row.soft, softConfirmed += row.softConfirmed, frameBlend += row.frameBlend, frameMax += row.frameMax;
+      greenAlpha += row.greenAlpha, sequence += row.sequence, modulate += row.modulate;
       for (int i = 0; i < kParticleOutcomes; ++i)
         outcomes[i] += row.outcomes[i];
       rows.push_back(&row);
@@ -4288,6 +4477,11 @@ void dumpStatistics(FILE *out) {
             outcomes[kParticleRasterBlended] / f, outcomes[kParticleRasterOther] / f, outcomes[kParticleTraced] / f,
             premultiplied / f, overbright / f, outcomes[kParticleFaded] / f, outcomes[kParticleStencil] / f,
             outcomes[kParticleFailed] / f);
+    fprintf(out,
+            "     sprite overlay draws per frame: soft depth %.2f (scale confirmed by the pixel shader's constants "
+            "%.2f), frames blended %.2f, brighter frame %.2f, green/alpha %.2f, second sequence %.2f, modulate "
+            "(mod2x / multiply) %.2f\n",
+            soft / f, softConfirmed / f, frameBlend / f, frameMax / f, greenAlpha / f, sequence / f, modulate / f);
     for (size_t i = 0; i < rows.size() && i < 16; ++i) {
       const ParticleRow &row = *rows[i];
       fprintf(out, "     %s, %s, vs %016llX: draws %.2f, %.1f quads |", row.shader.c_str(), kParticleKindNames[row.kind],
@@ -4298,7 +4492,12 @@ void dumpStatistics(FILE *out) {
       if (row.outcomes[kParticleFailed])
         fprintf(out, " (%s)", row.failure);
       if (row.secondFrames)
-        fprintf(out, " | second sheet frame on %.0f%% of vertices", 100.0 * row.secondFrames / std::max(row.vertices, 1u));
+        fprintf(out, " | second sheet frame leads on %.0f%% of vertices",
+                100.0 * row.secondFrames / std::max(row.vertices, 1u));
+      if (row.soft || row.frameBlend || row.frameMax || row.greenAlpha || row.sequence || row.modulate)
+        fprintf(out, " | sprite: soft %.2f frames %.2f brighter %.2f green/alpha %.2f sequence %.2f modulate %.2f",
+                row.soft / f, row.frameBlend / f, row.frameMax / f, row.greenAlpha / f, row.sequence / f,
+                row.modulate / f);
       fprintf(out, " | %s %s | [%s]\n", row.outcomes[kParticleFailed] ? "last failing material" : "first material",
               row.material.c_str(), row.declaration.c_str());
     }

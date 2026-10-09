@@ -65,6 +65,7 @@ struct Info {
   // It depends on bone weights or indices (skinning).
   bool skinned = false;
   uint32_t written = 0; // output slots written (1 << Slot)
+  uint32_t varying = 0; // of them, those computed from vertex data (not from constants alone)
   // The output whose rgb carries the vertex colour for the pixel shader (-1:
   // none): the first texture coordinate computed from the COLOR input alone
   // (Source's generic and Sprite shaders pass it in TEXCOORD2; their COLOR0

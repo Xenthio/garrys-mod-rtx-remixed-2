@@ -32,7 +32,12 @@ them. `OPENREMIX_PROXY_PARTICLES=0` turns it off,
 `OPENREMIX_PROXY_PARTICLES_TRACED=1` traces the non-additive ones,
 `OPENREMIX_PROXY_PARTICLE_PATHS=dir/;dir2/` adds material directories, and
 `OPENREMIX_PROXY_DUMP_PARTICLES=1` writes each kind of particle draw once to
-`bin/win64/particles.txt`.
+`bin/win64/particles.txt`. What Spritecard's pixel shader does per pixel
+(sheet frames blended, `$maxlumframeblend1`, `$extractgreenalpha`,
+`$dualsequence`, soft particles by `$depthblend`) and the Modulate shader's
+multiplying blend go to the runtime's sprite overlays
+(`remixapi_InstanceInfoSpriteEXT`); `OPENREMIX_PROXY_PARTICLE_SPRITES=0`
+leaves them out.
 
 ## x64 notes
 

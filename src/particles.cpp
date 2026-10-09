@@ -66,7 +66,10 @@ bool expand(const Request &r, Vertex *out, Result &result, const char **failure)
   }
 
   const bool hasColor = info.colorSlot >= 0, hasAlpha = info.alphaSlot >= 0;
-  const bool frames = r.frameBlend && (info.written & (1u << (vsprog::kTex0 + 1))) && (info.written & (1u << (vsprog::kTex0 + 2)));
+  const bool frames = (r.frameBlend || r.sprites) && (info.written & (1u << (vsprog::kTex0 + 1))) &&
+                      (info.written & (1u << (vsprog::kTex0 + 2)));
+  const bool sequences = r.sprites && (info.written & (1u << (vsprog::kTex0 + 5))) &&
+                         (info.written & (1u << (vsprog::kTex0 + 6))) && (info.written & (1u << (vsprog::kTex0 + 2)));
   uint32_t slots = 1u << vsprog::kPosition | 1u << vsprog::kTex0;
   if (hasColor)
     slots |= 1u << info.colorSlot;
@@ -74,12 +77,14 @@ bool expand(const Request &r, Vertex *out, Result &result, const char **failure)
     slots |= 1u << info.alphaSlot;
   if (frames)
     slots |= 1u << (vsprog::kTex0 + 1) | 1u << (vsprog::kTex0 + 2);
+  if (sequences)
+    slots |= 1u << (vsprog::kTex0 + 2) | 1u << (vsprog::kTex0 + 5) | 1u << (vsprog::kTex0 + 6);
   // The slots in the order vsprog::run writes them.
   thread_local std::vector<float> scratch;
   const size_t block = size_t(r.count) * 4;
   unsigned blocks = 0;
   const float *position = nullptr, *color = nullptr, *alpha = nullptr, *tex0 = nullptr, *tex1 = nullptr,
-              *tex2 = nullptr;
+              *tex2 = nullptr, *tex5 = nullptr, *tex6 = nullptr;
   {
     unsigned index[vsprog::kSlots] = {};
     for (unsigned slot = 0; slot < vsprog::kSlots; ++slot)
@@ -101,6 +106,11 @@ bool expand(const Request &r, Vertex *out, Result &result, const char **failure)
     if (frames) {
       tex1 = base + block * index[vsprog::kTex0 + 1];
       tex2 = base + block * index[vsprog::kTex0 + 2];
+    }
+    if (sequences) {
+      tex2 = base + block * index[vsprog::kTex0 + 2];
+      tex5 = base + block * index[vsprog::kTex0 + 5];
+      tex6 = base + block * index[vsprog::kTex0 + 6];
     }
   }
 
@@ -137,6 +147,8 @@ bool expand(const Request &r, Vertex *out, Result &result, const char **failure)
   result.anyColor = anyColor;
   result.anyAlpha = anyAlpha;
   result.secondFrames = 0;
+  result.frames = r.sprites && frames;
+  result.sequences = sequences;
 
   const uint8_t *encode = encodeTable();
   const float toIndex = 4096.0f / float(result.gain);
@@ -153,7 +165,24 @@ bool expand(const Request &r, Vertex *out, Result &result, const char **failure)
     }
     finite &= std::isfinite(o.position[0] + o.position[1] + o.position[2]);
     const float *uv = tex0 + size_t(v) * 4;
-    if (tex2 && tex2[size_t(v) * 4] > 0.5f) {
+    if (r.sprites) {
+      SpriteVertex &s = r.sprites[v];
+      s = SpriteVertex{};
+      auto finite = [](float value) { return std::isfinite(value) ? value : 0.0f; };
+      if (tex1) {
+        s.frame[0] = finite(tex1[size_t(v) * 4]);
+        s.frame[1] = finite(tex1[size_t(v) * 4 + 1]);
+        s.frame[2] = finite(tex2[size_t(v) * 4]);
+        result.secondFrames += s.frame[2] > 0.5f;
+      }
+      if (tex5) {
+        s.sequence[0] = finite(tex5[size_t(v) * 4]);
+        s.sequence[1] = finite(tex5[size_t(v) * 4 + 1]);
+        s.sequence[2] = finite(tex6[size_t(v) * 4]);
+        s.sequence[3] = finite(tex6[size_t(v) * 4 + 1]);
+        s.weight2 = finite(tex2[size_t(v) * 4 + 2]);
+      }
+    } else if (tex1 && tex2[size_t(v) * 4] > 0.5f) {
       uv = tex1 + size_t(v) * 4;
       ++result.secondFrames;
     }

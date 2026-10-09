@@ -50,6 +50,7 @@ enum : unsigned {
   kSetVertexShaderConstantF = 94,
   kSetStreamSource = 100,
   kSetIndices = 104,
+  kSetPixelShaderConstantF = 109,
   kCreateQuery = 118,
   // IDirect3DQuery9
   kQueryIssue = 6,
@@ -411,6 +412,9 @@ IDirect3DIndexBuffer9 *g_indices = nullptr;
 IDirect3DVertexDeclaration9 *g_decl = nullptr;
 std::unordered_map<IDirect3DVertexDeclaration9 *, std::vector<D3DVERTEXELEMENT9>> g_declElements;
 float g_vsConstants[256 * 4] = {};
+// Pixel shader registers c0..c31 (what Source's shader model 2 shaders use):
+// the factors particle shaders apply per pixel (soft-particle depth scale).
+float g_psConstants[32 * 4] = {};
 IDirect3DSurface9 *g_backBuffer = nullptr;
 IDirect3DSurface9 *g_renderTarget0 = nullptr;
 IDirect3DBaseTexture9 *g_texture0 = nullptr;
@@ -455,6 +459,7 @@ using SetVertexDeclarationFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, 
 using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const DWORD *, IDirect3DVertexShader9 **);
 using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DVertexShader9 *);
 using SetVertexShaderConstantFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const float *, UINT);
+using SetPixelShaderConstantFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const float *, UINT);
 using SetStreamSourceFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, IDirect3DVertexBuffer9 *, UINT,
                                                        UINT);
 using SetIndicesFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DIndexBuffer9 *);
@@ -482,6 +487,7 @@ SetVertexDeclarationFn g_setVertexDeclaration = nullptr;
 CreateVertexShaderFn g_createVertexShader = nullptr;
 SetVertexShaderFn g_setVertexShader = nullptr;
 SetVertexShaderConstantFFn g_setVertexShaderConstantF = nullptr;
+SetPixelShaderConstantFFn g_setPixelShaderConstantF = nullptr;
 SetStreamSourceFn g_setStreamSource = nullptr;
 SetIndicesFn g_setIndices = nullptr;
 CreateQueryFn g_createQuery = nullptr;
@@ -715,6 +721,12 @@ HRESULT STDMETHODCALLTYPE setVertexShaderConstantF(IDirect3DDevice9 *dev, UINT s
   return g_setVertexShaderConstantF(dev, start, data, count);
 }
 
+HRESULT STDMETHODCALLTYPE setPixelShaderConstantF(IDirect3DDevice9 *dev, UINT start, const float *data, UINT count) {
+  if (data && start < 32)
+    std::memcpy(&g_psConstants[start * 4], data, std::min(count, 32 - start) * 16);
+  return g_setPixelShaderConstantF(dev, start, data, count);
+}
+
 HRESULT STDMETHODCALLTYPE setStreamSource(IDirect3DDevice9 *dev, UINT stream, IDirect3DVertexBuffer9 *vb, UINT offset,
                                           UINT stride) {
   ++g_stats.streamSets;
@@ -874,6 +886,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.startIndex = startIndex;
   d.primCount = primCount;
   d.vsConstants = g_vsConstants;
+  d.psConstants = g_psConstants;
   d.vertexShader = g_vertexShader;
   d.vertexProgram = g_vertexProgram.get();
   d.mainTarget = g_renderTarget0 == g_backBuffer;
@@ -1367,6 +1380,7 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kCreateVertexShader, &createVertexShader, g_createVertexShader);
   hookSlot(vt, kSetVertexShader, &setVertexShader, g_setVertexShader);
   hookSlot(vt, kSetVertexShaderConstantF, &setVertexShaderConstantF, g_setVertexShaderConstantF);
+  hookSlot(vt, kSetPixelShaderConstantF, &setPixelShaderConstantF, g_setPixelShaderConstantF);
   hookSlot(vt, kSetStreamSource, &setStreamSource, g_setStreamSource);
   hookSlot(vt, kSetIndices, &setIndices, g_setIndices);
   hookSlot(vt, kCreateQuery, &createQuery, g_createQuery);

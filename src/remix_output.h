@@ -45,6 +45,7 @@ struct Draw {
   const D3DVERTEXELEMENT9 *elements = nullptr; // terminated by D3DDECL_END
   const void *declaration = nullptr;
   const float *vsConstants = nullptr;          // 256 float4 registers
+  const float *psConstants = nullptr;          // 32 float4 pixel shader registers
   const void *vertexShader = nullptr;          // IDirect3DVertexShader9 identity
   const vsprog::Program *vertexProgram = nullptr; // it, decoded (nullptr: not seen at creation)
   const void *texture0 = nullptr;              // texture bound to sampler 0 (base texture)

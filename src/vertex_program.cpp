@@ -403,6 +403,9 @@ std::shared_ptr<const Program> compile(const uint32_t *tokens, size_t maxTokens)
         value |= component;
     return value;
   };
+  for (unsigned slot = 0; slot < kSlots; ++slot)
+    if (slotTaint(slot) & (kFromPosition | kFromOther | kFromColor | kFromBones | kFromShape))
+      info.varying |= 1u << slot;
   const uint8_t position = slotTaint(kPosition);
   info.expands = (position & (kFromOther | kFromColor)) != 0;
   info.skinned = (position & kFromBones) != 0;
