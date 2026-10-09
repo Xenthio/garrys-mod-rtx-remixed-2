@@ -2145,8 +2145,13 @@ bool build(const Bsp &bsp) {
           if (!all && !none)
             mixed.insert(mixed.end(), triangles.begin() + i, triangles.begin() + i + 3);
         }
-        emit(groupFor(centroid, sky, m), first, false);
-        emit(groupFor(centroid, sky, layer.material), second, false);
+        // (groupFor creates the group's surface for the material: only for
+        // triangles. A surface without any makes the runtime reject the whole
+        // mesh of the group, and with it the first layer under the sheets.)
+        if (!first.empty())
+          emit(groupFor(centroid, sky, m), first, false);
+        if (!second.empty())
+          emit(groupFor(centroid, sky, layer.material), second, false);
         if (!mixed.empty()) {
           std::array<int32_t, 5> key = {int32_t(std::floor(centroid[0] / kCell)), int32_t(std::floor(centroid[1] / kCell)),
                                         int32_t(std::floor(centroid[2] / kCell)), 2, sky};
@@ -2388,6 +2393,9 @@ void submit(MaterialLookup lookup) {
     for (auto &[index, geometry] : group.surfaces) {
       if (resolvedOnly && !g_world.materials[index].resolved)
         continue;
+      // CreateMesh rejects a mesh with an empty surface.
+      if (geometry.indices.empty() || geometry.vertices.empty())
+        continue;
       remixapi_MeshInfoSurfaceTriangles s = {};
       s.vertices_values = geometry.vertices.data();
       s.vertices_count = geometry.vertices.size();
@@ -2395,6 +2403,10 @@ void submit(MaterialLookup lookup) {
       s.indices_count = geometry.indices.size();
       s.material = g_world.materials[index].ref.handle;
       surfaces.push_back(s);
+    }
+    if (surfaces.empty()) {
+      group.builtResolved = resolved;
+      return;
     }
     remixapi_MeshInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
