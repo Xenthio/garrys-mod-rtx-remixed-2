@@ -2415,7 +2415,11 @@ bool providesLight(int type, const float position[3], const float direction[3]) 
   if (!g_active)
     return false;
   for (const auto &l : g_world.lights) {
-    if (l.type != type)
+    // A position is one light whatever the engine calls it: it hands surface
+    // (texture) lights to models as points or as spots, and a styled one's
+    // colour changes every frame (kept as its own light, that copy was a new
+    // light each frame).
+    if ((l.type == 2) != (type == 2))
       continue;
     if (type == 2 ? dot(l.direction, direction) > 0.9999f
                   : std::fabs(l.position[0] - position[0]) < .01f && std::fabs(l.position[1] - position[1]) < .01f &&
