@@ -3159,6 +3159,34 @@ void dumpStatistics(FILE *out) {
               b.sharcMilliseconds, b.signatureMilliseconds, b.descriptorMilliseconds, b.primaryMilliseconds,
               b.passesMilliseconds, b.postMilliseconds, b.compositeMilliseconds, b.uiMilliseconds,
               b.snapshotMilliseconds, b.otherMilliseconds, b.presentSetupMilliseconds, b.presentReleaseMilliseconds);
+      // The statistics file holds one interval (and none of this once the
+      // game has closed): every interval also goes to shaderapi_proxy_frames.log.
+      static bool first = true;
+      if (FILE *log = _wfopen((g_moduleDir + L"\\shaderapi_proxy_frames.log").c_str(), first ? L"w" : L"a")) {
+        first = false;
+        SYSTEMTIME now;
+        GetLocalTime(&now);
+        fprintf(log,
+                "%02u:%02u:%02u frames %u record mean %.2f over8 %u over20 %u | slowest record %.2f scene %.2f fence %.2f "
+                "geometry %.2f upload %.2f accel %.2f alloc %.2f conversions %llu allocations %llu uploaded %.2f MiB | "
+                "raster %.2f skin %.2f begin %.2f setup %.2f surfaces %.2f material %.2f temporal %.2f retire %.2f "
+                "traceAccel %.2f table %.2f lighting %.2f sharc %.2f signature %.2f descriptors %.2f primary %.2f "
+                "passes %.2f post %.2f composite %.2f ui %.2f snapshot %.2f other %.2f presentSetup %.2f release %.2f | "
+                "meshes cached %zu lights cached %zu\n",
+                now.wHour, now.wMinute, now.wSecond, g_slowFrame.frames, g_slowFrame.recordSum / n, g_slowFrame.over8,
+                g_slowFrame.over20, p.recordMilliseconds, p.sceneMilliseconds, p.fenceMilliseconds,
+                p.geometryMilliseconds, p.uploadMilliseconds, p.accelerationMilliseconds, p.allocationMilliseconds,
+                static_cast<unsigned long long>(p.geometryConversions),
+                static_cast<unsigned long long>(p.bufferAllocations), p.uploadBytes / 1048576.0,
+                b.rasterPrepareMilliseconds, b.rasterSkinningMilliseconds, b.traceBeginMilliseconds,
+                b.traceSetupMilliseconds, b.traceSurfacesMilliseconds, b.materialMilliseconds, b.temporalMilliseconds,
+                b.retireMilliseconds, b.traceAccelerationMilliseconds, b.tableMilliseconds, b.lightingMilliseconds,
+                b.sharcMilliseconds, b.signatureMilliseconds, b.descriptorMilliseconds, b.primaryMilliseconds,
+                b.passesMilliseconds, b.postMilliseconds, b.compositeMilliseconds, b.uiMilliseconds,
+                b.snapshotMilliseconds, b.otherMilliseconds, b.presentSetupMilliseconds, b.presentReleaseMilliseconds,
+                g_meshes.size(), g_lights.size());
+        fclose(log);
+      }
       g_slowFrame.performance = {};
       g_slowFrame.breakdown = {};
       g_slowFrame.frames = g_slowFrame.over8 = g_slowFrame.over20 = 0;
