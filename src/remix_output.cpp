@@ -2166,6 +2166,38 @@ void shutdown() {
 
 void applyTargetPixels();
 
+// The runtime's slowest frame of the statistics interval (CPU side), with its
+// breakdown: the averages hide a stage that is slow on some frames only.
+struct SlowFrame {
+  std::mutex lock;
+  remixapi_FramePerformanceEXT performance = {};
+  remixapi_FrameBreakdownEXT breakdown = {};
+  uint32_t frames = 0, over8 = 0, over20 = 0;
+  double recordSum = 0;
+} g_slowFrame;
+void sampleFramePerformance() {
+  static auto getPerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
+      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+  static auto getBreakdown = reinterpret_cast<PFN_remixapi_GetFrameBreakdownEXT>(
+      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFrameBreakdownEXT"));
+  remixapi_FramePerformanceEXT performance = {};
+  performance.structSize = sizeof(performance);
+  if (!getPerformance || getPerformance(&performance) != REMIXAPI_ERROR_CODE_SUCCESS)
+    return;
+  std::lock_guard<std::mutex> lock(g_slowFrame.lock);
+  ++g_slowFrame.frames;
+  g_slowFrame.recordSum += performance.recordMilliseconds;
+  g_slowFrame.over8 += performance.recordMilliseconds > 8;
+  g_slowFrame.over20 += performance.recordMilliseconds > 20;
+  if (performance.recordMilliseconds > g_slowFrame.performance.recordMilliseconds) {
+    g_slowFrame.performance = performance;
+    g_slowFrame.breakdown = {};
+    g_slowFrame.breakdown.structSize = sizeof(g_slowFrame.breakdown);
+    if (getBreakdown)
+      getBreakdown(&g_slowFrame.breakdown);
+  }
+}
+
 void onPresent() {
   sampleGpuPasses();
   if (!g_ready)
@@ -2802,6 +2834,7 @@ void onPresent() {
   g_uiCommandMasks.clear();
 
   applyTargetPixels();
+  sampleFramePerformance();
   serviceScreenshotRequest();
   {
     Timer present(g_usPresent);
@@ -3101,6 +3134,36 @@ void dumpStatistics(FILE *out) {
               perf.presentMilliseconds, perf.sceneMilliseconds, perf.recordMilliseconds, perf.geometryMilliseconds,
               perf.uploadMilliseconds, perf.fenceMilliseconds, perf.acquireMilliseconds, perf.submitMilliseconds,
               perf.queuePresentMilliseconds, static_cast<unsigned long long>(perf.geometryConversions));
+    {
+      std::lock_guard<std::mutex> lock(g_slowFrame.lock);
+      const auto &p = g_slowFrame.performance;
+      const auto &b = g_slowFrame.breakdown;
+      const double n = g_slowFrame.frames ? g_slowFrame.frames : 1;
+      fprintf(out,
+              "   runtime record stage over %u frames: mean %.2f ms, over 8 ms on %u, over 20 ms on %u | slowest: record "
+              "%.2f (scene %.2f fence %.2f geometry %.2f upload %.2f acceleration %.2f allocation %.2f; %llu "
+              "conversions, %llu buffer allocations, %.2f MiB uploaded)\n",
+              g_slowFrame.frames, g_slowFrame.recordSum / n, g_slowFrame.over8, g_slowFrame.over20,
+              p.recordMilliseconds, p.sceneMilliseconds, p.fenceMilliseconds, p.geometryMilliseconds,
+              p.uploadMilliseconds, p.accelerationMilliseconds, p.allocationMilliseconds,
+              static_cast<unsigned long long>(p.geometryConversions),
+              static_cast<unsigned long long>(p.bufferAllocations), p.uploadBytes / 1048576.0);
+      fprintf(out,
+              "     its record breakdown: raster prepare %.2f (skinning %.2f) trace begin %.2f setup %.2f surfaces %.2f "
+              "(material %.2f temporal %.2f) retire %.2f acceleration %.2f table %.2f lighting %.2f sharc %.2f "
+              "signature %.2f descriptors %.2f primary %.2f passes %.2f post %.2f composite %.2f ui %.2f snapshot %.2f "
+              "other %.2f | present setup %.2f release %.2f\n",
+              b.rasterPrepareMilliseconds, b.rasterSkinningMilliseconds, b.traceBeginMilliseconds,
+              b.traceSetupMilliseconds, b.traceSurfacesMilliseconds, b.materialMilliseconds, b.temporalMilliseconds,
+              b.retireMilliseconds, b.traceAccelerationMilliseconds, b.tableMilliseconds, b.lightingMilliseconds,
+              b.sharcMilliseconds, b.signatureMilliseconds, b.descriptorMilliseconds, b.primaryMilliseconds,
+              b.passesMilliseconds, b.postMilliseconds, b.compositeMilliseconds, b.uiMilliseconds,
+              b.snapshotMilliseconds, b.otherMilliseconds, b.presentSetupMilliseconds, b.presentReleaseMilliseconds);
+      g_slowFrame.performance = {};
+      g_slowFrame.breakdown = {};
+      g_slowFrame.frames = g_slowFrame.over8 = g_slowFrame.over20 = 0;
+      g_slowFrame.recordSum = 0;
+    }
     // GPU side: per-pass times, tracing and local-light counts.
     auto stat = [](const char *name) { return GetProcAddress(GetModuleHandleW(L"remix.dll"), name); };
     static auto passTimings = reinterpret_cast<decltype(&remixapi_GetGpuPassTimingsEXT)>(stat("remixapi_GetGpuPassTimingsEXT"));
