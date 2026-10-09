@@ -1097,7 +1097,10 @@ SecondLayer secondLayer(int base, bool use) {
     KeyValues kv;
     bool world = false;
     if (loadMaterial(g_world.materials[base].name, kv))
-      for (const char *shader : {"worldvertextransition", "lightmappedgeneric", "lightmapped_4wayblend"})
+      // LightmappedGeneric takes a $basetexture2 too, but does not blend it by
+      // the displacement's alpha: gm_flatgrass paints alpha on FLATGRASS
+      // (LightmappedGeneric) plates and the game shows the first texture there.
+      for (const char *shader : {"worldvertextransition", "lightmapped_4wayblend"})
         world |= kv.shader.rfind(shader, 0) == 0;
     // OPENREMIX_PROXY_BSP_LAYERS=0: the first texture alone, as before.
     static const bool enabled = [] {
