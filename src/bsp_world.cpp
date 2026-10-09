@@ -1908,13 +1908,10 @@ bool build(const Bsp &bsp) {
     if (m < 0)
       continue;
     const TexData &td = texDatas[ti.texData];
-    // The face's plane is already the one it faces along (dface_t::side says
-    // which of a node's two planes that is; it does not flip the normal: on
-    // these maps every face winds clockwise seen from its plane's front, with
-    // empty space there, whatever its side).
+    // dface_t::side: the face looks along the opposite of its plane's normal.
     float normal[3];
     for (int k = 0; k < 3; ++k)
-      normal[k] = planes[face.plane].normal[k];
+      normal[k] = planes[face.plane].normal[k] * (face.side ? -1.0f : 1.0f);
     std::vector<std::array<float, 3>> corners;
     for (int e = 0; e < face.numEdges; ++e) {
       const size_t se = size_t(face.firstEdge + e);
@@ -1935,15 +1932,11 @@ bool build(const Bsp &bsp) {
     for (auto &c : corners)
       for (int k = 0; k < 3; ++k)
         centroid[k] += c[k] / float(corners.size());
-    // Into the leaf in front of the face, and the one behind it: a
-    // displacement's brush is not solid, and its base face may lie flush
-    // against another brush (the skybox floor under a terrain block), so
-    // either side can be the one that is in the skybox's area.
+    // Into the leaf in front of the face.
     const float probe[3] = {centroid[0] + normal[0], centroid[1] + normal[1], centroid[2] + normal[2]};
-    const float behind[3] = {centroid[0] - normal[0], centroid[1] - normal[1], centroid[2] - normal[2]};
     // The 3D skybox: path traced in world space, or left to the engine's
     // sky view (l4d2-rtx keeps its draws).
-    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe) || inSky(behind);
+    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe);
     if (skyboxFace) {
       ++g_world.skyFaces;
       if (!g_world.skyTraced)
