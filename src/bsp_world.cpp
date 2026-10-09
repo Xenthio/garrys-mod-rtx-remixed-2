@@ -537,6 +537,7 @@ struct Material {
   bool maskDropped = false; // the mask was never uploaded: lit instead
   uint32_t categories = 0;
   bool alphaTest = false, modulate = false;
+  bool noCull = false; // $nocull: Source draws both sides
   bool owned = false; // ref.handle created here (water)
   uint8_t alphaRef = 179;
   MaterialRef ref;
@@ -552,6 +553,9 @@ struct Geometry {
 // material) and one instance.
 struct Group {
   bool sky = false, alphaTest = false;
+  // skybox: 3D skybox geometry baked into world space (outside the map's
+  // visibility partition). noCull: $nocull materials, seen from both sides.
+  bool skybox = false, noCull = false;
   uint8_t alphaRef = 0;
   uint32_t categories = 0;
   uint64_t id = 0;
@@ -563,6 +567,8 @@ struct Group {
 // One strip of a studio model (LOD 0): the unit the engine draws, so its
 // dxvk mesh hash (with the base texture's) keys mod mesh replacements.
 struct PropPart {
+  // (Its triangles wind clockwise seen from the front, like the map's faces:
+  // CullStatistics::propAlong / propAgainst.)
   remixapi_MeshHandle mesh = nullptr;
   int material = -1;
   uint64_t replacementHash = 0;
@@ -579,12 +585,15 @@ struct Prop {
   uint64_t id = 0;
   // Seen by the engine's 3D skybox view: drawn by the engine, not here.
   bool skybox = false;
+  // A 3D skybox prop baked into world space (path-traced skybox).
+  bool skyTraced = false;
 };
 
 // info_overlay decals, clipped onto their faces; merged per cell and blend.
 struct OverlayGroup {
   bool modulate = false; // DecalModulate: multiplies the surface (DESTCOLOR, SRCCOLOR)
   bool sky = false;
+  bool skybox = false, noCull = false; // as Group
   uint64_t id = 0;
   std::map<uint32_t, Geometry> surfaces; // by material index
   remixapi_MeshHandle mesh = nullptr;
@@ -613,6 +622,26 @@ struct LayerStatistics {
   std::string names;
 };
 
+// What the camera does not see of the map (remixapi_InstanceInfoCameraCullingEXT;
+// submit()): orientation of what was built, and the instances marked.
+struct CullStatistics {
+  // Faces whose dface_t::side is set: their plane already faces the way they
+  // do (the normal is not flipped). Fan triangles wound against their face
+  // (slivers at collinear vertices), kept. Faces and displacement triangles
+  // by which way they wind seen from the face's front.
+  uint32_t sideFaces = 0, slivers = 0, clockwise = 0, counterClockwise = 0, degenerate = 0;
+  uint32_t dispClockwise = 0, dispCounterClockwise = 0;
+  // Overlay polygons: wound like their face as built, re-wound, and with a
+  // normal pointing to the back of their face.
+  uint32_t overlayKept = 0, overlayRewound = 0, overlayBehind = 0;
+  // Static prop triangles: cross(b - a, c - a) along / against their vertex
+  // normals (against: clockwise seen from the normals' side).
+  uint32_t propAlong = 0, propAgainst = 0, propPartsAlong = 0;
+  // Last submit(): instances with back faces hidden, with unseen clusters
+  // hidden, two-sided ($nocull), and of the 3D skybox (always seen).
+  uint32_t backFaces = 0, visibility = 0, twoSided = 0, skybox = 0, instances = 0;
+};
+
 struct World {
   const remixapi_Interface *api = nullptr;
   std::string map;
@@ -631,6 +660,7 @@ struct World {
   std::map<std::array<int32_t, 5>, OverlayGroup> layerGroups;
   std::unordered_map<int, SecondLayer> secondLayers; // by base material index
   LayerStatistics layers;
+  CullStatistics cull;
   std::unordered_map<std::string, int> overlayMaterialIndex;
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0;
   // Prop placements by 64-unit cell of their origin, for matching engine draws.
@@ -937,6 +967,24 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
 
           std::vector<remixapi_HardcodedVertex> partVertices(vertices.begin() + low, vertices.begin() + high + 1);
           std::vector<uint32_t> partIndices(rebased.begin(), rebased.end());
+          {
+            // Which way the strip winds against its vertex normals.
+            uint32_t along = 0, against = 0;
+            for (size_t i = 0; i + 2 < partIndices.size(); i += 3) {
+              const auto &a = partVertices[partIndices[i]], &b = partVertices[partIndices[i + 1]],
+                         &c = partVertices[partIndices[i + 2]];
+              const float e1[3] = {b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]};
+              const float e2[3] = {c.position[0] - a.position[0], c.position[1] - a.position[1], c.position[2] - a.position[2]};
+              const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+              float d = 0;
+              for (int k = 0; k < 3; ++k)
+                d += n[k] * (a.normal[k] + b.normal[k] + c.normal[k]);
+              ++(d > 0 ? along : against);
+            }
+            g_world.cull.propAlong += along;
+            g_world.cull.propAgainst += against;
+            g_world.cull.propPartsAlong += along > against;
+          }
           remixapi_MeshInfoSurfaceTriangles surface = {};
           surface.vertices_values = partVertices.data();
           surface.vertices_count = partVertices.size();
@@ -1062,6 +1110,7 @@ int materialByName(const std::string &name, bool brush) {
       return slot;
     }
     m.alphaTest = flag("$alphatest");
+    m.noCull = flag("$nocull");
     if (kv.values.count("$alphatestreference")) {
       const float r = float(std::atof(kv.values["$alphatestreference"].c_str()));
       if (r > 0)
@@ -1128,6 +1177,7 @@ SecondLayer secondLayer(int base, bool use) {
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
   m.categories &= ~uint32_t(REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE | REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN);
+  m.noCull = g_world.materials[base].noCull;
   if (m.candidates.empty()) {
     ++stats.noHash;
   } else {
@@ -1377,6 +1427,7 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
       }
       noteSkyReach(moved);
       ++g_world.skyTracedProps;
+      prop.skyTraced = true;
     }
     prop.model = &it->second;
     prop.id = XXH3_64bits_withSeed(&p, sizeof(p), 0x70726f70ull) | 1;
@@ -1466,6 +1517,7 @@ int overlayMaterial(const std::string &name, bool &modulate) {
   if (!loadMaterial(m.name, kv) || !kv.values.count("$basetexture"))
     return slot;
   m.modulate = kv.shader == "decalmodulate";
+  m.noCull = std::atoi(kv.values["$nocull"].c_str()) != 0;
   m.candidates = textureHashes(kv.values["$basetexture"]);
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
@@ -1523,12 +1575,13 @@ template <typename InSky> void loadOverlays(const Bsp &bsp, const InSky &inSky) 
     // 3D skybox overlays stay with the engine, like its faces.
     if (inSky(ov.origin))
       continue;
-    const bool sky = false;
+    const bool sky = false, noCull = g_world.materials[material].noCull;
     std::array<int32_t, 5> key = {int32_t(std::floor(ov.origin[0] / kCell)), int32_t(std::floor(ov.origin[1] / kCell)),
-                                  int32_t(std::floor(ov.origin[2] / kCell)), modulate, sky};
+                                  int32_t(std::floor(ov.origin[2] / kCell)), modulate, int32_t(sky) | (noCull ? 4 : 0)};
     auto &group = g_world.overlayGroups[key];
     group.modulate = modulate;
     group.sky = sky;
+    group.noCull = noCull;
     group.id = XXH3_64bits_withSeed(key.data(), sizeof(key), 0x6f766c79ull) | 1;
     Geometry &g = group.surfaces[uint32_t(material)];
     const uint32_t faceCount = ov.faceCountAndRenderOrder & 0x3fff;
@@ -1572,8 +1625,24 @@ template <typename InSky> void loadOverlays(const Bsp &bsp, const InSky &inSky) 
         const float len = std::sqrt(dot(tn, tn));
         if (len < 1e-8f)
           continue;
+        // The face's triangles wind clockwise seen from its front (faceTriangles
+        // keeps the map's order): -tn is the face's front. The overlay lies on
+        // the side its own normal names, as before; it is wound so that this
+        // side is its front, like the face under it.
+        const bool behind = dot(tn, n) > 0;
+        g_world.cull.overlayBehind += behind;
         for (float &x : tn)
           x /= dot(tn, n) < 0 ? -len : len;
+        float polyArea = 0;
+        for (size_t i = 0; i < poly.size(); ++i) {
+          const Point &p = poly[i], &q = poly[(i + 1) % poly.size()];
+          polyArea += p.p[0] * q.p[1] - q.p[0] * p.p[1];
+        }
+        // Wound like the triangle it is mapped onto (clockwise seen from the
+        // face's front) unless the overlay faces the other way.
+        const bool sameAsFace = (polyArea > 0) == (area > 0);
+        const bool rewind = sameAsFace == behind;
+        ++(rewind ? g_world.cull.overlayRewound : g_world.cull.overlayKept);
         const uint32_t base = uint32_t(g.vertices.size());
         for (const Point &p : poly) {
           // Barycentric coordinates in the overlay plane.
@@ -1588,8 +1657,12 @@ template <typename InSky> void loadOverlays(const Bsp &bsp, const InSky &inSky) 
           vtx.color = 0xffffffff;
           g.vertices.push_back(vtx);
         }
-        for (uint32_t k = 1; k + 1 < poly.size(); ++k)
-          g.indices.insert(g.indices.end(), {base, base + k, base + k + 1});
+        for (uint32_t k = 1; k + 1 < poly.size(); ++k) {
+          if (rewind)
+            g.indices.insert(g.indices.end(), {base, base + k + 1, base + k});
+          else
+            g.indices.insert(g.indices.end(), {base, base + k, base + k + 1});
+        }
         g_world.overlayTriangles += uint32_t(poly.size() - 2);
       }
     }
@@ -1805,14 +1878,19 @@ bool build(const Bsp &bsp) {
   };
 
   constexpr float kCell = 2048;
-  auto groupFor = [&](const float centroid[3], bool sky, int materialIndex) -> Geometry & {
+  // skybox: a face of the 3D skybox baked into world space. Such faces and
+  // $nocull materials get groups of their own (the camera's culling is per
+  // instance); the other groups keep the keys, and so the ids, they had.
+  auto groupFor = [&](const float centroid[3], bool sky, int materialIndex, bool skybox) -> Geometry & {
     const auto &m = g_world.materials[materialIndex];
     std::array<int32_t, 6> key = {int32_t(std::floor(centroid[0] / kCell)), int32_t(std::floor(centroid[1] / kCell)),
-                                  int32_t(std::floor(centroid[2] / kCell)), sky,
+                                  int32_t(std::floor(centroid[2] / kCell)), int32_t(sky) | (skybox ? 2 : 0) | (m.noCull ? 4 : 0),
                                   m.alphaTest ? m.alphaRef + 1 : 0, int32_t(m.categories)};
     auto &group = g_world.groups[key];
     if (!group.id) {
       group.sky = sky;
+      group.skybox = skybox;
+      group.noCull = m.noCull;
       group.alphaTest = m.alphaTest;
       group.alphaRef = m.alphaRef;
       group.categories = m.categories;
@@ -1847,10 +1925,8 @@ bool build(const Bsp &bsp) {
       if (texInfos[face.texInfo].flags & (kSurfSky2D | kSurfSky | kSurfNoDraw | kSurfHint | kSurfSkip | kSurfTrans))
         continue;
       WorldPlane w;
-      const float sign = face.side ? -1.0f : 1.0f;
-      for (int k = 0; k < 3; ++k)
-        w.normal[k] = planes[face.plane].normal[k] * sign;
-      w.dist = planes[face.plane].dist * sign;
+      std::memcpy(w.normal, planes[face.plane].normal, sizeof(w.normal));
+      w.dist = planes[face.plane].dist;
       bool valid = true;
       for (int e = 0; e < face.numEdges && valid; ++e) {
         const size_t se = size_t(face.firstEdge + e);
@@ -1911,10 +1987,15 @@ bool build(const Bsp &bsp) {
     if (m < 0)
       continue;
     const TexData &td = texDatas[ti.texData];
-    // dface_t::side: the face looks along the opposite of its plane's normal.
+    // The face looks along its plane's normal: dface_t::planenum is the face's
+    // own plane and dface_t::side only that plane's parity (vbsp numbers the
+    // two planes of a pair 2n and 2n + 1; the node the face lies on holds the
+    // even one). On gm_construct, gm_flatgrass and gm_7eleven_v6 the parity
+    // equals side for every face, the empty leaf is on the normal's side of
+    // every face with one solid side, the brush the face belongs to is behind
+    // it, and the face's vertices run clockwise seen from that side.
     float normal[3];
-    for (int k = 0; k < 3; ++k)
-      normal[k] = planes[face.plane].normal[k] * (face.side ? -1.0f : 1.0f);
+    std::memcpy(normal, planes[face.plane].normal, sizeof(normal));
     std::vector<std::array<float, 3>> corners;
     for (int e = 0; e < face.numEdges; ++e) {
       const size_t se = size_t(face.firstEdge + e);
@@ -1931,15 +2012,31 @@ bool build(const Bsp &bsp) {
     }
     if (corners.size() != size_t(face.numEdges))
       continue;
+    // Which way the polygon winds seen from its front (twice its area along
+    // the normal, negative: clockwise). The runtime takes a triangle's front
+    // from its winding (clockwise seen from the front): a polygon wound the
+    // other way is emitted reversed.
+    float winding = 0;
+    for (size_t k = 1; k + 1 < corners.size(); ++k) {
+      const float *a = corners[0].data(), *b = corners[k].data(), *c = corners[k + 1].data();
+      const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+      const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+      winding += dot(n, normal);
+    }
+    const bool reversed = winding > 0;
     float centroid[3] = {};
     for (auto &c : corners)
       for (int k = 0; k < 3; ++k)
         centroid[k] += c[k] / float(corners.size());
-    // Into the leaf in front of the face.
+    // Into the leaf in front of the face. A displacement's brush is not solid
+    // and its base face may lie buried in another brush (a terrain block
+    // sunk into the skybox's floor): the leaf behind it counts as well. (For
+    // brush faces it must not: what is behind them is another room.)
     const float probe[3] = {centroid[0] + normal[0], centroid[1] + normal[1], centroid[2] + normal[2]};
+    const float behind[3] = {centroid[0] - normal[0], centroid[1] - normal[1], centroid[2] - normal[2]};
     // The 3D skybox: path traced in world space, or left to the engine's
     // sky view (l4d2-rtx keeps its draws).
-    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe);
+    const bool skyboxFace = skyFace[size_t(f)] != 0 || inSky(probe) || (face.dispInfo >= 0 && inSky(behind));
     if (skyboxFace) {
       ++g_world.skyFaces;
       if (!g_world.skyTraced)
@@ -2058,12 +2155,20 @@ bool build(const Bsp &bsp) {
           else
             triangles.insert(triangles.end(), {i, down, diagonal, i, diagonal, right});
         }
+      // (The grid's triangles wind like the base face's corners.)
+      if (reversed)
+        for (size_t i = 0; i + 2 < triangles.size(); i += 3)
+          std::swap(triangles[i + 1], triangles[i + 2]);
+      g_world.cull.sideFaces += face.side != 0;
       // Smooth normals from the triangles, facing the base surface's side.
       for (size_t i = 0; i + 2 < triangles.size(); i += 3) {
         auto &a = grid[triangles[i]], &b = grid[triangles[i + 1]], &c = grid[triangles[i + 2]];
         const float e1[3] = {b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]};
         const float e2[3] = {c.position[0] - a.position[0], c.position[1] - a.position[1], c.position[2] - a.position[2]};
         float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        // (Against the base's normal: clockwise seen from the base's front.
+        // The rest are overhangs, seen from where the displaced surface faces.)
+        ++(dot(n, normal) < 0 ? g_world.cull.dispClockwise : g_world.cull.dispCounterClockwise);
         if (dot(n, normal) < 0)
           for (float &x : n)
             x = -x;
@@ -2123,7 +2228,7 @@ bool build(const Bsp &bsp) {
       if (layer.material < 0 || (!anyAlpha && !layer.masked)) {
         if (twoLayers)
           ++(layer.material < 0 ? g_world.layers.withoutTexture : g_world.layers.flat);
-        emit(groupFor(centroid, sky, m), triangles, false);
+        emit(groupFor(centroid, sky, m, skyboxFace), triangles, false);
       } else {
         blend.resize(alpha.size());
         const float low = std::clamp(layer.centre - layer.halfWidth, 0.0f, 1.0f),
@@ -2152,14 +2257,18 @@ bool build(const Bsp &bsp) {
         // triangles. A surface without any makes the runtime reject the whole
         // mesh of the group, and with it the first layer under the sheets.)
         if (!first.empty())
-          emit(groupFor(centroid, sky, m), first, false);
+          emit(groupFor(centroid, sky, m, skyboxFace), first, false);
         if (!second.empty())
-          emit(groupFor(centroid, sky, layer.material), second, false);
+          emit(groupFor(centroid, sky, layer.material, skyboxFace), second, false);
         if (!mixed.empty()) {
+          const bool noCull = g_world.materials[m].noCull;
           std::array<int32_t, 5> key = {int32_t(std::floor(centroid[0] / kCell)), int32_t(std::floor(centroid[1] / kCell)),
-                                        int32_t(std::floor(centroid[2] / kCell)), 2, sky};
+                                        int32_t(std::floor(centroid[2] / kCell)), 2,
+                                        int32_t(sky) | (skyboxFace ? 2 : 0) | (noCull ? 4 : 0)};
           auto &group = g_world.layerGroups[key];
           group.sky = sky;
+          group.skybox = skyboxFace;
+          group.noCull = noCull;
           group.id = XXH3_64bits_withSeed(key.data(), sizeof(key), 0x6c61796572ull) | 1;
           emit(group.surfaces[uint32_t(layer.material)], mixed, true);
         }
@@ -2172,13 +2281,26 @@ bool build(const Bsp &bsp) {
       ++g_world.displacements;
     } else if (face.dispInfo < 0) {
       g_world.layers.brushFaces += secondLayer(m, false).present;
-      Geometry &g = groupFor(centroid, sky, m);
+      Geometry &g = groupFor(centroid, sky, m, skyboxFace);
       const uint32_t base = uint32_t(g.vertices.size());
       const size_t firstIndex = g.indices.size();
       for (auto &c : corners)
         g.vertices.push_back(vertex(c.data(), normal, ti, td));
-      for (uint32_t k = 1; k + 1 < corners.size(); ++k)
-        g.indices.insert(g.indices.end(), {base, base + k, base + k + 1});
+      g_world.cull.sideFaces += face.side != 0;
+      ++(winding < 0 ? g_world.cull.clockwise : winding > 0 ? g_world.cull.counterClockwise : g_world.cull.degenerate);
+      for (uint32_t k = 1; k + 1 < corners.size(); ++k) {
+        if (reversed)
+          g.indices.insert(g.indices.end(), {base, base + k + 1, base + k});
+        else
+          g.indices.insert(g.indices.end(), {base, base + k, base + k + 1});
+        // A fan triangle wound against its face: a sliver at collinear
+        // vertices, covered by its neighbours (kept: the map's triangles
+        // are the same with or without culling).
+        const float *a = corners[0].data(), *b = corners[k].data(), *c = corners[k + 1].data();
+        const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        g_world.cull.slivers += winding != 0 && dot(n, normal) * winding < 0;
+      }
       toWorld(g, base, firstIndex);
       g_world.triangles += uint32_t(corners.size() - 2);
       ++g_world.faces;
@@ -2458,6 +2580,42 @@ void submit(MaterialLookup lookup) {
     return;
   }
   g_world.batchValid = false;
+  // What the camera does not see of the map, as in Source: back faces (except
+  // $nocull materials) and what lies in clusters outside the camera cluster's
+  // potentially visible set (the runtime locates the camera and each surface
+  // point in the partition sendPartition() gave it; the 3D skybox, drawn by
+  // Source whatever the PVS says, is exempt). Camera rays only: shadows,
+  // bounces and reflections still meet every instance from both sides, so
+  // lighting is what it was. OPENREMIX_PROXY_BSP_CULL_BACKFACES=0 and
+  // OPENREMIX_PROXY_BSP_CULL_PVS=0 switch each off.
+  static const uint32_t cullEnabled = [] {
+    char v[8] = {};
+    uint32_t flags = REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT | REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT;
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_CULL_BACKFACES", v, sizeof(v)) && v[0] == '0')
+      flags &= ~uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT);
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_CULL_PVS", v, sizeof(v)) && v[0] == '0')
+      flags &= ~uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT);
+    return flags;
+  }();
+  auto &cullStats = g_world.cull;
+  cullStats.backFaces = cullStats.visibility = cullStats.twoSided = cullStats.skybox = cullStats.instances = 0;
+  // Chains the camera culling of an instance in front of info.pNext.
+  auto cameraCulling = [&](remixapi_InstanceInfo &info, remixapi_InstanceInfoCameraCullingEXT &culling, bool noCull,
+                           bool skybox) {
+    culling = {};
+    culling.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_CAMERA_CULLING_EXT;
+    culling.flags = cullEnabled & ~((noCull ? uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT) : 0u) |
+                                    (skybox ? uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT) : 0u));
+    ++cullStats.instances;
+    cullStats.twoSided += noCull;
+    cullStats.skybox += skybox;
+    cullStats.backFaces += (culling.flags & REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT) != 0;
+    cullStats.visibility += (culling.flags & REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT) != 0;
+    if (!culling.flags)
+      return;
+    culling.pNext = info.pNext;
+    info.pNext = &culling;
+  };
   const bool record = beginRecording && endRecording && replayBatch && frame - g_world.stableSince >= 30 &&
                       g_world.batchVersion != g_world.submitVersion &&
                       beginRecording() == REMIXAPI_ERROR_CODE_SUCCESS;
@@ -2482,6 +2640,9 @@ void submit(MaterialLookup lookup) {
     info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
     info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
     info.doubleSided = 1;
+    // Paint is seen from its face's front only, and where its face is.
+    remixapi_InstanceInfoCameraCullingEXT culling;
+    cameraCulling(info, culling, group.noCull, group.skybox);
     api.DrawInstance(&info);
   }
   // Overlays: static decals, blended over the surface below.
@@ -2505,6 +2666,9 @@ void submit(MaterialLookup lookup) {
     info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
     info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
     info.doubleSided = 1;
+    // Paint is seen from its face's front only, and where its face is.
+    remixapi_InstanceInfoCameraCullingEXT culling;
+    cameraCulling(info, culling, group.noCull, group.skybox);
     api.DrawInstance(&info);
   }
   for (auto &[key, group] : g_world.groups) {
@@ -2530,6 +2694,8 @@ void submit(MaterialLookup lookup) {
     info.categoryFlags = group.categories | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
     info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
     info.doubleSided = 1;
+    remixapi_InstanceInfoCameraCullingEXT culling;
+    cameraCulling(info, culling, group.noCull, group.skybox);
     api.DrawInstance(&info);
   }
   for (const auto &prop : g_world.props) {
@@ -2563,6 +2729,10 @@ void submit(MaterialLookup lookup) {
       info.categoryFlags = m.categories;
       std::memcpy(info.transform.matrix, prop.transform, sizeof(info.transform.matrix));
       info.doubleSided = 1;
+      // (A prop is hidden per point like the map, not per leaf list as Source
+      // draws it: see the runtime's VISIBILITY flag.)
+      remixapi_InstanceInfoCameraCullingEXT culling;
+      cameraCulling(info, culling, m.noCull, prop.skyTraced);
       api.DrawInstance(&info);
     }
   }
@@ -2810,6 +2980,34 @@ void dumpStatistics(FILE *out) {
             l.materials, l.displacements, l.displacements ? l.alphaMin : 0.0f, l.alphaMax, l.layered, l.baseTriangles,
             l.secondTriangles, l.blendedTriangles, g_world.layerGroups.size(), meshes, l.flat, l.withoutTexture,
             l.noHash, waiting, l.modulated, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
+  }
+  {
+    const auto &c = g_world.cull;
+    fprintf(out,
+            "   BSP camera culling (camera rays only; OPENREMIX_PROXY_BSP_CULL_BACKFACES / _PVS): instances %u: back "
+            "faces hidden %u, unseen clusters hidden %u | two-sided ($nocull) %u, 3D skybox (always seen) %u\n"
+            "   BSP orientation: faces wound clockwise seen from their plane's front %u, counter-clockwise (emitted "
+            "reversed) %u, without area %u | faces with dface_t::side set (normal no longer flipped) %u | fan slivers "
+            "wound against their face (kept) %u | displacement triangles clockwise from the base's front %u, overhangs "
+            "%u | overlay polygons wound like their face %u, re-wound %u, facing behind their face %u | static prop "
+            "triangles clockwise seen from their normals %u, counter-clockwise %u (strips mostly counter-clockwise %u)\n",
+            c.instances, c.backFaces, c.visibility, c.twoSided, c.skybox, c.clockwise, c.counterClockwise, c.degenerate,
+            c.sideFaces, c.slivers, c.dispClockwise, c.dispCounterClockwise, c.overlayKept, c.overlayRewound,
+            c.overlayBehind, c.propAgainst, c.propAlong, c.propPartsAlong);
+    // The runtime's view of it (last traced frame).
+    static auto get = reinterpret_cast<PFN_remixapi_GetCameraCullingStatisticsEXT>(
+        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetCameraCullingStatisticsEXT"));
+    remixapi_CameraCullingStatisticsEXT r = {};
+    r.structSize = sizeof(r);
+    if (get && get(&r) == REMIXAPI_ERROR_CODE_SUCCESS)
+      fprintf(out,
+              "   runtime camera culling: requested %u, active %u (1 back faces, 2 visibility) | partition %u | camera "
+              "cluster %d (previous frame %d)%s | visible clusters %u of %u, leaves %u of %u | visible-set changes %llu\n",
+              r.requested, r.active, r.partition, r.cameraCluster, r.previousCluster,
+              r.outside ? ", OUTSIDE the world: everything is seen" : "", r.visibleClusters, r.clusterCount,
+              r.visibleLeaves, r.leafCount, (unsigned long long)r.updates);
+    else
+      fprintf(out, "   runtime camera culling: not available (remixapi_GetCameraCullingStatisticsEXT missing)\n");
   }
   if (g_world.skyTraced)
     fprintf(out, "   3D skybox path traced: %u triangles, %u clipped at the map, %u props (in playable space: %u "

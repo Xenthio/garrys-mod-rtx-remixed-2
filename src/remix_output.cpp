@@ -59,7 +59,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, flashlightLitPasses{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
@@ -717,6 +717,7 @@ struct Instance {
   uint64_t replacementHash; // dxvk-remix mesh replacement key (0: none)
   bool persistent;          // mesh from static buffers (cached across frames)
   bool singleSided = false; // blended draw D3D culls: its back faces are not seen
+  bool cameraCullBack = false; // D3D culls its back faces: hidden from the camera only
   std::vector<remixapi_Transform> bones; // skinned instances
   float transform[3][4];
   uint64_t view;
@@ -2258,6 +2259,17 @@ void onDraw(const Draw &d) {
     return GetEnvironmentVariableA("OPENREMIX_PROXY_CULL_BLENDED", v, sizeof(v)) && v[0] == '1';
   }();
   inst.singleSided = cullBlended && d.blend && d.cullMode != D3DCULL_NONE;
+  // Opt-in (OPENREMIX_PROXY_CULL_BACKFACES_MODELS=1), not verified in game:
+  // engine-drawn models hide from the camera the back faces D3D culls
+  // (remixapi_InstanceInfoCameraCullingEXT; shadows and bounces still meet
+  // both sides). Only D3DCULL_CCW, Source's default, whose visible triangles
+  // wind clockwise in world space like the runtime's front faces
+  // (faceNormalSign); a draw with the opposite mode stays two-sided.
+  static const bool cullModels = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_CULL_BACKFACES_MODELS", v, sizeof(v)) && v[0] == '1';
+  }();
+  inst.cameraCullBack = cullModels && !d.blend && !inst.singleSided && d.cullMode == D3DCULL_CCW;
   inst.categories = categories;
   inst.replacementHash = geometry ? geometry ^ baseTextureHash : 0;
   inst.persistent = !(ps.dynamic || d.indices.dynamic);
@@ -2871,6 +2883,14 @@ void onPresent() {
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
       std::memcpy(info.transform.matrix, inst.transform, sizeof(info.transform.matrix));
       info.doubleSided = !inst.singleSided;
+      remixapi_InstanceInfoCameraCullingEXT cameraCulling = {};
+      if (inst.cameraCullBack) {
+        cameraCulling.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_CAMERA_CULLING_EXT;
+        cameraCulling.pNext = info.pNext;
+        cameraCulling.flags = REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT;
+        info.pNext = &cameraCulling;
+        ++g_stats.cameraCulledModels;
+      }
       remixapi_InstanceInfoMaskEXT cut = {};
       if (inst.stencilRole == kStencilCut) {
         assignStencilMasks();
@@ -3640,6 +3660,9 @@ void dumpStatistics(FILE *out) {
           g_stats.haloGroups.exchange(0) / f, g_stats.haloSources.exchange(0) / f, g_stats.maskGroups.exchange(0) / f,
           g_stats.maskSources.exchange(0) / f, g_stats.maskOverlays.exchange(0) / f, g_stats.maskUi.exchange(0) / f,
           g_stats.maskCuts.exchange(0) / f);
+  if (const double culled = g_stats.cameraCulledModels.exchange(0) / f; culled > 0)
+    fprintf(out, "   engine-drawn models with back faces hidden from the camera "
+                 "(OPENREMIX_PROXY_CULL_BACKFACES_MODELS): %.1f per frame\n", culled);
   fprintf(out, "   UI draws %.1f (render-target sampling skipped %.1f, stencil-masked dropped %.1f); CPU texture copies %zu\n",
           g_stats.uiDraws.exchange(0) / f, g_stats.uiNoTexture.exchange(0) / f, g_stats.uiStencil.exchange(0) / f, [] {
             std::lock_guard<std::recursive_mutex> lock(g_textureLock);
