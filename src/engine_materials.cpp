@@ -59,7 +59,7 @@ constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 constexpr uint8_t kTypeTexture = 3, kTypeUndefined = 6;
 // MaterialVarFlags_t.
-constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6;
+constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7;
 
 struct Expected {
   bool shaderApi; // else materialsystem.dll
@@ -509,6 +509,19 @@ void onBind(void *material) {
 const Shading &current() { return g_current; }
 
 const char *currentName() { return g_currentEntry ? g_currentEntry->name.c_str() : ""; }
+
+bool currentIsLitOpaque() {
+  const Entry *e = g_currentEntry;
+  if (!e)
+    return false;
+  bool lit = false;
+  for (const char *shader : {"lightmappedgeneric", "vertexlitgeneric", "worldvertextransition", "lightmapped_4wayblend"})
+    lit |= _strnicmp(e->shaderName.c_str(), shader, std::strlen(shader)) == 0;
+  if (!lit)
+    return false;
+  void *flags = paramAt(*e, e->flags);
+  return flags && !(g_varInt(flags) & kFlagAdditive);
+}
 
 void dumpStatistics(FILE *out) {
   const char *detail = g_detail.load();

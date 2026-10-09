@@ -52,6 +52,10 @@ void onBind(void *material);
 const Shading &current();
 // Its name, for statistics ("" when unknown).
 const char *currentName();
+// The bound material is a lit surface shader (LightmappedGeneric,
+// VertexLitGeneric, WorldVertexTransition, Lightmapped_4WayBlend) without
+// $additive: drawn additively, it is the engine's flashlight pass.
+bool currentIsLitOpaque();
 
 void dumpStatistics(FILE *out);
 

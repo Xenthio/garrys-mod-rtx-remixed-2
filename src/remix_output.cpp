@@ -59,7 +59,7 @@ uint64_t g_frame = 0;
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, flashlightLitPasses{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
@@ -1939,8 +1939,15 @@ void onDraw(const Draw &d) {
     if (const auto lights = engine_lights::current(); lights && !lights->projected.empty()) {
       if (g_worldLists > 0 && d.texture0)
         cookies.insert(d.texture0);
-      if (g_worldLists > 0 || cookies.count(d.texture0) || (!ps.dynamic && opaqueDrawn.count(geometryKey))) {
+      // A third sign: a lit surface material that is not additive itself.
+      // Nothing else draws one additively, and it catches the pass's dynamic
+      // batches (world pieces in the beam, re-cut every frame as the
+      // flashlight moves: each was a new overlay mesh for the runtime to
+      // upload, tens of ms a frame until every piece had been seen).
+      const bool litPass = engine_materials::currentIsLitOpaque();
+      if (g_worldLists > 0 || cookies.count(d.texture0) || (!ps.dynamic && opaqueDrawn.count(geometryKey)) || litPass) {
         ++g_stats.flashlightPasses;
+        g_stats.flashlightLitPasses += litPass;
         return;
       }
     }
@@ -3307,10 +3314,10 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   player body (l4d2-rtx shadow mesh) %.1f\n", g_stats.playerBody.exchange(0) / f);
   fprintf(out, "   rtx.conf texture categories: %zu hashes; ignored/hidden draws %.1f\n", categories::size(),
           g_stats.ignored.exchange(0) / f);
-  fprintf(out, "   depthOnly %.1f additive %.1f other blended %.1f duplicate %.1f; engine flashlight passes dropped %.1f; black additive dropped %.1f\n",
+  fprintf(out, "   depthOnly %.1f additive %.1f other blended %.1f duplicate %.1f; engine flashlight passes dropped %.1f (%.1f by their lit material); black additive dropped %.1f\n",
           g_stats.depthOnly.exchange(0) / f, g_stats.additive.exchange(0) / f, g_stats.blended.exchange(0) / f,
           g_stats.duplicate.exchange(0) / f, g_stats.flashlightPasses.exchange(0) / f,
-          g_stats.additiveBlack.exchange(0) / f);
+          g_stats.flashlightLitPasses.exchange(0) / f, g_stats.additiveBlack.exchange(0) / f);
   {
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
     if (!g_census.empty())
