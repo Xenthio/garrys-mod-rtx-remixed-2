@@ -1198,6 +1198,7 @@ void captureUi(const Draw &d) {
 
 // Converts one indexed draw into a Remix mesh. Returns nullptr when the draw
 // cannot be represented yet.
+float g_liftVertexStep = 0; // added lift per vertex index (render thread; set by onDraw for decals)
 // `normalOffset` > 0 lifts the surface off its receiver (decals, see onDraw):
 // along the vertex normals, or without them (DecalModulate's vertices are a
 // position and a texture coordinate) along the summed face normals, e1 x e2
@@ -1407,7 +1408,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       anyFace |= !(vlen > 1e-6f);
       if (len > 1e-12f)
         for (int j = 0; j < 3; ++j)
-          vertices[v].position[j] += n[j] / len * normalOffset * sign;
+          vertices[v].position[j] += n[j] / len * (normalOffset + std::min(float(v) * g_liftVertexStep, 0.3f)) * sign;
     }
     if (usedFaceNormals)
       *usedFaceNormals = anyFace;
@@ -2119,8 +2120,24 @@ void onDraw(const Draw &d) {
                            (bound.vertexColor || decalAlphaFade);
   if (decalKind == kDecalMod2x && decalMaterial && bound.vertexColor && bound.vertexAlpha)
     ++g_stats.decalModulateFade;
-  constexpr float kDecalOffset = 0.1f; // inches
-  const float lift = lifted ? kDecalOffset : 0;
+  // Decals over decals: all at one height they were coplanar, and which one a
+  // ray met first changed with the camera angle (flicker). The engine draws
+  // them bottom to top, so each draw sits a little above the one before, and
+  // within a draw (a batch of one material's decals) each vertex a little
+  // above the one before it; the next draw starts above the last. Above the
+  // map's overlays (0.1) and its second layers (0.05); in all under the
+  // runtime's attach distance (~2 inches): past kDecalRise they share a height.
+  constexpr float kDecalOffset = 0.15f, kDecalVertexStep = 0.001f, kDecalDrawGap = 0.004f, kDecalRise = 1.2f; // inches
+  static uint64_t decalFrame = ~0ull;
+  static float decalRise = 0; // how far this frame's decals have stacked up
+  if (decalFrame != g_frame) {
+    decalFrame = g_frame;
+    decalRise = 0;
+  }
+  const float lift = lifted ? kDecalOffset + decalRise : 0;
+  if (lifted) // the next draw starts above this one's last vertex
+    decalRise = std::min(decalRise + std::min(float(d.numVertices) * kDecalVertexStep, 0.3f) + kDecalDrawGap, kDecalRise);
+  g_liftVertexStep = lifted ? kDecalVertexStep : 0;
   const float windingSign = lifted ? faceNormalSign(d.cullMode) : 1;
 
   struct Key {
