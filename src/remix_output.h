@@ -98,7 +98,9 @@ void onTextureReleased(const void *texture);
 // IShaderAPI::Bind (engine_materials): the material now bound and its name.
 void onMaterialBound(const engine_materials::Shading &shading, const char *material);
 // Contents read back from a render-target texture the scene samples (32-bit,
-// B8G8R8A8 rows); it becomes the texture's image after this frame's Present.
+// B8G8R8A8 rows). They rewrite the texture's image in place, at once (the
+// runtime's dynamic texture: nothing is created); the first image of a
+// texture makes its record after this frame's Present.
 void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
                     uint32_t pitch);
 // The draw being captured has a perspective projection (not 2D).

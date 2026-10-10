@@ -125,6 +125,12 @@ struct RemixTexture {
   float skyBrightness = 0;
   uint64_t hash = 0;
   std::vector<uint64_t> emissive; // its unlit / self-illuminated variants (g_emissiveMaterials keys)
+  // A render-target texture's contents (onTargetPixels): a dynamic runtime
+  // texture of this size, rewritten in place (remixapi_UpdateTextureEXT).
+  // `hash` is then an identity, not a content hash, and stays for the life
+  // of the record, as do the materials made from it.
+  bool dynamic = false;
+  uint32_t width = 0, height = 0;
   ~RemixTexture();
 };
 // Recursive: a texture record can be released, and its destructor run, while
@@ -4136,22 +4142,79 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
   ++cpu->version;
 }
 
+// --- Render-target contents ---------------------------------------------------
+// A render-target texture the scene samples (a screen the game redraws every
+// frame) is one dynamic runtime texture under a stable identity: each image
+// read back rewrites its pixels in place (remixapi_UpdateTextureEXT), so the
+// texture, its lit material and its unlit / self-illuminated variants are
+// made once. (Under a content hash, as ordinary uploads are, every image was
+// a new texture with new materials: GPU objects made and released every
+// frame.) Ordinary uploads keep their content hash: mods key replacements by it.
+// OPENREMIX_PROXY_TARGET_UPDATE=0, or a runtime without the entry point: a new
+// texture per image, as before.
 struct TargetPixels {
   const void *texture;
   uint32_t width, height;
   D3DFORMAT format;
-  std::vector<uint8_t> pixels;
+  std::vector<uint8_t> pixels; // B8G8R8A8 rows, alpha opaque for X8R8G8B8
 };
-std::vector<TargetPixels> g_targetPixels;
+std::vector<TargetPixels> g_targetPixels; // images whose record is made after Present
+std::atomic<uint32_t> g_targetImages{0}, g_targetUnchanged{0}, g_targetUpdates{0}, g_targetCreated{0},
+    g_targetRecreated{0}, g_targetFailed{0};
+std::atomic<uint64_t> g_usTargetUpdate{0};
+
+PFN_remixapi_UpdateTextureEXT targetUpdateEntry() {
+  static const auto entry = [] {
+    char v[8] = {};
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_TARGET_UPDATE", v, sizeof(v)) && v[0] == '0')
+      return PFN_remixapi_UpdateTextureEXT(nullptr);
+    return reinterpret_cast<PFN_remixapi_UpdateTextureEXT>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateTextureEXT")));
+  }();
+  return entry;
+}
 
 void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
                     uint32_t pitch) {
-  if (!g_ready || !data)
+  if (!g_ready || !data || !width || !height)
     return;
+  ++g_targetImages;
   TargetPixels t = {texture, width, height, format, {}};
   t.pixels.resize(size_t(width) * height * 4);
   for (uint32_t y = 0; y < height; ++y)
     std::memcpy(t.pixels.data() + size_t(y) * width * 4, data + size_t(y) * pitch, width * 4);
+  if (format == D3DFMT_X8R8G8B8)
+    for (size_t i = 3; i < t.pixels.size(); i += 4)
+      t.pixels[i] = 0xff;
+  if (const auto update = targetUpdateEntry()) {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    const auto record = g_textures.find(texture);
+    if (record != g_textures.end() && record->second->dynamic && record->second->width == width &&
+        record->second->height == height) {
+      // The record exists: its pixels change now, in place. Nothing is made
+      // or destroyed, so this needs no frame boundary. An image equal to the
+      // last one (the CPU copy) is not sent at all.
+      const auto copy = g_cpuTextures.find(texture);
+      if (copy != g_cpuTextures.end() && copy->second && copy->second->width == width &&
+          copy->second->height == height && copy->second->format == format && copy->second->data == t.pixels) {
+        ++g_targetUnchanged;
+        return;
+      }
+      LARGE_INTEGER t0, t1, frequency;
+      QueryPerformanceCounter(&t0);
+      const bool updated = update(record->second->texture, 0, 0, width, height, REMIXAPI_FORMAT_B8G8R8A8_SRGB,
+                                  t.pixels.data(), width * 4) == REMIXAPI_ERROR_CODE_SUCCESS;
+      QueryPerformanceCounter(&t1);
+      QueryPerformanceFrequency(&frequency);
+      g_usTargetUpdate += uint64_t((t1.QuadPart - t0.QuadPart) * 1000000 / frequency.QuadPart);
+      if (updated) {
+        ++g_targetUpdates;
+        storeCpuCopy(texture, width, height, format, std::move(t.pixels));
+        return;
+      }
+      ++g_targetFailed; // the record is made again below
+    }
+  }
   for (auto &queued : g_targetPixels)
     if (queued.texture == texture) {
       queued = std::move(t);
@@ -4160,9 +4223,55 @@ void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFOR
   g_targetPixels.push_back(std::move(t));
 }
 
-// After Present: this frame's instances held the previous image's material.
+// A new dynamic record for a render-target texture's first image (or its
+// first of a new size). Returns false when the runtime refused it.
+bool createTargetTexture(TargetPixels &t) {
+  static uint64_t serial = 0;
+  auto record = std::make_shared<RemixTexture>();
+  std::unique_lock<std::recursive_mutex> lock(g_textureLock);
+  // An identity that no upload's content hash names.
+  do {
+    ++serial;
+    record->hash = XXH3_64bits_withSeed(&serial, sizeof(serial), 0x7461726765743264ull);
+  } while (!record->hash || g_texturesByHash.count(record->hash));
+  remixapi_TextureInfoDynamicEXT dynamic = {};
+  dynamic.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_DYNAMIC_EXT;
+  dynamic.dynamic = 1;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.pNext = &dynamic;
+  info.hash = record->hash;
+  info.width = t.width;
+  info.height = t.height;
+  info.depth = 1;
+  info.mipLevels = 1;
+  info.format = REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+  info.data = t.pixels.data();
+  info.dataSize = t.pixels.size();
+  if (g_api.CreateTexture(&info, &record->texture) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    record->texture = nullptr;
+    return false;
+  }
+  record->dynamic = true;
+  record->width = t.width;
+  record->height = t.height;
+  ++g_stats.textures;
+  auto &slot = g_textures[t.texture];
+  g_targetRecreated += slot && slot->dynamic;
+  ++g_targetCreated;
+  std::shared_ptr<RemixTexture> previous = std::move(slot);
+  slot = std::move(record);
+  storeCpuCopy(t.texture, t.width, t.height, t.format, std::move(t.pixels));
+  lock.unlock();
+  previous.reset(); // its materials and texture go: outside the lock
+  return true;
+}
+
+// After Present: this frame's instances held the previous record's materials.
 void applyTargetPixels() {
   for (auto &t : g_targetPixels) {
+    if (targetUpdateEntry() && createTargetTexture(t))
+      continue;
     uint64_t previous = 0;
     {
       std::lock_guard<std::recursive_mutex> lock(g_textureLock);
@@ -4658,6 +4767,50 @@ void dumpStatistics(FILE *out) {
             std::lock_guard<std::recursive_mutex> lock(g_textureLock);
             return g_textures.size();
           }());
+  {
+    // Render-target contents (onTargetPixels) and what the runtime made of
+    // them: with the tool gun out, images arrive every frame and nothing
+    // should be created.
+    const uint32_t images = g_targetImages.exchange(0), updates = g_targetUpdates.exchange(0);
+    fprintf(out, "   render-target images: %.2f per frame (equal to the last, not sent %.2f), updated in place %.2f "
+                 "(%.3f ms each in the call), records created %u (replacing a dynamic one %u), update failures %u%s\n",
+            images / f, g_targetUnchanged.exchange(0) / f, updates / f,
+            g_usTargetUpdate.exchange(0) / (updates ? updates : 1) / 1000.0, g_targetCreated.exchange(0),
+            g_targetRecreated.exchange(0), g_targetFailed.exchange(0),
+            targetUpdateEntry() ? "" : " | in-place updates off: a new texture per image");
+    static const auto statistics = reinterpret_cast<PFN_remixapi_GetTextureStatisticsEXT>(reinterpret_cast<void *>(
+        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetTextureStatisticsEXT")));
+    static remixapi_TextureStatisticsEXT last = {};
+    remixapi_TextureStatisticsEXT now = {};
+    now.structSize = sizeof(now);
+    if (statistics && statistics(&now) == REMIXAPI_ERROR_CODE_SUCCESS) {
+      const double changed = double(now.updates - last.updates), uploads = double(now.uploads - last.uploads);
+      fprintf(out, "   runtime textures per frame: created %.2f destroyed %.2f, materials created %.2f destroyed %.2f | "
+                   "GPU objects: textures made %.2f released %.2f, materials made %.2f released %.2f, making %.3f ms "
+                   "(%.1f KiB staged), releasing %.3f ms | in-place updates: calls %.2f, changed pixels %.2f "
+                   "(%.1f KiB, %.3f ms each), uploads %.2f (%.1f KiB, %.3f ms each) | emissive estimates remade %llu "
+                   "(%.2f ms in all)\n",
+              (now.texturesCreated - last.texturesCreated) / f, (now.texturesDestroyed - last.texturesDestroyed) / f,
+              (now.materialsCreated - last.materialsCreated) / f,
+              (now.materialsDestroyed - last.materialsDestroyed) / f,
+              (now.gpuTexturesCreated - last.gpuTexturesCreated) / f,
+              (now.gpuTexturesDestroyed - last.gpuTexturesDestroyed) / f,
+              (now.gpuMaterialsCreated - last.gpuMaterialsCreated) / f,
+              (now.gpuMaterialsDestroyed - last.gpuMaterialsDestroyed) / f,
+              (now.gpuCreateMilliseconds - last.gpuCreateMilliseconds) / f,
+              (now.gpuCreateBytes - last.gpuCreateBytes) / f / 1024.0,
+              (now.gpuDestroyMilliseconds - last.gpuDestroyMilliseconds) / f,
+              (now.updateCalls - last.updateCalls) / f, changed / f,
+              (now.updateBytes - last.updateBytes) / (changed ? changed : 1) / 1024.0,
+              (now.updateMilliseconds - last.updateMilliseconds) /
+                  (now.updateCalls != last.updateCalls ? double(now.updateCalls - last.updateCalls) : 1),
+              uploads / f, (now.uploadBytes - last.uploadBytes) / (uploads ? uploads : 1) / 1024.0,
+              (now.uploadMilliseconds - last.uploadMilliseconds) / (uploads ? uploads : 1),
+              static_cast<unsigned long long>(now.emissionRefreshes - last.emissionRefreshes),
+              now.emissionRefreshMilliseconds - last.emissionRefreshMilliseconds);
+      last = now;
+    }
+  }
   fprintf(out, "   nonFinite %u rejected %u; camera (%u draws) view row3 %.1f %.1f %.1f proj diag %.3f %.3f %.4f %.3f\n",
           g_stats.nonFinite.exchange(0), g_stats.rejected.exchange(0), g_lastCamera.draws, g_lastCamera.view[12],
           g_lastCamera.view[13], g_lastCamera.view[14], g_lastCamera.projection[0], g_lastCamera.projection[5],

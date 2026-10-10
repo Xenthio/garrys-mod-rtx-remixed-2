@@ -255,35 +255,66 @@ const void *g_renderTargetTexture = nullptr;
 // (a readback costs about 1.3 ms per MiB here, and the upload more).
 // A target that receives 3D or depth-tested draws is a scene view (water
 // reflection, shadows) and is left alone for good.
+//
+// The readback is deferred: leaving the target only issues the copy into the
+// texture's own system-memory surface (and has D3D submit it); the surface is
+// locked when the target is left again in a later frame, or at that frame's
+// Present, when the GPU has long finished the copy. Locking it at once made
+// D3D submit the frame's queued work and wait for the GPU to run it: ~3 ms
+// per readback of which the copy itself is a tenth. The image drawn in frame
+// N is read during frame N + 1 and shown by that frame, as it was before (it
+// used to be read in frame N and applied after its Present).
+// OPENREMIX_PROXY_TARGET_READ_DEFER=0 locks at once, as before.
 namespace targetread {
 constexpr uint32_t kReadSize = 256, kMaxSize = 1024, kWantedFrames = 30;
 struct Live {
   bool scene = false, dirty = false;
   uint64_t wanted = 0; // g_d3dFrame of the last request
+  // The copy issued and not yet read: into `system`, in frame `issued`.
+  IDirect3DSurface9 *system = nullptr;
+  uint32_t width = 0, height = 0;
+  D3DFORMAT format = D3DFMT_UNKNOWN;
+  bool pending = false;
+  uint64_t issued = 0;
 };
 std::unordered_map<const void *, Live> g_live;
-IDirect3DSurface9 *g_small = nullptr, *g_system = nullptr;
+IDirect3DSurface9 *g_small = nullptr; // StretchRect destination, shared (copies are issued in order)
+IDirect3DQuery9 *g_flush = nullptr;   // event query: has D3D submit its queued work without waiting
 uint32_t g_width = 0, g_height = 0;
 D3DFORMAT g_format = D3DFMT_UNKNOWN;
-std::atomic<uint32_t> g_draws{0}, g_reads{0}, g_failures{0};
-std::atomic<uint64_t> g_us{0};
+std::atomic<uint32_t> g_draws{0}, g_reads{0}, g_failures{0}, g_issues{0}, g_superseded{0};
+std::atomic<uint64_t> g_issueUs{0}, g_collectUs{0};
 
+void drop(Live &live) {
+  if (live.system)
+    live.system->Release();
+  live.system = nullptr;
+  live.pending = false;
+  live.width = live.height = 0;
+}
 void release() {
   if (g_small)
     g_small->Release();
-  if (g_system)
-    g_system->Release();
-  g_small = g_system = nullptr;
+  if (g_flush)
+    g_flush->Release();
+  g_small = nullptr;
+  g_flush = nullptr;
   g_width = g_height = 0;
+  for (auto &[texture, live] : g_live)
+    drop(live);
 }
 bool draw();
 void leave(IDirect3DDevice9 *dev, IDirect3DSurface9 *surface);
+void present();
 } // namespace targetread
 
 ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
   const ULONG refs = g_textureRelease(self);
   if (refs == 0) {
-    targetread::g_live.erase(self);
+    if (auto live = targetread::g_live.find(self); live != targetread::g_live.end()) {
+      targetread::drop(live->second);
+      targetread::g_live.erase(live);
+    }
     g_targetTextures.erase(self);
     if (g_renderTargetTexture == self)
       g_renderTargetTexture = nullptr;
@@ -545,6 +576,7 @@ void refreshBackBuffer(IDirect3DDevice9 *dev) {
 HRESULT STDMETHODCALLTYPE present(IDirect3DDevice9 *dev, const RECT *src, const RECT *dst, HWND wnd,
                                   const RGNDATA *dirty) {
   ++g_stats.frames;
+  targetread::present(); // copies issued in earlier frames; before the frame number changes
   ++g_d3dFrame;
   const uint64_t t0 = nowUs();
   // The runtime presents into the game window; D3D9's own presentation there
@@ -1237,47 +1269,107 @@ bool draw() {
   return true;
 }
 
+// Reads the copy issued for `texture` and hands the image to the output.
+void collect(const void *texture, Live &live) {
+  if (!live.pending || !live.system)
+    return;
+  live.pending = false;
+  const uint64_t t0 = nowUs();
+  D3DLOCKED_RECT locked;
+  if (FAILED(live.system->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+    ++g_failures;
+    return;
+  }
+  remix::onTargetPixels(texture, live.width, live.height, live.format, static_cast<const uint8_t *>(locked.pBits),
+                        uint32_t(locked.Pitch));
+  live.system->UnlockRect();
+  ++g_reads;
+  g_collectUs += nowUs() - t0;
+}
+
 // Render target 0 is about to leave `surface` (level 0 of the bound texture).
 void leave(IDirect3DDevice9 *dev, IDirect3DSurface9 *surface) {
-  auto it = g_live.find(g_renderTargetTexture);
+  static const bool defer = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_TARGET_READ_DEFER", v, sizeof(v)) && v[0] == '0');
+  }();
+  const void *const texture = g_renderTargetTexture;
+  auto it = g_live.find(texture);
   if (it == g_live.end() || !it->second.dirty || !surface)
     return;
-  it->second.dirty = false;
-  if (it->second.scene)
+  Live &live = it->second;
+  live.dirty = false;
+  if (live.scene)
     return;
-  const TargetTexture &target = g_targetTextures[g_renderTargetTexture];
+  const TargetTexture &target = g_targetTextures[texture];
   const uint32_t width = std::min(target.width, kReadSize), height = std::min(target.height, kReadSize);
+  // The image of an earlier frame first: its surface receives the new copy.
+  // (A copy issued earlier in this frame is not waited for: the new one
+  // replaces it.)
+  if (live.pending && live.issued != g_d3dFrame)
+    collect(texture, live);
+  else if (live.pending)
+    ++g_superseded;
   const uint64_t t0 = nowUs();
-  if (width != g_width || height != g_height || target.format != g_format) {
-    release();
+  const bool stretch = width != target.width || height != target.height;
+  if (stretch && (width != g_width || height != g_height || target.format != g_format)) {
+    if (g_small)
+      g_small->Release();
+    g_small = nullptr;
+    g_width = g_height = 0;
     if (FAILED(dev->CreateRenderTarget(width, height, target.format, D3DMULTISAMPLE_NONE, 0, FALSE, &g_small,
-                                       nullptr)) ||
-        FAILED(dev->CreateOffscreenPlainSurface(width, height, target.format, D3DPOOL_SYSTEMMEM, &g_system, nullptr))) {
-      release();
+                                       nullptr))) {
+      g_small = nullptr;
       ++g_failures;
       return;
     }
     g_width = width, g_height = height, g_format = target.format;
   }
+  if (!live.system || live.width != width || live.height != height || live.format != target.format) {
+    drop(live);
+    if (FAILED(dev->CreateOffscreenPlainSurface(width, height, target.format, D3DPOOL_SYSTEMMEM, &live.system,
+                                                nullptr))) {
+      live.system = nullptr;
+      ++g_failures;
+      return;
+    }
+    live.width = width, live.height = height, live.format = target.format;
+  }
   IDirect3DSurface9 *source = surface;
-  if (width != target.width || height != target.height) {
+  if (stretch) {
     if (FAILED(dev->StretchRect(surface, nullptr, g_small, nullptr, D3DTEXF_LINEAR))) {
       ++g_failures;
       return;
     }
     source = g_small;
   }
-  D3DLOCKED_RECT locked;
-  if (FAILED(dev->GetRenderTargetData(source, g_system)) ||
-      FAILED(g_system->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+  if (FAILED(dev->GetRenderTargetData(source, live.system))) {
+    live.pending = false;
     ++g_failures;
     return;
   }
-  remix::onTargetPixels(g_renderTargetTexture, width, height, target.format,
-                        static_cast<const uint8_t *>(locked.pBits), uint32_t(locked.Pitch));
-  g_system->UnlockRect();
-  ++g_reads;
-  g_us += nowUs() - t0;
+  live.pending = true;
+  live.issued = g_d3dFrame;
+  ++g_issues;
+  if (defer) {
+    // Nothing presents through D3D (see present): without this the copy
+    // could stay queued until the lock, which would then wait as before.
+    if (!g_flush && FAILED(dev->CreateQuery(D3DQUERYTYPE_EVENT, &g_flush)))
+      g_flush = nullptr;
+    if (g_flush && SUCCEEDED(g_flush->Issue(D3DISSUE_END)))
+      g_flush->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+  }
+  g_issueUs += nowUs() - t0;
+  if (!defer)
+    collect(texture, live);
+}
+
+// The frame ends: the images of targets that were not left again since the
+// frame before (a screen that stopped changing still gets its last image).
+void present() {
+  for (auto &[texture, live] : g_live)
+    if (live.pending && live.issued != g_d3dFrame)
+      collect(texture, live);
 }
 } // namespace targetread
 
@@ -1488,14 +1580,18 @@ void dumpStatistics(FILE *out) {
             g_stats.usSky.exchange(0) / c / 1000, sky::kFaceSize, g_stats.usSkyReadback.exchange(0) / c / 1000);
   }
   {
-    const uint32_t reads = targetread::g_reads.exchange(0);
+    const uint32_t reads = targetread::g_reads.exchange(0), issues = targetread::g_issues.exchange(0);
     size_t scene = 0;
     for (const auto &[texture, live] : targetread::g_live)
       scene += live.scene;
+    // issue: StretchRect, GetRenderTargetData and the flush, when the target
+    // is left; lock: LockRect and the copy out, a frame later.
     fprintf(out, "   render-target contents: %zu textures sampled by the scene (%zu scene views, left alone); 2D draws "
-                 "rasterized %.2f per frame, readbacks %.2f per frame, %.2f ms each, failed %u\n",
-            targetread::g_live.size(), scene, targetread::g_draws.exchange(0) / f, reads / f,
-            targetread::g_us.exchange(0) / (reads ? reads : 1) / 1000.0, targetread::g_failures.exchange(0));
+                 "rasterized %.2f per frame, readbacks issued %.2f and read %.2f per frame (replaced unread %u), "
+                 "issue %.2f ms + lock %.2f ms each, failed %u\n",
+            targetread::g_live.size(), scene, targetread::g_draws.exchange(0) / f, issues / f, reads / f,
+            targetread::g_superseded.exchange(0), targetread::g_issueUs.exchange(0) / (issues ? issues : 1) / 1000.0,
+            targetread::g_collectUs.exchange(0) / (reads ? reads : 1) / 1000.0, targetread::g_failures.exchange(0));
   }
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
