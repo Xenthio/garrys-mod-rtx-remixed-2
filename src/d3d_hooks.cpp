@@ -450,6 +450,7 @@ float g_psConstants[32 * 4] = {};
 IDirect3DSurface9 *g_backBuffer = nullptr;
 IDirect3DSurface9 *g_renderTarget0 = nullptr;
 IDirect3DBaseTexture9 *g_texture0 = nullptr;
+IDirect3DBaseTexture9 *g_texture1 = nullptr;
 DWORD g_renderStates[256] = {};
 // Vertex shaders decoded at creation (vsprog): the draws whose shader builds
 // the geometry (particles) are run through it on the CPU. A shader object's
@@ -708,6 +709,8 @@ HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect
   ++g_stats.textureBinds;
   if (stage == 0)
     g_texture0 = texture;
+  else if (stage == 1)
+    g_texture1 = texture;
 
   return g_setTexture(dev, stage, texture);
 }
@@ -943,6 +946,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.vertexProgram = g_vertexProgram.get();
   d.mainTarget = g_renderTarget0 == g_backBuffer;
   d.texture0 = g_texture0;
+  d.texture1 = g_texture1;
   d.colorWrite = g_renderStates[D3DRS_COLORWRITEENABLE];
   d.blend = g_renderStates[D3DRS_ALPHABLENDENABLE] != 0;
   d.srcBlend = g_renderStates[D3DRS_SRCBLEND];

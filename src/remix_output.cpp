@@ -41,6 +41,8 @@ namespace {
 constexpr unsigned kRegModelViewProj = 4; // c4..c7: model * view * projection (columns)
 constexpr unsigned kRegViewProj = 8;  // c8..c11: view * projection
 constexpr unsigned kRegModel = 58;    // c58..c60: model (object to world) 3x4 rows
+constexpr unsigned kRegEyeIrisU = 50; // c50, c51: Eyes shader iris projection U, V (world position -> iris texture)
+constexpr unsigned kRegFlexScale = 3; // c3.x: 1 while a flex mesh is bound to stream 2, else 0 (cFlexScale)
 constexpr unsigned kRegAmbientUp = 25; // c21..c26: ambient cube +X -X +Y -Y +Z -Z (linear)
 // MaterialMatrixMode_t
 constexpr int kMatrixView = 0;
@@ -66,6 +68,12 @@ struct Stats {
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
+  // Flexed draws (facial animation, see flexScale): rebuilt this frame, and flex streams whose scale was 0.
+  std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0};
+  // Eye draws (the Eyes shader), and the iris overlays made for them.
+  std::atomic<uint32_t> eyes{0}, eyeIrises{0}, eyeRefracts{0};
+  // Rope draws (the Cable shader): with their base texture found by name, and without.
+  std::atomic<uint32_t> cableDraws{0}, cableNoBase{0};
   // Decals (onDraw): by kind (DecalKind order), by what marked them, and how
   // they were lifted off their receiver.
   std::atomic<uint32_t> decalKinds[5] = {};
@@ -113,6 +121,28 @@ struct CachedMesh {
   uint64_t geometry = 0; // dxvk::geometryHash of the draw that built it
 };
 std::unordered_map<uint64_t, CachedMesh> g_meshes;
+// Flexed meshes (faces, see flexScale): one runtime mesh per draw whose
+// vertices are refreshed in place when the flex deltas change
+// (remixapi_MeshInfoRefreshGeometryEXT), so the face stays the same mesh and
+// the same instance from frame to frame: motion vectors and denoiser history,
+// which a new mesh every frame did not have (a talking face smeared).
+struct FlexMesh {
+  remixapi_MeshHandle handle = nullptr;
+  uint64_t lastFrame = 0;
+  uint64_t content = 0; // the flex deltas it was built from (0: at rest)
+  uint32_t bones = 0;
+  uint64_t geometry = 0;
+};
+std::unordered_map<uint64_t, FlexMesh> g_flexMeshes;
+// Diagnostics: cached (static-buffer) meshes built anew, by the material bound
+// at the time, with the cache key of the last two builds. A mesh that is
+// rebuilt every frame is a new mesh, and a new instance, every frame: it has
+// no motion vectors. The key field that differs between the two says why.
+struct MeshBuilds {
+  uint32_t count = 0;
+  uint64_t last[13] = {}, previous[13] = {};
+};
+std::unordered_map<std::string, MeshBuilds> g_meshBuilds; // under g_transientSampleLock
 std::vector<remixapi_MeshHandle> g_transient; // destroyed after Present
 
 // --- Textures and materials ------------------------------------------------
@@ -122,6 +152,7 @@ struct RemixTexture {
   remixapi_TextureHandle texture = nullptr;
   remixapi_MaterialHandle material = nullptr;
   remixapi_MaterialHandle skyMaterial = nullptr; // tinted by rtx.skyBrightness
+  remixapi_MaterialHandle clampMaterial = nullptr; // clamp-to-edge variant (an eye's iris)
   float skyBrightness = 0;
   uint64_t hash = 0;
   std::vector<uint64_t> emissive; // its unlit / self-illuminated variants (g_emissiveMaterials keys)
@@ -315,6 +346,8 @@ RemixTexture::~RemixTexture() {
     g_api.DestroyMaterial(material);
   if (skyMaterial)
     g_api.DestroyMaterial(skyMaterial);
+  if (clampMaterial)
+    g_api.DestroyMaterial(clampMaterial);
   if (texture)
     g_api.DestroyTexture(texture);
 }
@@ -381,6 +414,51 @@ uint64_t maskTextureHash(const std::string &name, bool count = true) {
   if (!mask.resolved)
     g_stats.emissiveMaskNotUploaded += count;
   return mask.resolved;
+}
+
+// The texture's material sampled clamp-to-edge: an iris is projected onto the
+// whole eye and must not repeat beside itself (its border texels are
+// transparent). Otherwise as ensureMaterial.
+remixapi_MaterialHandle clampedMaterialFor(const void *texture) {
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  auto it = g_textures.find(texture);
+  if (it == g_textures.end())
+    return nullptr;
+  RemixTexture &t = *it->second;
+  if (!t.clampMaterial) {
+    wchar_t path[32];
+    swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
+    remixapi_MaterialInfoOpaqueEXT opaque = {};
+    opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.albedoConstant = {1, 1, 1};
+    opaque.opacityConstant = 1;
+    opaque.alphaTestType = 7;
+    opaque.useDrawCallAlphaState = 1;
+    remixapi_MaterialInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+    info.pNext = &opaque;
+    info.hash = t.hash ^ 0xc1a3b0c1a3b0c1a3ull;
+    info.albedoTexture = path;
+    info.filterMode = 1;
+    info.wrapModeU = info.wrapModeV = 3; // clamp to edge (1: repeat)
+    if (g_api.CreateMaterial(&info, &t.clampMaterial) != REMIXAPI_ERROR_CODE_SUCCESS)
+      t.clampMaterial = nullptr;
+  }
+  return t.clampMaterial;
+}
+
+// The lit material of the uploaded texture a name stands for (nullptr: its
+// file gave no hashes, or none of them is uploaded now). For draws whose base
+// texture is not on sampler 0 (onDraw: the Cable shader). The record is held
+// by the engine's D3D texture (g_textures), as a draw's own texture's is.
+remixapi_MaterialHandle materialForName(const std::string &name) {
+  const uint64_t hash = name.empty() ? 0 : maskTextureHash(name, false);
+  if (!hash)
+    return nullptr;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  const auto found = g_texturesByHash.find(hash);
+  const auto texture = found != g_texturesByHash.end() ? found->second.lock() : nullptr;
+  return texture ? ensureMaterial(*texture, 0) : nullptr;
 }
 
 // A draw belongs to the material bound when it reaches D3D, usually. Not
@@ -1233,6 +1311,39 @@ void captureUi(const Draw &d) {
   ++g_stats.uiDraws;
 }
 
+// Flexes (facial animation, common_vs_fxc.h ApplyMorph). Every model
+// declaration ends with POSITION1 (float3, or float4 with the wrinkle weight)
+// and NORMAL1 on stream 2. Without flexes that stream is a buffer of zeros
+// with stride 0; for a flexed strip group studiorender writes this frame's
+// deltas into a dynamic "flex mesh" and binds it there, and the vertex shader
+// adds delta * cFlexScale.x to the position and the normal before skinning.
+// Returns that scale (0: nothing to add). A flex mesh whose deltas are all
+// zero (a face at rest) counts as none: the draw keeps its cached mesh.
+float flexScale(const Draw &d) {
+  const auto *delta = findElement(d.elements, D3DDECLUSAGE_POSITION, 1);
+  if (!delta || delta->Stream >= 4 || (delta->Type != D3DDECLTYPE_FLOAT3 && delta->Type != D3DDECLTYPE_FLOAT4))
+    return 0;
+  const auto &s = d.streams[delta->Stream];
+  if (!s.data || !s.stride)
+    return 0;
+  const float scale = d.vsConstants[kRegFlexScale * 4];
+  if (!std::isfinite(scale) || scale == 0) {
+    ++g_stats.flexUnscaled; // a flex stream with the switch off: not this build's register?
+    return 0;
+  }
+  const int64_t begin = int64_t(s.offset) + (int64_t(d.baseVertex) + d.minIndex) * s.stride;
+  const int64_t bytes = int64_t(d.numVertices) * s.stride;
+  if (begin < 0 || begin + bytes > int64_t(s.size))
+    return 0;
+  for (int64_t at = 0; at + 4 <= bytes; at += 4) {
+    uint32_t word;
+    std::memcpy(&word, s.data + begin + at, 4);
+    if (word & 0x7fffffff) // anything but +-0
+      return scale;
+  }
+  return 0;
+}
+
 // Converts one indexed draw into a Remix mesh. Returns nullptr when the draw
 // cannot be represented yet.
 float g_liftVertexStep = 0; // added lift per vertex index (render thread; set by onDraw for decals)
@@ -1244,10 +1355,18 @@ float g_liftVertexStep = 0; // added lift per vertex index (render thread; set b
 // hides sprites and beams through it, e.g. a holstered gravity gun's beams
 // stay alive at brightness 0); such a draw that is all black adds nothing and
 // yields no mesh, unless `keepBlack` (unlit $vertexcolor surfaces: a black one
-// is still a surface).
+// is still a surface). `flex`: this frame's flex deltas times it are added to
+// the positions and normals (flexScale). `eyeProjection`: the Eyes shader's
+// two iris projection registers; the texture coordinates are then that
+// projection of the skinned position instead of the vertex buffer's.
+// `refresh`: new vertices for the mesh already registered under `hash`
+// (g_flexMeshes), or a plain create when there is none. `eyeScale`: the
+// projected coordinates are scaled by it about the texture's centre.
 remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVertex, uint32_t *boneCount,
                               float normalOffset = 0, bool vertexColors = false, bool keepBlack = false,
-                              float faceNormalSign = 1, bool *usedFaceNormals = nullptr) {
+                              float faceNormalSign = 1, bool *usedFaceNormals = nullptr, float flex = 0,
+                              const float *eyeProjection = nullptr, bool refresh = false,
+                              float eyeScale = 1) {
   Timer timer(g_usBuild);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
@@ -1257,6 +1376,8 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   const auto *col = vertexColors ? findElement(d.elements, D3DDECLUSAGE_COLOR, 0) : nullptr;
   if (col && col->Type != D3DDECLTYPE_D3DCOLOR)
     col = nullptr;
+  const auto *flexPos = flex != 0 ? findElement(d.elements, D3DDECLUSAGE_POSITION, 1) : nullptr;
+  const auto *flexNrm = flex != 0 ? findElement(d.elements, D3DDECLUSAGE_NORMAL, 1) : nullptr;
   uint32_t anyRgb = 0;
   const auto &ps = d.streams[pos->Stream];
 
@@ -1326,6 +1447,13 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       return nullptr;
     }
     std::memcpy(out.position, p, 12);
+    if (flexPos) // this frame's flex delta (see flexScale): the bind pose the bones then move
+      if (const uint8_t *f = fetch(flexPos, v, 12)) {
+        float delta[3];
+        std::memcpy(delta, f, 12);
+        for (int j = 0; j < 3; ++j)
+          out.position[j] += delta[j] * flex;
+      }
     if (!std::isfinite(out.position[0]) || !std::isfinite(out.position[1]) || !std::isfinite(out.position[2])) {
       ++g_stats.nonFinite; // the runtime rejects the whole mesh
       return nullptr;
@@ -1346,6 +1474,17 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       if (!std::isfinite(out.normal[0]) || !std::isfinite(out.normal[1]) || !std::isfinite(out.normal[2]))
         out.normal[0] = out.normal[1] = out.normal[2] = 0;
     }
+    if (flexNrm && flexNrm->Type == D3DDECLTYPE_FLOAT3)
+      if (const uint8_t *f = fetch(flexNrm, v, 12)) {
+        float delta[3], n[3];
+        std::memcpy(delta, f, 12);
+        for (int j = 0; j < 3; ++j)
+          n[j] = out.normal[j] + delta[j] * flex;
+        const float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (std::isfinite(len) && len > 1e-6f)
+          for (int j = 0; j < 3; ++j)
+            out.normal[j] = n[j] / len;
+      }
     out.color = 0xffffffff;
     if (col)
       if (const uint8_t *c = fetch(col, v, 4)) { // D3DCOLOR in memory, the runtime's layout
@@ -1404,6 +1543,29 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     if (maxBone >= kMaxBones) {
       ++g_stats.badRange;
       return nullptr;
+    }
+  }
+
+  // Eyes shader (eyes_vs20): the iris is a planar projection of the world
+  // position, u = dot(c50, (world, 1)), v = dot(c51, (world, 1)), which
+  // studiorender aims along the eyeball's gaze every frame. The world position
+  // is this bind-pose vertex moved by its bones, as the runtime will skin it.
+  if (eyeProjection) {
+    const float *model = d.vsConstants + kRegModel * 4;
+    for (uint32_t v = 0; v < count; ++v) {
+      const float *p = vertices[v].position;
+      float world[3] = {0, 0, 0};
+      for (uint32_t k = 0; k < std::max(bonesPerVertex, 1u); ++k) {
+        const float *m = model + (bonesPerVertex ? bones[size_t(v) * bonesPerVertex + k] : 0) * 12;
+        const float w = bonesPerVertex ? weights[size_t(v) * bonesPerVertex + k] : 1.0f;
+        for (int r = 0; r < 3; ++r)
+          world[r] += w * (m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3]);
+      }
+      for (int a = 0; a < 2; ++a) {
+        const float *e = eyeProjection + a * 4;
+        const float t = e[0] * world[0] + e[1] * world[1] + e[2] * world[2] + e[3];
+        vertices[v].texcoord[a] = std::isfinite(t) ? (t - 0.5f) * eyeScale + 0.5f : 0;
+      }
     }
   }
 
@@ -1477,6 +1639,14 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   info.hash = hash ? hash : 1;
   info.surfaces_values = &surface;
   info.surfaces_count = 1;
+  // remixapi_MeshInfoRefreshGeometryEXT (remix_fo4_ext.h): a structure type and
+  // a chain pointer, nothing else.
+  struct {
+    remixapi_StructType sType;
+    void *pNext;
+  } refreshGeometry = {REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT, nullptr};
+  if (refresh)
+    info.pNext = &refreshGeometry;
   remixapi_MeshHandle handle = nullptr;
   if (g_api.CreateMesh(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
     ++g_stats.rejected;
@@ -1595,6 +1765,8 @@ bool startRemix() {
   // Static world brushes (onPresent) would otherwise make every ray traverse
   // a static and a dynamic acceleration structure.
   g_api.SetConfigVariable("rtx.native.pathtrace.combinedTlas", "1");
+  // Flexed faces are refreshed in place (g_flexMeshes).
+  g_api.SetConfigVariable("rtx.native.meshes.refreshInPlace", "1");
   // OPENREMIX_PROXY_CONFIG="key=value;key=value": runtime settings at startup.
   char config[2048] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_CONFIG", config, sizeof(config))) {
@@ -3039,17 +3211,72 @@ void onDraw(const Draw &d) {
     uint32_t vbVersion, ibVersion, offset, stride;
     int baseVertex;
     uint32_t minIndex, numVertices, startIndex, primCount, type, bonesPerVertex;
+    // The key is hashed as bytes. Without this member its last four were the
+    // structure's tail padding, whatever the stack held: the same draw then
+    // hashed to another mesh from one frame to the next (rebuilt, or one of
+    // several cached copies in turn), each a new instance to the runtime with
+    // no previous frame, so no motion vectors, until the stack happened to
+    // settle (a restart).
+    uint32_t padding;
   } key = {ps.buffer, d.indices.buffer, d.declaration, ps.version, d.indices.version, ps.offset, ps.stride,
-           d.baseVertex, d.minIndex, d.numVertices, d.startIndex, d.primCount, uint32_t(d.type), bonesPerVertex};
-  const uint64_t hash = fnv(&key, sizeof(key)) ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^
-                        (unlitColors ? 0xc0105c0105c0105ull : 0) ^ (decalColors ? 0x0decac0105c0105ull : 0) ^
-                        (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+           d.baseVertex, d.minIndex, d.numVertices, d.startIndex, d.primCount, uint32_t(d.type), bonesPerVertex, 0};
+  static_assert(sizeof(Key) == 3 * sizeof(void *) + 12 * sizeof(uint32_t), "Key must have no padding: it is hashed as bytes");
+  uint64_t hash = fnv(&key, sizeof(key)) ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^
+                  (unlitColors ? 0xc0105c0105c0105ull : 0) ^ (decalColors ? 0x0decac0105c0105ull : 0) ^
+                  (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+  // A flexed draw (see flexScale) changes every frame although its own
+  // buffers are static. `flexContent` names this frame's deltas: the flex
+  // mesh's place and version (0: at rest).
+  const float flex = particle == kNotParticle ? flexScale(d) : 0;
+  uint64_t flexContent = 0;
+  if (flex != 0) {
+    const auto &fs = d.streams[findElement(d.elements, D3DDECLUSAGE_POSITION, 1)->Stream];
+    const struct {
+      const void *buffer;
+      uint32_t version, offset;
+    } flexKey = {fs.buffer, fs.version, fs.offset};
+    flexContent = fnv(&flexKey, sizeof(flexKey)) | 1;
+    ++g_stats.flexed;
+  }
+  // It gets a mesh of its own (g_flexMeshes), apart from the cached at-rest
+  // mesh of the same buffers, and keeps it while the face is at rest between
+  // expressions: one mesh and one instance for as long as it is drawn. Decals
+  // on a flexed face and flexed draws from dynamic buffers stay per frame,
+  // named by their deltas.
+  const bool dynamicBuffers = ps.dynamic || d.indices.dynamic;
+  const uint64_t flexHash = hash ^ 0xf1e8f1e8f1e8f1e8ull;
+  const bool flexTracked = !dynamicBuffers && !lifted && (flex != 0 || g_flexMeshes.count(flexHash) != 0);
+  if (flex != 0 && !flexTracked)
+    hash = fnv(&flexContent, sizeof(flexContent), hash);
+  const bool transientDraw = dynamicBuffers || (flex != 0 && !flexTracked);
 
   remixapi_MeshHandle mesh = nullptr;
   uint32_t boneCount = 0;
   uint64_t geometry = 0;
   bool faceNormals = false, meshBuilt = false;
-  if (ps.dynamic || d.indices.dynamic) {
+  if (flexTracked) {
+    FlexMesh &f = g_flexMeshes[flexHash];
+    if (!f.handle || f.content != flexContent) {
+      const remixapi_MeshHandle refreshed =
+          buildMesh(d, flexHash, bonesPerVertex, &boneCount, 0, unlitColors || decalColors, unlitColors || decalColors,
+                    windingSign, &faceNormals, flex, nullptr, true);
+      if (refreshed) {
+        f.handle = refreshed;
+        f.content = flexContent;
+        f.bones = boneCount;
+        if (!f.geometry)
+          f.geometry = dxvk::geometryHash(d);
+        ++g_stats.flexRefreshed;
+      } else if (!f.handle) {
+        g_flexMeshes.erase(flexHash);
+        return;
+      }
+    }
+    f.lastFrame = g_frame;
+    mesh = f.handle;
+    boneCount = f.bones;
+    geometry = f.geometry;
+  } else if (transientDraw) {
     // Dynamic buffers are rewritten every frame: build, draw once, destroy.
     // (Decals on the world, on displacements and on models all come this
     // way: the engine rebuilds their batches every frame.)
@@ -3060,7 +3287,7 @@ void onDraw(const Draw &d) {
     }
     // Additive as onPresent classifies it (destination factor ONE): raster only.
     mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, additiveDraw || unlitColors || decalColors,
-                     unlitColors || decalColors, windingSign, &faceNormals);
+                     unlitColors || decalColors, windingSign, &faceNormals, flex);
     if (!mesh) {
       g_stats.decalNoMesh += lifted;
       return;
@@ -3086,6 +3313,18 @@ void onDraw(const Draw &d) {
     meshBuilt = true;
     geometry = dxvk::geometryHash(d);
     g_meshes[hash] = {mesh, g_frame, boneCount, geometry};
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      const char *name = engine_materials::currentName();
+      MeshBuilds &b = g_meshBuilds[*name ? name : "(unnamed)"];
+      ++b.count;
+      std::memcpy(b.previous, b.last, sizeof(b.last));
+      const uint64_t fields[13] = {uint64_t(uintptr_t(key.vb)), uint64_t(uintptr_t(key.ib)),
+                                   uint64_t(uintptr_t(key.decl)), key.vbVersion, key.ibVersion, key.offset,
+                                   key.stride, uint64_t(int64_t(key.baseVertex)), key.minIndex, key.numVertices,
+                                   key.startIndex, key.primCount, key.bonesPerVertex};
+      std::memcpy(b.last, fields, sizeof(fields));
+    }
   }
   if (lifted) {
     ++g_stats.decalKinds[decalKind];
@@ -3114,7 +3353,20 @@ void onDraw(const Draw &d) {
 
   Instance inst;
   inst.mesh = mesh;
-  inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+  // Ropes and cables (keyframe_rope, move_rope: the Cable shader) sample their
+  // $bumpmap on sampler 0 and their $basetexture on sampler 1: texture 0 is
+  // cable/cablenormalmap, which as albedo painted every rope in the normal
+  // map's blues and purples. Their material is the bound one's $basetexture,
+  // found by name among the uploaded textures (as emissive masks are); until
+  // that is uploaded a rope goes untextured rather than normal-mapped. Their
+  // COLOR0 is the lighting the engine sampled along the rope on the CPU, so
+  // it is not forwarded: the path tracer lights them.
+  if (bound.known && nameStarts(bound.shader, "cable")) {
+    inst.material = materialForName(engine_materials::current().base);
+    ++(inst.material ? g_stats.cableDraws : g_stats.cableNoBase);
+  } else {
+    inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+  }
   if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
     ++g_stats.emissiveNoTexture;
   if (d.texture0Target)
@@ -3165,7 +3417,7 @@ void onDraw(const Draw &d) {
   inst.cameraCullBack = cullModels && !d.blend && !inst.singleSided && d.cullMode == D3DCULL_CCW;
   inst.categories = categories;
   inst.replacementHash = geometry ? geometry ^ baseTextureHash : 0;
-  inst.persistent = !(ps.dynamic || d.indices.dynamic);
+  inst.persistent = !transientDraw;
   noteReplacementKey(inst.replacementHash);
   inst.texture0 = d.texture0;
   if (boneCount > 1) {
@@ -3187,9 +3439,105 @@ void onDraw(const Draw &d) {
       for (auto &bone : inst.bones)
         premultiply(cameraToWorld, bone.matrix);
   }
+  // EyeRefract (Episode Two and later models, Black Mesa's): sampler 0 is the
+  // cornea's normal map, which as albedo gave the eye every colour of a
+  // normal map. The eye's picture, white included, is the iris texture on
+  // sampler 1, at coordinates the vertex shader projects from the world
+  // position with the same two registers as the Eyes shader (the refraction
+  // through the cornea, which shifts them a little, is left out). The pixel
+  // shader samples the iris at half the projected coordinates about the centre
+  // (its "sphere" coordinates, uv * 0.5 + 0.25: the projection spans the
+  // cornea, the texture the whole eyeball); unscaled the iris came out at half
+  // its size. The eyeball
+  // is submitted with that texture and those coordinates: a mesh of its own,
+  // refreshed in place as the gaze and the head move (g_flexMeshes).
+  if (!d.blend && d.texture1 && bound.known && nameStarts(bound.shader, "eyerefract")) {
+    ++g_stats.eyes;
+    uint32_t eyeBones = 0;
+    g_liftVertexStep = 0;
+    const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1);
+    const uint64_t eyeHash = (dynamicBuffers ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
+    remixapi_MeshHandle eyeMesh =
+        eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
+                                d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers, 0.5f)
+                    : nullptr;
+    if (dynamicBuffers) {
+      if (eyeMesh)
+        g_transient.push_back(eyeMesh);
+    } else if (eyeMaterial) {
+      FlexMesh &f = g_flexMeshes[eyeHash];
+      if (eyeMesh)
+        f.handle = eyeMesh;
+      f.lastFrame = g_frame;
+      eyeMesh = f.handle; // a failed refresh keeps the last one
+      if (!eyeMesh)
+        g_flexMeshes.erase(eyeHash);
+    }
+    if (eyeMesh) {
+      inst.mesh = eyeMesh;
+      inst.material = eyeMaterial;
+      inst.texture0 = d.texture1;
+      inst.persistent = !dynamicBuffers;
+      inst.replacementHash = 0;
+      ++g_stats.eyeRefracts;
+    }
+  }
   if (!stencilRole(d, inst))
     return;
   g_instances.push_back(inst);
+  // Eyes (Source's Eyes shader; not EyeRefract): the draw above is the eyeball
+  // with its sclera texture, sampler 0. The iris and pupil are a second
+  // texture (sampler 1) the pixel shader lays over it by its alpha, at
+  // coordinates the vertex shader projects from the world position. Here:
+  // the same triangles again with those coordinates, as an alpha decal on the
+  // eyeball (lifted a hair off it; the runtime composes decals into their
+  // receiver). The projection follows the gaze and the head, so its texture
+  // coordinates change every frame: one mesh per eye, refreshed in place like
+  // a flexed face (g_flexMeshes), which the tracer refits instead of building
+  // anew and which stays one instance from frame to frame.
+  if (!d.blend && d.texture1 && bound.known && nameStarts(bound.shader, "eyes")) {
+    constexpr float kIrisLift = 0.03f; // inches; an eye is about one across
+    ++g_stats.eyes;
+    uint32_t irisBones = 0;
+    g_liftVertexStep = 0;
+    const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1);
+    // From buffers the engine rewrites (not seen for eyes) it stays per frame.
+    const uint64_t irisHash = (dynamicBuffers ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
+    remixapi_MeshHandle irisMesh =
+        irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false, 1, nullptr, flex,
+                                 d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers)
+                     : nullptr;
+    if (dynamicBuffers) {
+      if (irisMesh)
+        g_transient.push_back(irisMesh);
+    } else if (irisMaterial) {
+      FlexMesh &f = g_flexMeshes[irisHash];
+      if (irisMesh)
+        f.handle = irisMesh;
+      f.lastFrame = g_frame;
+      irisMesh = f.handle; // a failed refresh keeps the last one
+      if (!irisMesh)
+        g_flexMeshes.erase(irisHash);
+    }
+    if (irisMesh) {
+      Instance iris = inst; // same bones / transform, view and culling
+      iris.mesh = irisMesh;
+      iris.material = irisMaterial;
+      iris.texture0 = d.texture1;
+      Draw over = d; // lerp(sclera, iris, iris.a)
+      over.blend = true;
+      over.srcBlend = D3DBLEND_SRCALPHA;
+      over.dstBlend = D3DBLEND_INVSRCALPHA;
+      over.blendOp = D3DBLENDOP_ADD;
+      over.separateAlpha = over.alphaTest = false;
+      iris.blend = blendState(over);
+      iris.categories = categories | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+      iris.persistent = !dynamicBuffers;
+      iris.replacementHash = 0;
+      g_instances.push_back(iris);
+      ++g_stats.eyeIrises;
+    }
+  }
   if (inst.stencilRole == kStencilSourceOnly || inst.stencilRole == kStencilInside)
     return; // marks and overlays: no part in lighting estimates
   if (boneCount) // studio models: their ambient cube samples the surrounding (sky) light
@@ -4008,6 +4356,14 @@ void onPresent() {
       ++it;
     }
   }
+  for (auto it = g_flexMeshes.begin(); it != g_flexMeshes.end();) {
+    if (g_frame - it->second.lastFrame > 600) {
+      g_api.DestroyMesh(it->second.handle);
+      it = g_flexMeshes.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 // Caller holds g_textureLock.
@@ -4733,6 +5089,41 @@ void dumpStatistics(FILE *out) {
             pinned, g_stats.emissiveCreated.exchange(0), g_stats.emissiveEvicted.exchange(0),
             g_stats.emissiveFailed.exchange(0), g_stats.emissiveNoTexture.exchange(0) / f,
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
+  fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f\n",
+          g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f);
+  fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f\n",
+          g_stats.flexed.exchange(0) / f, g_stats.flexRefreshed.exchange(0) / f, g_flexMeshes.size(),
+          g_stats.flexUnscaled.exchange(0) / f);
+  fprintf(out, "   eye draws per frame (Eyes and EyeRefract shaders): %.1f, iris overlays submitted %.1f, EyeRefract eyes retextured %.1f\n",
+          g_stats.eyes.exchange(0) / f, g_stats.eyeIrises.exchange(0) / f, g_stats.eyeRefracts.exchange(0) / f);
+  {
+    // Cached meshes built more than once in the interval (see MeshBuilds).
+    std::lock_guard<std::mutex> lock(g_transientSampleLock);
+    static const char *const kFields[13] = {"vb", "ib", "decl", "vbVersion", "ibVersion", "offset", "stride",
+                                            "baseVertex", "minIndex", "numVertices", "startIndex", "primCount",
+                                            "bonesPerVertex"};
+    std::vector<std::pair<uint32_t, std::string>> order;
+    for (const auto &[name, b] : g_meshBuilds)
+      if (b.count > 1)
+        order.push_back({b.count, name});
+    std::sort(order.rbegin(), order.rend());
+    fprintf(out, "   cached meshes rebuilt (no motion vectors while it lasts): %zu materials with repeated builds\n",
+            order.size());
+    for (size_t i = 0; i < order.size() && i < 12; ++i) {
+      const MeshBuilds &b = g_meshBuilds[order[i].second];
+      std::string changed;
+      for (int k = 0; k < 13; ++k)
+        if (b.last[k] != b.previous[k]) {
+          char text[96];
+          snprintf(text, sizeof(text), " %s %llu -> %llu", kFields[k], (unsigned long long)b.previous[k],
+                   (unsigned long long)b.last[k]);
+          changed += text;
+        }
+      fprintf(out, "     %s: %.2f builds per frame; last two keys differ in:%s\n", order[i].second.c_str(),
+              b.count / f, changed.empty() ? " nothing (a variant flag)" : changed.c_str());
+    }
+    g_meshBuilds.clear();
+  }
   {
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
     fprintf(out, "   draws matched to a material by base texture while another was bound: %zu materials; emissive draws of a "
