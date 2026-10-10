@@ -198,7 +198,18 @@ bool engineRead(const std::string &path, std::vector<uint8_t> *out, uint64_t off
   if (!file)
     return false;
   reinterpret_cast<SeekFn>(vt[4])(fs, file, 0, 2); // FILESYSTEM_SEEK_TAIL
-  const uint64_t total = reinterpret_cast<TellFn>(vt[5])(fs, file);
+  uint64_t total = reinterpret_cast<TellFn>(vt[5])(fs, file);
+  // A file inside a VPK the engine mounted (another game's content: Black
+  // Mesa, the episodes) is left one byte short of its end by a seek to the
+  // tail. Every offset counted from the end was then off by one, and the
+  // texture hashes made from them matched nothing the engine uploaded.
+  // What can still be read from there is the rest of the file.
+  {
+    uint8_t rest[16];
+    const int got = reinterpret_cast<ReadFn>(vt[0])(fs, rest, int(sizeof(rest)), file);
+    if (got > 0 && got < int(sizeof(rest)))
+      total += uint64_t(got);
+  }
   bool ok = true;
   if (size)
     *size = total;

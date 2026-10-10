@@ -1758,7 +1758,10 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
       l.attenuation[0] = l.attenuation[1] = 0, l.attenuation[2] = 1;
     l.thetaDot = w.stopdot;
     l.phiDot = w.stopdot2;
-    l.hash = 0x6c696768745f6273ull ^ (uint64_t(i) * 0x9e3779b97f4a7c15ull);
+    // By index and contents: the index alone named the same light on every
+    // map, so after a map change the renderer found the previous map's light
+    // cached under that name and went on drawing it in place of the new one.
+    l.hash = XXH3_64bits_withSeed(&w, sizeof(w), 0x6c696768745f6273ull ^ (uint64_t(i) * 0x9e3779b97f4a7c15ull)) | 1;
     if (styled) {
       l.style = w.style;
       ++g_world.styleDrivenLights;
