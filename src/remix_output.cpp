@@ -649,8 +649,10 @@ float envScale(const char *name, float fallback) {
 // Source colors are linear intensities with 1/(a0 + a1 d + a2 d^2) falloff in
 // game units. A point light becomes a small sphere of the same radiant
 // intensity (matched at a reference distance when the falloff is not purely
-// quadratic). The runtime shades the distant light as brdf * cos * radiance,
-// i.e. its "radiance" is the irradiance, which is what Source's color is.
+// quadratic). The runtime shades the distant light as brdf * cos * radiance
+// with a Lambert brdf of albedo / pi, where Source lights a surface with
+// albedo * cos * color: the sun's radiance is Source's color times pi (passed
+// as it was, light_environment suns came out at a third of their brightness).
 remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
   static const float lightScale = envScale("OPENREMIX_PROXY_LIGHT_SCALE", 1.0f);
   static const float sunScale = envScale("OPENREMIX_PROXY_SUN_SCALE", 1.0f);
@@ -661,7 +663,8 @@ remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
   remixapi_LightInfoDistantEXT distant = {};
   if (l.type == 2) {
     constexpr float kSunDiameterDegrees = 0.5f;
-    info.radiance = {l.color[0] * sunScale, l.color[1] * sunScale, l.color[2] * sunScale};
+    const float s = sunScale * 3.14159265f;
+    info.radiance = {l.color[0] * s, l.color[1] * s, l.color[2] * s};
     const float len = std::sqrt(l.direction[0] * l.direction[0] + l.direction[1] * l.direction[1] +
                                 l.direction[2] * l.direction[2]);
     if (len < 1e-6f)
@@ -1531,9 +1534,11 @@ bool startRemix() {
   remixapi_StartupInfo startup = {};
   startup.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
   startup.hwnd = g_gameWindow;
+  // Before SDL wraps the window in Startup: the game's own window procedure.
+  const auto gameProc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC));
   if (g_api.Startup(&startup) != REMIXAPI_ERROR_CODE_SUCCESS)
     return false;
-  remix_ui::install(g_gameWindow, &g_api);
+  remix_ui::install(g_gameWindow, &g_api, gameProc);
   // OPENREMIX_PROXY_BACKEND=pathtrace|raster (runtime default: raster).
   char backend[32] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_BACKEND", backend, sizeof(backend)))

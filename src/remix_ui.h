@@ -14,7 +14,8 @@ namespace proxy::remix_ui {
 // subclassed here, and while the panel is open its input goes to the
 // panel's SDL queue instead of the game (as l4d2-rtx + bridge do).
 // Call on the thread that ran remixapi Startup (it owns the window's events).
-void install(HWND window, remixapi_Interface *api);
+// `gameProc`: the window procedure the game had before SDL wrapped the window.
+void install(HWND window, remixapi_Interface *api, WNDPROC gameProc);
 
 // Restores the window procedure (before the runtime releases its window).
 void uninstall();

@@ -14,6 +14,7 @@ namespace {
 
 HWND g_window = nullptr;
 WNDPROC g_previous = nullptr;
+WNDPROC g_gameProc = nullptr;
 remixapi_Interface *g_api = nullptr;
 bool g_active = false;
 char g_status[160] = "not installed";
@@ -269,17 +270,24 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     } else if (forward(message, w, l)) {
       return 0;
     }
+  } else if (message == WM_SETCURSOR && g_gameProc) {
+    // SDL's window procedure answers WM_SETCURSOR with its own cursor (an
+    // arrow) on every mouse move over the client area, which the game then
+    // hides again: a flickering cursor during mouse look on Windows. With the
+    // panel closed the cursor is the game's alone.
+    return CallWindowProcW(g_gameProc, window, message, w, l);
   }
   return CallWindowProcW(g_previous, window, message, w, l);
 }
 
 } // namespace
 
-void install(HWND window, remixapi_Interface *api) {
+void install(HWND window, remixapi_Interface *api, WNDPROC gameProc) {
   if (g_previous || !window || !api)
     return;
   g_window = window;
   g_api = api;
+  g_gameProc = gameProc;
   g_previous = reinterpret_cast<WNDPROC>(
       SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&windowProc)));
   std::snprintf(g_status, sizeof(g_status), "window %p subclassed %d (window thread %lu, startup thread %lu)",
@@ -296,6 +304,7 @@ void uninstall() {
   if (g_active)
     setCursorVisible(false);
   g_active = false;
+  g_gameProc = nullptr;
   std::snprintf(g_status, sizeof(g_status), "uninstalled");
 }
 

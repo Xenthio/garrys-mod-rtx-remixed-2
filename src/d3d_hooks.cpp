@@ -38,6 +38,7 @@ enum : unsigned {
   kUpdateSurface = 30,
   kUpdateTexture = 31,
   kSetRenderTarget = 37,
+  kClear = 43,
   kSetRenderState = 57,
   kSetTexture = 65,
   kDrawPrimitive = 81,
@@ -96,7 +97,7 @@ uint64_t nowUs() {
 
 struct Stats {
   std::atomic<uint64_t> usPresent{0}, usLock{0};
-  std::atomic<uint32_t> frames{0}, dip{0}, dp{0}, dipUP{0}, dpUP{0}, depthDraws{0}, occlusionQueries{0}, occluderDraws{0}, queriesVisible{0}, queriesHidden{0}, rtChanges{0}, textureBinds{0};
+  std::atomic<uint32_t> frames{0}, dip{0}, dp{0}, dipUP{0}, dpUP{0}, depthDraws{0}, occlusionQueries{0}, occluderDraws{0}, occluderClears{0}, queriesVisible{0}, queriesHidden{0}, rtChanges{0}, textureBinds{0};
   std::atomic<uint32_t> vsConstCalls{0}, streamSets{0}, partialTextureLocks{0};
   std::atomic<uint32_t> vertexPrograms{0}; // vertex shaders decoded since launch
   std::atomic<uint64_t> dipPrims{0};
@@ -522,6 +523,8 @@ SetPixelShaderConstantFFn g_setPixelShaderConstantF = nullptr;
 SetStreamSourceFn g_setStreamSource = nullptr;
 SetIndicesFn g_setIndices = nullptr;
 CreateQueryFn g_createQuery = nullptr;
+using ClearFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, const D3DRECT *, DWORD, D3DCOLOR, float, DWORD);
+ClearFn g_clear = nullptr;
 QueryIssueFn g_queryIssue = nullptr;
 QueryGetDataFn g_queryGetData = nullptr;
 // Occlusion queries between Issue(BEGIN) and Issue(END).
@@ -892,6 +895,23 @@ HRESULT STDMETHODCALLTYPE queryIssue(IDirect3DQuery9 *query, DWORD flags) {
       g_openOcclusion.erase(query);
   }
   return g_queryIssue(query, flags);
+}
+
+// A depth clear takes the occluders with it: the engine clears depth between
+// the views of a frame (3D skybox, then the main view), so occluders drawn
+// for a query of the skybox view were gone, and never redrawn, by the time
+// the main view tested its glows and the sun against them. The next query on
+// this target draws them again, with that view's matrices.
+HRESULT STDMETHODCALLTYPE clear(IDirect3DDevice9 *dev, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color,
+                                float z, DWORD stencil) {
+  if (flags & D3DCLEAR_ZBUFFER) {
+    auto it = g_occludersDrawn.find(g_renderTarget0);
+    if (it != g_occludersDrawn.end() && it->second == g_d3dFrame) {
+      g_occludersDrawn.erase(it);
+      ++g_stats.occluderClears;
+    }
+  }
+  return g_clear(dev, count, rects, flags, color, z, stencil);
 }
 
 HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, IDirect3DQuery9 **out) {
@@ -1462,6 +1482,7 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kCreateVertexBuffer, &createVertexBuffer, g_createVertexBuffer);
   hookSlot(vt, kCreateIndexBuffer, &createIndexBuffer, g_createIndexBuffer);
   hookSlot(vt, kSetRenderTarget, &setRenderTarget, g_setRenderTarget);
+  hookSlot(vt, kClear, &clear, g_clear);
   hookSlot(vt, kSetTexture, &setTexture, g_setTexture);
   hookSlot(vt, kSetRenderState, &setRenderState, g_setRenderState);
   hookSlot(vt, kDrawPrimitive, &drawPrimitive, g_drawPrimitive);
@@ -1553,10 +1574,11 @@ void requestTargetContents(const void *texture) { wantTargetContents(texture); }
 void dumpStatistics(FILE *out) {
   const uint32_t frames = g_stats.frames.exchange(0);
   const double f = frames ? frames : 1;
-  fprintf(out, "== D3D9 per frame (%u frames): DIP %.1f (%.0f prims) DP %.1f DIPUP %.1f DPUP %.1f, depth DIP %.1f (occlusion queries %.1f: visible %.1f hidden %.1f; occluder passes %.1f)\n",
+  fprintf(out, "== D3D9 per frame (%u frames): DIP %.1f (%.0f prims) DP %.1f DIPUP %.1f DPUP %.1f, depth DIP %.1f (occlusion queries %.1f: visible %.1f hidden %.1f; occluder passes %.1f, depth clears after one %.1f)\n",
           frames, g_stats.dip.exchange(0) / f, g_stats.dipPrims.exchange(0) / f, g_stats.dp.exchange(0) / f,
           g_stats.dipUP.exchange(0) / f, g_stats.dpUP.exchange(0) / f, g_stats.depthDraws.exchange(0) / f, g_stats.occlusionQueries.exchange(0) / f,
-          g_stats.queriesVisible.exchange(0) / f, g_stats.queriesHidden.exchange(0) / f, g_stats.occluderDraws.exchange(0) / f);
+          g_stats.queriesVisible.exchange(0) / f, g_stats.queriesHidden.exchange(0) / f, g_stats.occluderDraws.exchange(0) / f,
+          g_stats.occluderClears.exchange(0) / f);
   fprintf(out, "   ms/frame in D3D9: Present %.2f, buffer Lock %.2f\n", g_stats.usPresent.exchange(0) / f / 1000,
           g_stats.usLock.exchange(0) / f / 1000);
   fprintf(out, "   buffer shadow copies per frame: %.1f (%.2f MiB, %.2f ms), whole-buffer locks %.1f\n",
