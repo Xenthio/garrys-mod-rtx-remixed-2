@@ -69,6 +69,43 @@ uint32_t countSlots(const void *const *vtbl) {
   return n;
 }
 
+// The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
+// -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
+// name, at run time) and creates an IDirect3DDevice9Ex nothing here sees: the
+// game then runs without the proxy's D3D hooks. The original looks the switch
+// up when it connects (tier0's ICommandLine::FindParm), so it is appended to
+// the command line before the original is loaded.
+// ICommandLine slots, as the original calls them in GMod x64: AppendParm 5
+// (after CreateCmdLine x2, GetCmdLine, CheckParm, RemoveParm), ParmValue
+// (name, int) 7, FindParm 10.
+void forceNoD3D9Ex() {
+  constexpr char kSwitch[] = "-nod3d9ex";
+  HMODULE tier0 = GetModuleHandleW(L"tier0.dll");
+  auto get = tier0 ? reinterpret_cast<void *(*)()>(GetProcAddress(tier0, "CommandLine_Tier0")) : nullptr;
+  void *commandLine = get ? get() : nullptr;
+  if (!commandLine) {
+    log("proxy: no tier0 command line; pass -nod3d9ex yourself");
+    return;
+  }
+  void **vt = *static_cast<void ***>(commandLine);
+  const auto [begin, end] = codeRangeOf(vt[0]);
+  for (int slot : {5, 10})
+    if (reinterpret_cast<uintptr_t>(vt[slot]) < begin || reinterpret_cast<uintptr_t>(vt[slot]) >= end) {
+      log("proxy: tier0 command line vtable not as expected; pass -nod3d9ex yourself");
+      return;
+    }
+  using FindParmFn = int (*)(void *, const char *);
+  using AppendParmFn = void (*)(void *, const char *, const char *);
+  const auto findParm = reinterpret_cast<FindParmFn>(vt[10]);
+  if (findParm(commandLine, kSwitch)) {
+    log("proxy: -nod3d9ex given");
+    return;
+  }
+  reinterpret_cast<AppendParmFn>(vt[5])(commandLine, kSwitch, nullptr);
+  log("proxy: -nod3d9ex appended to the command line (%s)",
+      findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
+}
+
 bool loadOriginal() {
   if (g_orig)
     return true;
@@ -77,6 +114,7 @@ bool loadOriginal() {
   g_dir = path;
   g_dir.resize(g_dir.find_last_of(L"\\/"));
   g_log = _wfopen((g_dir + L"\\shaderapi_proxy.log").c_str(), L"w");
+  forceNoD3D9Ex();
   g_orig = LoadLibraryW((g_dir + L"\\shaderapidx9_orig.dll").c_str());
   if (!g_orig) {
     log("proxy: failed to load shaderapidx9_orig.dll (%lu)", GetLastError());
