@@ -137,11 +137,20 @@ bool isSkyDraw(const Draw &draw);
 // The 2D skybox as six BGRA faces (proxy::sky::faceBasis, kFaceSize square):
 // becomes the dome light (environment and background). Returns whether the
 // faces differed from the dome's (false: nothing was resampled or uploaded).
-bool setSkyFaces(const uint8_t *const faces[6]);
+void setSkyFaces(const uint8_t *const faces[6]);
+// A dome was made from faces given since the last call (the faces are
+// compared and resampled on another thread, some frames after they are given).
+bool takeSkyChanged();
 // Counts the times the dome was dropped (a new map): faces captured before
 // belong to another sky.
 uint32_t skyEpoch();
 
 void dumpStatistics(FILE *out);
+// Around the statistics thread's whole dump (shaderapi_proxy_spikes.log says
+// whether a slow frame fell within one).
+void noteStatisticsDump(bool begin);
+// The thread that presents and how long its current frame has run (ms since
+// the last onPresent began); false before the first frame.
+bool frameInProgress(unsigned long &thread, double &milliseconds);
 
 } // namespace proxy::remix

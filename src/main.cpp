@@ -10,6 +10,7 @@
 #include "remix_output.h"
 #include "vtable_proxy.h"
 
+#include <algorithm>
 #include <tlhelp32.h>
 
 #include <cstdarg>
@@ -412,6 +413,81 @@ DWORD WINAPI profilerThread(void *) {
   }
 }
 
+// Dev aid (OPENREMIX_PROXY_STALLS=<ms>): what the presenting thread runs in
+// the frames that take longer than <ms>. It is sampled only while its frame
+// has already run that long, so shaderapi_proxy_stalls.txt (rewritten every
+// 10 s, for those 10 s) holds the stalls alone: "<samples> <ip> < <code addresses up its
+// stack>" (a scan of the stack's top, not an unwind: stale addresses may show).
+DWORD WINAPI stallThread(void *parameter) {
+  const double limit = double(reinterpret_cast<uintptr_t>(parameter));
+  std::map<std::string, unsigned> counts;
+  HANDLE thread = nullptr;
+  DWORD opened = 0;
+  static DWORD64 stack[384];
+  ULONGLONG written = GetTickCount64();
+  unsigned samples = 0;
+
+  for (;;) {
+    Sleep(1);
+    unsigned long id = 0;
+    double ms = 0;
+    if (proxy::remix::frameInProgress(id, ms) && ms > limit && ms < 1000) {
+      if (id != opened) {
+        if (thread)
+          CloseHandle(thread);
+        thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, id);
+        opened = id;
+      }
+      CONTEXT context = {};
+      context.ContextFlags = CONTEXT_CONTROL;
+      DWORD64 pc = 0;
+      size_t n = 0;
+      if (thread && SuspendThread(thread) != DWORD(-1)) {
+        // While suspended: no allocation, no locks.
+        if (GetThreadContext(thread, &context)) {
+          pc = context.Rip;
+          MEMORY_BASIC_INFORMATION region = {};
+          if (VirtualQuery(reinterpret_cast<void *>(context.Rsp), &region, sizeof(region)) &&
+              region.State == MEM_COMMIT) {
+            const uintptr_t end = uintptr_t(region.BaseAddress) + region.RegionSize;
+            n = std::min<size_t>(std::size(stack), (end - context.Rsp) / sizeof(DWORD64));
+            std::memcpy(stack, reinterpret_cast<void *>(context.Rsp), n * sizeof(DWORD64));
+          }
+        }
+        ResumeThread(thread);
+      }
+      if (pc) {
+        std::string chain = symbolAt(pc);
+        unsigned found = 0;
+        for (size_t i = 0; i < n && found < 14; ++i) {
+          const auto range = codeRangeOf(reinterpret_cast<void *>(stack[i]));
+          if (range.first && stack[i] >= range.first && stack[i] < range.second) {
+            chain += " < " + symbolAt(stack[i]);
+            ++found;
+          }
+        }
+        ++counts[chain];
+        ++samples;
+      }
+    }
+    if (GetTickCount64() - written > 10000) {
+      written = GetTickCount64();
+      std::vector<std::pair<unsigned, std::string>> sorted;
+      for (const auto &[chain, count] : counts)
+        sorted.emplace_back(count, chain);
+      std::sort(sorted.rbegin(), sorted.rend());
+      if (FILE *f = _wfopen((g_dir + L"\\shaderapi_proxy_stalls.txt").c_str(), L"w")) {
+        fprintf(f, "%u samples in frames over %.0f ms\n", samples, limit);
+        for (const auto &[count, chain] : sorted)
+          fprintf(f, "%u %s\n", count, chain.c_str());
+        fclose(f);
+      }
+      counts.clear(); // each file is its own 10 s
+      samples = 0;
+    }
+  }
+}
+
 // Per-slot call counts to shaderapi_proxy_slots.txt every 10 s.
 DWORD WINAPI statisticsThread(void *) {
   for (int tick = 0;; ++tick) {
@@ -420,6 +496,7 @@ DWORD WINAPI statisticsThread(void *) {
       scanForRealPointers();
     FILE *f = _wfopen((g_dir + L"\\shaderapi_proxy_slots.txt").c_str(), L"w");
     if (f) {
+      proxy::remix::noteStatisticsDump(true);
       proxy::d3d::dumpStatistics(f);
       proxy::engine_patches::dumpStatistics(f);
       proxy::engine_nocull::dumpStatistics(f);
@@ -428,6 +505,7 @@ DWORD WINAPI statisticsThread(void *) {
       proxy::engine_materials::dumpStatistics(f);
       proxy::dumpStatistics(f);
       fclose(f);
+      proxy::remix::noteStatisticsDump(false);
     }
   }
 }
@@ -448,6 +526,10 @@ extern "C" __declspec(dllexport) void *CreateInterface(const char *name, int *re
     threadsStarted = true;
     CloseHandle(CreateThread(nullptr, 0, statisticsThread, nullptr, 0, nullptr));
     CloseHandle(CreateThread(nullptr, 0, profilerThread, nullptr, 0, nullptr));
+    char stalls[16] = {};
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_STALLS", stalls, sizeof(stalls)) && std::atoi(stalls) > 0)
+      CloseHandle(CreateThread(nullptr, 0, stallThread, reinterpret_cast<void *>(uintptr_t(std::atoi(stalls))), 0,
+                               nullptr));
   }
   return wrapInterface(name, g_origCreateInterface(name, returnCode));
 }

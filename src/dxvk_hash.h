@@ -10,6 +10,10 @@ namespace proxy::dxvk {
 // Texture hash: XXH3_64bits of mip 0 as the game wrote it, rows packed at a
 // 4-byte aligned pitch (d3d9_common_texture.cpp SetupForRtxFrom).
 uint64_t textureHash(const uint8_t *packedMip0, size_t size);
+// The same with rtx.useObsoleteHashOnTextureUpload (XXH64, seed 0), which the
+// Garry's Mod compatibility mod's configuration set: its mods and generated
+// material files (~gmod_topbr) key by this hash.
+uint64_t legacyTextureHash(const uint8_t *packedMip0, size_t size);
 
 // Geometry asset hash for rtx.geometryAssetHashRuleString =
 // positions,indices,geometrydescriptor (d3d9_rtx_geometry.cpp, rtx_hashing):

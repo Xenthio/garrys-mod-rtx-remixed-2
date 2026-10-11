@@ -1089,6 +1089,23 @@ int materialByName(const std::string &name, bool brush) {
     opaque.opacityConstant = std::clamp(0.35f + 40.0f / std::max(fogEnd, 1.0f), 0.35f, 0.9f);
     opaque.roughnessConstant = 0.05f;
     opaque.alphaTestType = 7;
+    // Mods made for the fixed-function compatibility mod replace water by
+    // the texture its addon drew every water surface with ("rtx/water":
+    // dev/dev_monitor), since Source's own water has no base texture. Water
+    // here answers to that key (OPENREMIX_PROXY_WATER_KEY: another hash in
+    // hex, 0 for none), so such a mod's water material takes its place; with
+    // no mod the fog-coloured surface above stays.
+    static const uint64_t waterKey = [] {
+      char value[32] = {};
+      if (GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_KEY", value, sizeof(value)))
+        return uint64_t(std::strtoull(value, nullptr, 16));
+      const auto hashes = textureHashes("dev/dev_monitor");
+      return hashes.empty() ? uint64_t(0) : hashes[0];
+    }();
+    remixapi_MaterialInfoReplacementHashEXT replacement = {};
+    replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
+    replacement.materialHash = waterKey;
+    opaque.pNext = waterKey ? &replacement : nullptr;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;

@@ -1014,13 +1014,14 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
 // and then (due) its draws (dynamic-buffer draws inside DrawWorldLists,
 // remix::isSkyDraw) are rasterized again into six world-aligned cube faces
 // around the camera, with the game's shaders and constants and only the
-// matrix registers replaced; the faces are read back at Present and become
-// the Remix dome (remix::setSkyFaces).
+// matrix registers replaced; the faces are read back at the Presents after
+// it, one a frame, and become the Remix dome (remix::setSkyFaces) when they
+// differ from the one there is.
 // The faces accumulate: they are cleared for a new map only, so a face the
 // engine does not draw in some frame (it may skip those behind the camera)
 // keeps what an earlier capture put there.
-// A capture reads 6 * kFaceSize^2 * 4 bytes back (24 MiB) and, when the sky
-// changed, resamples and uploads the dome, so captures are spaced: from
+// A capture reads 6 * kFaceSize^2 * 4 bytes back (6 MiB) and, when the sky
+// changed, resamples (on another thread) and uploads the dome, so captures are spaced: from
 // kSkyInterval frames, doubling up to kSkyMaxInterval while the sky stays the
 // same, and never costing more than 1 / kSkyCostFactor of the time. A sky
 // texture not seen since the map began (a face coming into view) captures
@@ -1034,6 +1035,8 @@ struct Faces {
   IDirect3DDevice9 *device = nullptr;
   IDirect3DSurface9 *targets[6] = {}, *readback[6] = {};
   bool failed = false, captured = false;
+  int reading = -1;                 // the face read back at this Present (-1: none)
+  uint64_t readUs = 0;              // spent on the capture being read
   bool reset = true;                // the targets hold nothing of this map's sky
   uint32_t epoch = 0;               // remix::skyEpoch() the faces belong to
   uint64_t captureFrame = ~0ull, lastCapture = 0, interval = kSkyInterval, notBeforeUs = 0;
@@ -1051,6 +1054,7 @@ void release() {
   }
   g.device = nullptr;
   g.captured = false;
+  g.reading = -1;
   g.reset = true; // new targets start undefined
 }
 
@@ -1236,45 +1240,60 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
     oldDepth->Release();
 }
 
-// At Present: read this frame's faces back and hand them to the dome.
+// At Present: read the captured faces back and hand them to the dome. A
+// readback waits for the GPU to have drawn the face and copies 1 MiB, so the
+// faces are read one a frame, from the frame after the capture.
 void finish(IDirect3DDevice9 *dev) {
-  if (g.captured && g.epoch != remix::skyEpoch())
-    g.captured = false; // captured before the map changed
-  if (!g.captured || g.device != dev)
+  if (g.epoch != remix::skyEpoch())
+    g.captured = false, g.reading = -1; // captured before the map changed
+  if (g.device != dev)
     return;
-  g.captured = false;
-  g.lastCapture = g_d3dFrame;
-  ++g_stats.skyCaptures;
-  const uint64_t t0 = nowUs();
-  const uint8_t *pointers[6];
-  bool read = true;
-  for (int f = 0; f < 6 && read; ++f) {
-    // One sequential copy out of the locked surface; the dome reads the copy.
-    D3DLOCKED_RECT locked;
-    read = SUCCEEDED(dev->GetRenderTargetData(g.targets[f], g.readback[f])) &&
-           SUCCEEDED(g.readback[f]->LockRect(&locked, nullptr, D3DLOCK_READONLY));
-    if (!read)
-      break;
-    g.pixels[f].resize(size_t(sky::kFaceSize) * sky::kFaceSize * 4);
-    for (UINT y = 0; y < sky::kFaceSize; ++y)
-      std::memcpy(g.pixels[f].data() + size_t(y) * sky::kFaceSize * 4,
-                  static_cast<uint8_t *>(locked.pBits) + size_t(y) * locked.Pitch, sky::kFaceSize * 4);
-    g.readback[f]->UnlockRect();
-    pointers[f] = g.pixels[f].data();
+  if (g.captured) {
+    // This frame's capture: read from the next Present (again, if the faces
+    // of the capture before it were still being read).
+    g.captured = false;
+    g.lastCapture = g_d3dFrame;
+    g.reading = 0;
+    g.readUs = 0;
+    return;
   }
+  if (g.reading < 0)
+    return;
+  const uint64_t t0 = nowUs();
+  const int f = g.reading;
+  // One sequential copy out of the locked surface; the dome reads the copy.
+  D3DLOCKED_RECT locked;
+  if (FAILED(dev->GetRenderTargetData(g.targets[f], g.readback[f])) ||
+      FAILED(g.readback[f]->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+    ++g_stats.skyFailures;
+    g.reading = -1;
+    return;
+  }
+  g.pixels[f].resize(size_t(sky::kFaceSize) * sky::kFaceSize * 4);
+  for (UINT y = 0; y < sky::kFaceSize; ++y)
+    std::memcpy(g.pixels[f].data() + size_t(y) * sky::kFaceSize * 4,
+                static_cast<uint8_t *>(locked.pBits) + size_t(y) * locked.Pitch, sky::kFaceSize * 4);
+  g.readback[f]->UnlockRect();
   const uint64_t t1 = nowUs();
   g_stats.usSkyReadback += t1 - t0;
-  bool changed = false;
-  if (!read)
-    ++g_stats.skyFailures;
-  else if ((changed = remix::setSkyFaces(pointers)))
-    ++g_stats.skyUpdates;
-  // An unchanged sky is looked at less and less often; a changing one as
-  // often as its cost allows.
+  g.readUs += t1 - t0;
+  if (++g.reading < 6)
+    return;
+  g.reading = -1;
+  ++g_stats.skyCaptures;
+  const uint8_t *pointers[6];
+  for (int i = 0; i < 6; ++i)
+    pointers[i] = g.pixels[i].data();
+  remix::setSkyFaces(pointers);
+  // An unchanged sky is looked at less and less often; one whose dome was
+  // replaced since the last capture as often as its cost allows.
+  const bool changed = remix::takeSkyChanged();
+  g_stats.skyUpdates += changed;
   g.interval = changed ? kSkyInterval : std::min(g.interval * 2, kSkyMaxInterval);
   const uint64_t t2 = nowUs();
-  g_stats.usSky += t2 - t0;
-  g.notBeforeUs = t2 + (t2 - t0) * kSkyCostFactor;
+  g.readUs += t2 - t1;
+  g_stats.usSky += g.readUs;
+  g.notBeforeUs = t2 + g.readUs * kSkyCostFactor;
 }
 } // namespace skycap
 

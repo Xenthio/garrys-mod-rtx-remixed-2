@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace proxy::remix {
@@ -89,7 +90,10 @@ struct Stats {
 struct Timer {
   LARGE_INTEGER start;
   std::atomic<uint32_t> &sink; // 32-bit: a 64-bit atomic add is a locked cmpxchg8b loop on x86
-  explicit Timer(std::atomic<uint32_t> &s) : sink(s) { QueryPerformanceCounter(&start); }
+  std::atomic<uint32_t> *total; // never reset (wraps): per-frame differences for logFrameSpike
+  explicit Timer(std::atomic<uint32_t> &s, std::atomic<uint32_t> *t = nullptr) : sink(s), total(t) {
+    QueryPerformanceCounter(&start);
+  }
   ~Timer() {
     static const double usPerTick = [] {
       LARGE_INTEGER f;
@@ -98,7 +102,10 @@ struct Timer {
     }();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    sink.fetch_add(uint32_t(double(now.QuadPart - start.QuadPart) * usPerTick), std::memory_order_relaxed);
+    const auto us = uint32_t(double(now.QuadPart - start.QuadPart) * usPerTick);
+    sink.fetch_add(us, std::memory_order_relaxed);
+    if (total)
+      total->fetch_add(us, std::memory_order_relaxed);
   }
 };
 std::atomic<uint64_t> g_transientVerts{0}, g_transientIndices{0};
@@ -107,6 +114,14 @@ std::unordered_map<const void *, uint32_t> g_transientDecls; // declaration -> t
 // Microseconds per statistics interval (10 s).
 std::atomic<uint32_t> g_usDraw{0}, g_usBuild{0}, g_usSubmit{0}, g_usPresent{0}, g_usFrame{0}, g_usBsp{0};
 LARGE_INTEGER g_lastPresent = {};
+// For logFrameSpike: the same timers without the statistics reset (draw,
+// mesh build, present submit, BSP world, Present call), the last frame's
+// length, and when the statistics thread's dump began and ended (ms ticks).
+std::atomic<uint32_t> g_totalUs[5] = {};
+double g_frameIntervalMs = 0;
+std::atomic<uint64_t> g_statisticsBegan{0}, g_statisticsEnded{0};
+std::atomic<int64_t> g_frameBegan{0}; // QueryPerformanceCounter at the last onPresent
+std::atomic<unsigned long> g_frameThread{0};
 
 // Keys for this session's caches and identities (draw state, views, lights).
 // (Formerly FNV-1a, byte by byte: a hot spot at ~1200 draws per frame.)
@@ -155,6 +170,9 @@ struct RemixTexture {
   remixapi_MaterialHandle clampMaterial = nullptr; // clamp-to-edge variant (an eye's iris)
   float skyBrightness = 0;
   uint64_t hash = 0;
+  // dxvk::legacyTextureHash of the upload (0: none): a second key mods may
+  // replace its material by (remixapi_MaterialInfoReplacementHashEXT).
+  uint64_t legacyHash = 0;
   std::vector<uint64_t> emissive; // its unlit / self-illuminated variants (g_emissiveMaterials keys)
   // A render-target texture's contents (onTargetPixels): a dynamic runtime
   // texture of this size, rewritten in place (remixapi_UpdateTextureEXT).
@@ -282,6 +300,11 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
     opaque.opacityConstant = 1;
     opaque.alphaTestType = 7; // always pass (0 would discard everything)
     opaque.useDrawCallAlphaState = 1; // alpha test/blend come from each draw (InstanceInfoBlendEXT)
+    remixapi_MaterialInfoReplacementHashEXT replacement = {};
+    replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
+    replacement.materialHash = t.legacyHash;
+    if (t.legacyHash && !sky)
+      opaque.pNext = &replacement;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
@@ -1367,7 +1390,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
                               float faceNormalSign = 1, bool *usedFaceNormals = nullptr, float flex = 0,
                               const float *eyeProjection = nullptr, bool refresh = false,
                               float eyeScale = 1) {
-  Timer timer(g_usBuild);
+  Timer timer(g_usBuild, &g_totalUs[1]);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
   const auto *boneIndices = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0);
@@ -1815,6 +1838,24 @@ remixapi_LightHandle g_skyDome = nullptr;
 remixapi_TextureHandle g_skyTexture = nullptr;
 uint64_t g_skyTextureHash = 0;
 uint32_t g_skyEpoch = 0;
+// The dome is resampled from the faces off the game's thread (2M texels) and
+// handed to the runtime at a later Present (applySkyDome).
+struct SkyJob {
+  std::thread thread;
+  std::atomic<bool> done{false};
+  bool running = false;
+  bool slight = false; // a slight difference from the dome makes a new one
+  bool update = false; // its verdict: rgba is a new dome
+  uint32_t epoch = 0;
+  uint64_t hash = 0;
+  std::vector<uint8_t> faces[6], rgba;
+  std::vector<uint16_t> reference, blocks; // g_skyBlocks then; these faces'
+} g_skyJob;
+// Per face, the sums of its 8x8 texel blocks (B, G, R) of the faces the dome
+// was last made from: what a capture is compared with.
+std::vector<uint16_t> g_skyBlocks;
+ULONGLONG g_skyDomeTick = 0; // when the dome was last replaced
+bool g_skyChanged = false;   // a dome was made since takeSkyChanged
 
 uint32_t skyEpoch() { return g_skyEpoch; }
 
@@ -1828,73 +1869,118 @@ static void resetSky() {
   g_skyDome = nullptr;
   g_skyTexture = nullptr;
   g_skyTextureHash = 0;
+  g_skyBlocks.clear();
   ++g_skyEpoch;
 }
 
-bool setSkyFaces(const uint8_t *const faces[6]) {
-  if (!g_ready)
-    return false;
-  constexpr uint32_t kWidth = proxy::sky::kDomeWidth, kHeight = proxy::sky::kDomeHeight, S = proxy::sky::kFaceSize;
-  // The faces identify the dome: unchanged ones cost neither the resampling
-  // nor a texture upload.
-  uint64_t hash = kWidth;
+void setSkyFaces(const uint8_t *const faces[6]) {
+  if (!g_ready || g_skyJob.running)
+    return; // the capture before this one is still being looked at
+  if (g_skyJob.thread.joinable())
+    g_skyJob.thread.join();
+  constexpr uint32_t S = proxy::sky::kFaceSize;
   for (int f = 0; f < 6; ++f)
-    hash = XXH3_64bits_withSeed(faces[f], size_t(S) * S * 4, hash);
-  hash |= 1;
-  if (hash == g_skyTextureHash)
-    return false;
-  float bases[6][3][3];
-  for (int f = 0; f < 6; ++f)
-    proxy::sky::faceBasis(f, bases[f][0], bases[f][1], bases[f][2]);
-  std::vector<float> cosPhi(kWidth), sinPhi(kWidth);
-  for (uint32_t u = 0; u < kWidth; ++u) {
-    const float phi = ((u + 0.5f) / kWidth - 0.5f) * 6.28318531f;
-    cosPhi[u] = std::cos(phi);
-    sinPhi[u] = std::sin(phi);
-  }
-  static std::vector<uint8_t> rgba; // kept (8 MiB)
-  rgba.resize(size_t(kWidth) * kHeight * 4);
-  auto rows = [&](uint32_t begin, uint32_t end) {
-    for (uint32_t v = begin; v < end; ++v) {
-      const float theta = (v + 0.5f) / kHeight * 3.14159265f;
-      const float sinTheta = std::sin(theta), cosTheta = std::cos(theta);
-      uint8_t *out = &rgba[size_t(v) * kWidth * 4];
-      for (uint32_t u = 0; u < kWidth; ++u, out += 4) {
-        // Dome direction (sin cos, cos, sin sin) with y and z swapped: world.
-        const float w[3] = {sinTheta * cosPhi[u], sinTheta * sinPhi[u], cosTheta};
-        // The face of the major axis (faceBasis order: +x -x +y -y +z -z).
-        const float ax = std::fabs(w[0]), ay = std::fabs(w[1]), az = std::fabs(w[2]);
-        const int axis = ax >= ay && ax >= az ? 0 : ay >= az ? 1 : 2;
-        const int face = axis * 2 + (w[axis] < 0);
-        const float inv = 1 / std::max(std::fabs(w[axis]), 1e-6f);
-        const float x = (w[0] * bases[face][0][0] + w[1] * bases[face][0][1] + w[2] * bases[face][0][2]) * inv;
-        const float y = (w[0] * bases[face][1][0] + w[1] * bases[face][1][1] + w[2] * bases[face][1][2]) * inv;
-        // Bilinear, texel centres at half-integers (the capture offsets its
-        // projection to match); the last half texel at a face's edge clamps.
-        const float px = std::clamp((x * 0.5f + 0.5f) * S - 0.5f, 0.f, S - 1.001f);
-        const float py = std::clamp((0.5f - y * 0.5f) * S - 0.5f, 0.f, S - 1.001f);
-        const uint32_t x0 = uint32_t(px), y0 = uint32_t(py);
-        const float fx = px - x0, fy = py - y0;
-        const uint8_t *t0 = faces[face] + (size_t(y0) * S + x0) * 4, *t1 = t0 + size_t(S) * 4;
-        for (int c = 0; c < 3; ++c) {
-          const int k = 2 - c; // BGRA -> RGBA
-          const float value = (t0[k] * (1 - fx) + t0[4 + k] * fx) * (1 - fy) + (t1[k] * (1 - fx) + t1[4 + k] * fx) * fy;
-          out[c] = uint8_t(value + 0.5f);
-        }
-        out[3] = 255;
+    g_skyJob.faces[f].assign(faces[f], faces[f] + size_t(S) * S * 4);
+  g_skyJob.reference = g_skyBlocks;
+  g_skyJob.slight = GetTickCount64() - g_skyDomeTick >= 10000;
+  g_skyJob.epoch = g_skyEpoch;
+  g_skyJob.update = false;
+  g_skyJob.done = false;
+  g_skyJob.running = true;
+  g_skyJob.thread = std::thread([] {
+    constexpr uint32_t kWidth = proxy::sky::kDomeWidth, kHeight = proxy::sky::kDomeHeight, S = proxy::sky::kFaceSize;
+    // The faces identify the dome: unchanged ones cost neither the resampling
+    // nor a texture upload. A painted sky (g_sky) is dithered anew every
+    // frame and its stars drift, so no two captures of it are equal; what
+    // counts is how far a block of texels' mean is from the dome's (levels of
+    // 255). A large difference (another sky, a face first seen) makes a new
+    // dome at once, a slight one (drift, a slow day) only now and then: a new
+    // dome costs an upload and restarts the runtime's sampling of it.
+    constexpr uint32_t kBlock = 8, kBlocks = S / kBlock;
+    constexpr int kSlight = 2 * int(kBlock * kBlock), kLarge = 24 * int(kBlock * kBlock);
+    auto &blocks = g_skyJob.blocks;
+    blocks.assign(size_t(6) * kBlocks * kBlocks * 3, 0);
+    for (int f = 0; f < 6; ++f)
+      for (uint32_t y = 0; y < kBlocks * kBlock; ++y) {
+        const uint8_t *in = g_skyJob.faces[f].data() + size_t(y) * S * 4;
+        uint16_t *out = &blocks[(size_t(f) * kBlocks + y / kBlock) * kBlocks * 3];
+        for (uint32_t x = 0; x < kBlocks; ++x, out += 3)
+          for (uint32_t k = 0; k < kBlock; ++k, in += 4) {
+            out[0] += in[0];
+            out[1] += in[1];
+            out[2] += in[2];
+          }
       }
+    int difference = kLarge + 1; // no dome yet
+    if (g_skyJob.reference.size() == blocks.size()) {
+      difference = 0;
+      for (size_t i = 0; i < blocks.size(); ++i)
+        difference = std::max(difference, std::abs(int(blocks[i]) - int(g_skyJob.reference[i])));
     }
-  };
-  {
-    // 2M texels: split over a few threads.
-    const uint32_t workers = std::clamp(std::thread::hardware_concurrency(), 1u, 8u);
-    std::vector<std::thread> threads;
-    for (uint32_t i = 1; i < workers; ++i)
-      threads.emplace_back(rows, kHeight * i / workers, kHeight * (i + 1) / workers);
-    rows(0, kHeight / workers);
-    for (auto &t : threads)
-      t.join();
-  }
+    if (difference > kLarge || (difference > kSlight && g_skyJob.slight)) {
+      uint64_t hash = kWidth;
+      for (int f = 0; f < 6; ++f)
+        hash = XXH3_64bits_withSeed(g_skyJob.faces[f].data(), g_skyJob.faces[f].size(), hash);
+      g_skyJob.hash = hash | 1;
+      const auto &faces = g_skyJob.faces;
+      auto &rgba = g_skyJob.rgba; // kept (8 MiB)
+      float bases[6][3][3];
+      for (int f = 0; f < 6; ++f)
+        proxy::sky::faceBasis(f, bases[f][0], bases[f][1], bases[f][2]);
+      std::vector<float> cosPhi(kWidth), sinPhi(kWidth);
+      for (uint32_t u = 0; u < kWidth; ++u) {
+        const float phi = ((u + 0.5f) / kWidth - 0.5f) * 6.28318531f;
+        cosPhi[u] = std::cos(phi);
+        sinPhi[u] = std::sin(phi);
+      }
+      rgba.resize(size_t(kWidth) * kHeight * 4);
+      for (uint32_t v = 0; v < kHeight; ++v) {
+        const float theta = (v + 0.5f) / kHeight * 3.14159265f;
+        const float sinTheta = std::sin(theta), cosTheta = std::cos(theta);
+        uint8_t *out = &rgba[size_t(v) * kWidth * 4];
+        for (uint32_t u = 0; u < kWidth; ++u, out += 4) {
+          // Dome direction (sin cos, cos, sin sin) with y and z swapped: world.
+          const float w[3] = {sinTheta * cosPhi[u], sinTheta * sinPhi[u], cosTheta};
+          // The face of the major axis (faceBasis order: +x -x +y -y +z -z).
+          const float ax = std::fabs(w[0]), ay = std::fabs(w[1]), az = std::fabs(w[2]);
+          const int axis = ax >= ay && ax >= az ? 0 : ay >= az ? 1 : 2;
+          const int face = axis * 2 + (w[axis] < 0);
+          const float inv = 1 / std::max(std::fabs(w[axis]), 1e-6f);
+          const float x = (w[0] * bases[face][0][0] + w[1] * bases[face][0][1] + w[2] * bases[face][0][2]) * inv;
+          const float y = (w[0] * bases[face][1][0] + w[1] * bases[face][1][1] + w[2] * bases[face][1][2]) * inv;
+          // Bilinear, texel centres at half-integers (the capture offsets its
+          // projection to match); the last half texel at a face's edge clamps.
+          const float px = std::clamp((x * 0.5f + 0.5f) * S - 0.5f, 0.f, S - 1.001f);
+          const float py = std::clamp((0.5f - y * 0.5f) * S - 0.5f, 0.f, S - 1.001f);
+          const uint32_t x0 = uint32_t(px), y0 = uint32_t(py);
+          const float fx = px - x0, fy = py - y0;
+          const uint8_t *t0 = faces[face].data() + (size_t(y0) * S + x0) * 4, *t1 = t0 + size_t(S) * 4;
+          for (int c = 0; c < 3; ++c) {
+            const int k = 2 - c; // BGRA -> RGBA
+            const float value = (t0[k] * (1 - fx) + t0[4 + k] * fx) * (1 - fy) + (t1[k] * (1 - fx) + t1[4 + k] * fx) * fy;
+            out[c] = uint8_t(value + 0.5f);
+          }
+          out[3] = 255;
+        }
+      }
+      g_skyJob.update = true;
+    }
+    g_skyJob.done = true;
+  });
+}
+
+bool takeSkyChanged() { return std::exchange(g_skyChanged, false); }
+
+// At Present: the dome a capture started, once it has been resampled.
+void applySkyDome() {
+  if (!g_skyJob.running || !g_skyJob.done)
+    return;
+  g_skyJob.thread.join();
+  g_skyJob.running = false;
+  if (g_skyJob.epoch != g_skyEpoch || !g_skyJob.update)
+    return; // of the previous map; the dome's sky still
+  constexpr uint32_t kWidth = proxy::sky::kDomeWidth, kHeight = proxy::sky::kDomeHeight;
+  const uint64_t hash = g_skyJob.hash;
   remixapi_TextureInfo info = {};
   info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
   info.hash = hash;
@@ -1903,11 +1989,11 @@ bool setSkyFaces(const uint8_t *const faces[6]) {
   info.depth = 1;
   info.mipLevels = 1;
   info.format = REMIXAPI_FORMAT_R8G8B8A8_SRGB;
-  info.data = rgba.data();
-  info.dataSize = rgba.size();
+  info.data = g_skyJob.rgba.data();
+  info.dataSize = g_skyJob.rgba.size();
   remixapi_TextureHandle texture = nullptr;
   if (g_api.CreateTexture(&info, &texture) != REMIXAPI_ERROR_CODE_SUCCESS)
-    return false;
+    return; // the next capture tries again
   static const float domeScale = envScale("OPENREMIX_PROXY_SKY_DOME_SCALE", 1.0f);
   wchar_t path[32];
   std::swprintf(path, 32, L"0x%llx", static_cast<unsigned long long>(hash));
@@ -1923,7 +2009,7 @@ bool setSkyFaces(const uint8_t *const faces[6]) {
   remixapi_LightHandle handle = nullptr;
   if (g_api.CreateLight(&light, &handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
     g_api.DestroyTexture(texture);
-    return false;
+    return;
   }
   if (g_skyDome && g_skyDome != handle)
     g_api.DestroyLight(g_skyDome);
@@ -1932,7 +2018,9 @@ bool setSkyFaces(const uint8_t *const faces[6]) {
   g_skyDome = handle;
   g_skyTexture = texture;
   g_skyTextureHash = hash;
-  return true;
+  g_skyBlocks = g_skyJob.blocks;
+  g_skyDomeTick = GetTickCount64();
+  g_skyChanged = true;
 }
 
 void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp) {
@@ -2834,7 +2922,7 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
 }
 
 void onDraw(const Draw &d) {
-  Timer timer(g_usDraw);
+  Timer timer(g_usDraw, &g_totalUs[0]);
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
     return;
@@ -3641,20 +3729,112 @@ void sampleFramePerformance() {
   }
 }
 
+bool frameInProgress(unsigned long &thread, double &milliseconds) {
+  static const double msPerTick = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return 1e3 / double(f.QuadPart);
+  }();
+  const int64_t began = g_frameBegan.load(std::memory_order_relaxed);
+  thread = g_frameThread.load(std::memory_order_relaxed);
+  if (!began || !thread)
+    return false;
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  milliseconds = double(now.QuadPart - began) * msPerTick;
+  return true;
+}
+
+void noteStatisticsDump(bool begin) { (begin ? g_statisticsBegan : g_statisticsEnded) = GetTickCount64(); }
+
+// shaderapi_proxy_spikes.log: one line for every frame much longer than the
+// ones around it, with where its time went. The frame is the span between two
+// onPresent calls: the previous Present call (whose runtime timings these
+// are), the engine's frame and this proxy's draw handling within it.
+void logFrameSpike() {
+  static auto getPerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
+      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+  static auto getBreakdown = reinterpret_cast<PFN_remixapi_GetFrameBreakdownEXT>(
+      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFrameBreakdownEXT"));
+  static uint32_t last[5] = {}, frames = 0, logged = 0, sinceSpike = 0;
+  static double average = 0;
+  static const ULONGLONG started = GetTickCount64();
+  double part[5];
+  for (int i = 0; i < 5; ++i) {
+    const uint32_t now = g_totalUs[i].load(std::memory_order_relaxed);
+    part[i] = double(uint32_t(now - last[i])) / 1000;
+    last[i] = now;
+  }
+  const double ms = g_frameIntervalMs;
+  ++sinceSpike;
+  if (++frames < 200) { // loading
+    average = ms;
+    return;
+  }
+  const bool spike = ms > average * 1.5 && ms > average + 3;
+  if (spike && logged < 5000) {
+    remixapi_FramePerformanceEXT p = {};
+    p.structSize = sizeof(p);
+    remixapi_FrameBreakdownEXT b = {};
+    b.structSize = sizeof(b);
+    if (getPerformance)
+      getPerformance(&p);
+    if (getBreakdown)
+      getBreakdown(&b);
+    const ULONGLONG tick = GetTickCount64(), began = g_statisticsBegan, ended = g_statisticsEnded;
+    if (FILE *log = _wfopen((g_moduleDir + L"\\shaderapi_proxy_spikes.log").c_str(), logged ? L"a" : L"w")) {
+      fprintf(log,
+              "%8.2f s frame %u: %.2f ms (average %.2f, %u frames since the last) | engine %.2f, proxy draws %.2f "
+              "(mesh build %.2f), present submit %.2f (BSP world %.2f, Present call %.2f) | statistics dump %s, began "
+              "%.2f s ago | runtime: present %.2f = setup %.2f scene %.2f fence %.2f acquire %.2f record %.2f submit "
+              "%.2f queuePresent %.2f release %.2f | geometry %.2f upload %.2f accel %.2f alloc %.2f, conversions %llu "
+              "buffer allocations %llu memory allocations %llu uploaded %.2f MiB | record: raster %.2f skin %.2f begin "
+              "%.2f setup %.2f surfaces %.2f material %.2f temporal %.2f retire %.2f traceAccel %.2f table %.2f "
+              "lighting %.2f sharc %.2f signature %.2f descriptors %.2f primary %.2f passes %.2f post %.2f composite "
+              "%.2f ui %.2f snapshot %.2f other %.2f\n",
+              double(tick - started) / 1000, frames, ms, average, sinceSpike,
+              ms - part[0] - part[2], part[0], part[1], part[2], part[3], part[4],
+              began > ended ? "running" : "idle", double(tick - began) / 1000, p.presentMilliseconds,
+              b.presentSetupMilliseconds, p.sceneMilliseconds, p.fenceMilliseconds, p.acquireMilliseconds,
+              p.recordMilliseconds, p.submitMilliseconds, p.queuePresentMilliseconds, b.presentReleaseMilliseconds,
+              p.geometryMilliseconds, p.uploadMilliseconds, p.accelerationMilliseconds, p.allocationMilliseconds,
+              static_cast<unsigned long long>(p.geometryConversions),
+              static_cast<unsigned long long>(p.bufferAllocations),
+              static_cast<unsigned long long>(p.memoryAllocations), p.uploadBytes / 1048576.0,
+              b.rasterPrepareMilliseconds, b.rasterSkinningMilliseconds, b.traceBeginMilliseconds,
+              b.traceSetupMilliseconds, b.traceSurfacesMilliseconds, b.materialMilliseconds, b.temporalMilliseconds,
+              b.retireMilliseconds, b.traceAccelerationMilliseconds, b.tableMilliseconds, b.lightingMilliseconds,
+              b.sharcMilliseconds, b.signatureMilliseconds, b.descriptorMilliseconds, b.primaryMilliseconds,
+              b.passesMilliseconds, b.postMilliseconds, b.compositeMilliseconds, b.uiMilliseconds,
+              b.snapshotMilliseconds, b.otherMilliseconds);
+      fclose(log);
+      ++logged;
+    }
+    sinceSpike = 0;
+  }
+  // The usual frame: a spike moves it little.
+  average = average * 0.97 + std::min(ms, average * 1.5) * 0.03;
+}
+
 void onPresent() {
   sampleGpuPasses();
   if (!g_ready)
     return;
   ++g_stats.frames;
+  applySkyDome();
   {
     LARGE_INTEGER now, freq;
     QueryPerformanceCounter(&now);
     QueryPerformanceFrequency(&freq);
-    if (g_lastPresent.QuadPart)
+    if (g_lastPresent.QuadPart) {
       g_usFrame += uint32_t(double(now.QuadPart - g_lastPresent.QuadPart) * 1e6 / double(freq.QuadPart));
+      g_frameIntervalMs = double(now.QuadPart - g_lastPresent.QuadPart) * 1e3 / double(freq.QuadPart);
+    }
     g_lastPresent = now;
+    g_frameBegan.store(now.QuadPart, std::memory_order_relaxed);
+    g_frameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
   }
-  Timer timer(g_usSubmit);
+  Timer timer(g_usSubmit, &g_totalUs[2]);
   // Classify this frame's perspective views. The main view is the one with the
   // most draws among those sharing the most common field of view. Views with
   // the main rotation are: the same camera with other depth planes (world),
@@ -4154,7 +4334,7 @@ void onPresent() {
     }
     tracked = std::move(nextTracked);
     {
-      Timer bspTimer(g_usBsp);
+      Timer bspTimer(g_usBsp, &g_totalUs[3]);
       bsp::submit(materialForHash);
     }
   }
@@ -4321,9 +4501,10 @@ void onPresent() {
 
   applyTargetPixels();
   sampleFramePerformance();
+  logFrameSpike();
   serviceScreenshotRequest();
   {
-    Timer present(g_usPresent);
+    Timer present(g_usPresent, &g_totalUs[4]);
     g_api.Present(nullptr);
   }
   g_instances.clear();
@@ -4414,6 +4595,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     std::memcpy(pixels.data() + size_t(r) * rowBytes, data + size_t(r) * pitch, rowBytes);
   // Hashed as the game wrote it, before the X8 channel is made opaque.
   const uint64_t contentHash = dxvk::textureHash(pixels.data(), pixels.size());
+  const uint64_t legacyHash = dxvk::legacyTextureHash(pixels.data(), pixels.size());
   noteReplacementKey(contentHash, 'T');
   if (format == D3DFMT_X8R8G8B8)
     for (size_t i = 3; i < pixels.size(); i += 4)
@@ -4429,6 +4611,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   }
   auto t = std::make_shared<RemixTexture>();
   t->hash = contentHash ? contentHash : 1;
+  t->legacyHash = legacyHash;
   remixapi_TextureInfo info = {};
   info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
   info.hash = t->hash;
