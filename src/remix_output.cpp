@@ -1,3 +1,4 @@
+#include "diag.h"
 #include <map>
 #include "remix_output.h"
 #include "d3d_hooks.h"
@@ -1719,18 +1720,30 @@ bool startRemix() {
   // OpenRemix runs in process (GMod is x64): bin/win64/openremix/remix.dll,
   // its dependencies (SDL3, OpenUSD, DLSS) resolved from that directory.
   dll = g_moduleDir + L"\\openremix\\remix.dll";
-  if (!LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH))
+  diag::stage("OpenRemix: loading openremix\\remix.dll");
+  if (!LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
+    // 126: the file or one of the DLLs it needs is missing; 193: wrong architecture.
+    diag::stage("OpenRemix: FAILED to load remix.dll (error %lu)", GetLastError());
     return false;
+  }
+  diag::stage("OpenRemix: remix.dll loaded, initializing the API");
   remixapi_HMODULE lib = nullptr;
-  if (remixapi_lib_loadRemixDllAndInitialize(dll.c_str(), &g_api, &lib) != REMIXAPI_ERROR_CODE_SUCCESS)
+  if (const auto status = remixapi_lib_loadRemixDllAndInitialize(dll.c_str(), &g_api, &lib);
+      status != REMIXAPI_ERROR_CODE_SUCCESS) {
+    diag::stage("OpenRemix: API initialization FAILED (remixapi_ErrorCode %d)", int(status));
     return false;
+  }
   remixapi_StartupInfo startup = {};
   startup.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
   startup.hwnd = g_gameWindow;
   // Before SDL wraps the window in Startup: the game's own window procedure.
   const auto gameProc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC));
-  if (g_api.Startup(&startup) != REMIXAPI_ERROR_CODE_SUCCESS)
+  diag::stage("OpenRemix: Startup (window %p): Vulkan device and swapchain", static_cast<void *>(g_gameWindow));
+  if (const auto status = g_api.Startup(&startup); status != REMIXAPI_ERROR_CODE_SUCCESS) {
+    diag::stage("OpenRemix: Startup FAILED (remixapi_ErrorCode %d)", int(status));
     return false;
+  }
+  diag::stage("OpenRemix: Startup succeeded");
   remix_ui::install(g_gameWindow, &g_api, gameProc);
   // OPENREMIX_PROXY_BACKEND=pathtrace|raster (runtime default: raster).
   char backend[32] = {};
@@ -2047,9 +2060,15 @@ void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp) {
 }
 
 void onDeviceCreated(IDirect3DDevice9 *) {
-  if (!enabled() || g_ready)
+  // The engine has installed its own crash handler by now.
+  diag::reinstall();
+  if (!enabled() || g_ready) {
+    diag::stage("Direct3D device created (OpenRemix %s)", g_ready ? "already running" : "disabled");
     return;
+  }
+  diag::stage("Direct3D device created");
   g_ready = startRemix();
+  diag::stage("OpenRemix: start-up %s", g_ready ? "complete" : "FAILED: the game goes on without it");
 }
 
 // Census of the draws that depend on what the proxy does not reproduce: a
@@ -3816,6 +3835,109 @@ void logFrameSpike() {
   average = average * 0.97 + std::min(ms, average * 1.5) * 0.03;
 }
 
+// For the diagnostics log: what OpenRemix (SDL) takes the game window's state
+// to be beside what Windows reports, and whether frames reach the screen. The
+// runtime skips a frame without an error while it holds the window minimized,
+// hidden or empty, so a disagreement here is a frozen picture. Written when
+// either changes, and every few seconds while no frame is presented.
+void logWindowState(uint32_t presents) {
+  if (presents % 30 != 0 && presents > 3)
+    return;
+  static auto framePerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
+      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT")));
+  remixapi_FramePerformanceEXT performance = {};
+  performance.structSize = sizeof(performance);
+  if (framePerformance)
+    framePerformance(&performance);
+  remixapi_WindowState state = {};
+  const auto status = g_api.GetWindowState ? g_api.GetWindowState(&state) : REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+  RECT client = {}, window = {};
+  GetClientRect(g_gameWindow, &client);
+  GetWindowRect(g_gameWindow, &window);
+  const bool iconic = IsIconic(g_gameWindow), visible = IsWindowVisible(g_gameWindow);
+  const bool foreground = GetForegroundWindow() == g_gameWindow;
+  static uint64_t lastPresentations = 0;
+  static uint32_t stalledSamples = 0;
+  // Since the last sample, 30 of the game's frames ago.
+  const bool stalled = presents > 3 && performance.presentations == lastPresentations;
+  stalledSamples = stalled ? stalledSamples + 1 : 0;
+  char text[512];
+  std::snprintf(text, sizeof(text),
+                "OpenRemix sees: minimized %d, drawable %ux%u, focused %d (status %d) | Windows says: minimized %d, "
+                "visible %d, client %ldx%ld, window %ld,%ld %ldx%ld, style %08lx, ex %08lx, foreground %d",
+                int(state.minimized), state.drawableWidth, state.drawableHeight, int(state.focused), int(status),
+                int(iconic), int(visible), client.right, client.bottom, window.left, window.top,
+                window.right - window.left, window.bottom - window.top,
+                static_cast<unsigned long>(GetWindowLongPtrW(g_gameWindow, GWL_STYLE)),
+                static_cast<unsigned long>(GetWindowLongPtrW(g_gameWindow, GWL_EXSTYLE)), int(foreground));
+  static std::string last;
+  static bool lastStalled = false;
+  // Every ~5 s while stalled (six samples of 30 presents at the game's rate).
+  if (text != last || stalled != lastStalled || (stalled && stalledSamples % 6 == 0)) {
+    const bool disagree = status == REMIXAPI_ERROR_CODE_SUCCESS &&
+                          (bool(state.minimized) != iconic ||
+                           (!iconic && visible && client.right > 0 && client.bottom > 0 &&
+                            (!state.drawableWidth || !state.drawableHeight)));
+    diag::stage("frame %u: %s%s | OpenRemix frames attempted %llu, presented %llu%s", presents, text,
+                disagree ? " | DISAGREE" : "", static_cast<unsigned long long>(performance.attempts),
+                static_cast<unsigned long long>(performance.presentations),
+                stalled ? " | NOT PRESENTING since the last sample" : "");
+    last = text;
+    lastStalled = stalled;
+  }
+  lastPresentations = performance.presentations;
+}
+
+// For the diagnostics log: what the runtime is drawing with and whether it is
+// drawing. A picture that stays on the clear colour or does not change has a
+// reason among these: the path tracer unavailable or not the active backend,
+// its frames not advancing, or no scene handed over. Written when the state
+// changes (the counters are compared between samples, not printed as state).
+void logRendererState(uint32_t presents, size_t instances) {
+  if (presents % 30 != 0 && presents > 3)
+    return;
+  auto stat = [](const char *name) { return reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), name)); };
+  static auto getBackend = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(stat("remixapi_GetBackendCapabilitiesEXT"));
+  static auto getTracing = reinterpret_cast<PFN_remixapi_GetTracingStatisticsEXT>(stat("remixapi_GetTracingStatisticsEXT"));
+  static auto getDenoising = reinterpret_cast<PFN_remixapi_GetDenoisingStatisticsEXT>(stat("remixapi_GetDenoisingStatisticsEXT"));
+  remixapi_BackendCapabilitiesEXT backend = {};
+  backend.structSize = sizeof(backend);
+  if (getBackend)
+    getBackend(&backend);
+  remixapi_TracingStatisticsEXT tracing = {};
+  tracing.structSize = sizeof(tracing);
+  if (getTracing)
+    getTracing(&tracing);
+  remixapi_DenoisingStatisticsEXT denoising = {};
+  denoising.structSize = sizeof(denoising);
+  if (getDenoising)
+    getDenoising(&denoising);
+  static uint64_t lastSequence = 0, lastGeneration = 0, lastRendered = 0;
+  const bool tracerAdvancing = tracing.sampleSequence != lastSequence;
+  const bool sceneChanging = tracing.sceneGeneration != lastGeneration;
+  const bool denoiserAdvancing = denoising.renderedFrames != lastRendered;
+  lastSequence = tracing.sampleSequence;
+  lastGeneration = tracing.sceneGeneration;
+  lastRendered = denoising.renderedFrames;
+  char text[900];
+  std::snprintf(text, sizeof(text),
+                "backend active %u, requested %u, supported mask %u (1 raster, 2 path tracing)%s%s | tracer frames "
+                "advancing %d, scene changing %d, accumulation %u | denoiser active %u of requested %u, frames "
+                "advancing %d%s%s | map world loaded %d, instances this frame %s, world cameras %s",
+                backend.activeBackend, backend.requestedBackend, backend.supportedBackends,
+                backend.unavailableReason[0] ? ", unavailable: " : "", backend.unavailableReason,
+                int(tracerAdvancing), int(sceneChanging), tracing.accumulationEnabled, denoising.activeDenoiser,
+                denoising.requestedDenoiser, int(denoiserAdvancing), denoising.unavailableReason[0] ? ", unavailable: " : "",
+                denoising.unavailableReason, int(bsp::active()), instances ? "some" : "NONE",
+                g_stats.worldViewCameras.load() ? "some" : "none yet");
+  static std::string last;
+  if (text != last) {
+    diag::stage("frame %u: renderer: %s (instances %zu, tracer sequence %llu)", presents, text, instances,
+                static_cast<unsigned long long>(tracing.sampleSequence));
+    last = text;
+  }
+}
+
 void onPresent() {
   sampleGpuPasses();
   if (!g_ready)
@@ -4503,10 +4625,31 @@ void onPresent() {
   sampleFramePerformance();
   logFrameSpike();
   serviceScreenshotRequest();
+  // The first frames, for the diagnostics log: a crash while rendering shows
+  // how far the game got.
+  static uint32_t presents = 0;
+  ++presents;
+  const bool mark = presents <= 3 || presents == 10 || presents == 100 || presents == 1000;
+  if (mark)
+    diag::stage("frame %u: presenting", presents);
+  // OPENREMIX_PROXY_CRASH_TEST=<n>: a deliberate fault at frame n, to check
+  // that the diagnostics log records it.
+  static const uint32_t crashAt = [] {
+    char value[16] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_CRASH_TEST", value, sizeof(value)) ? uint32_t(atoi(value)) : 0u;
+  }();
+  if (crashAt && presents == crashAt) {
+    diag::stage("OPENREMIX_PROXY_CRASH_TEST: faulting on purpose");
+    *reinterpret_cast<volatile int *>(uintptr_t(0x10)) = 1;
+  }
   {
     Timer present(g_usPresent, &g_totalUs[4]);
     g_api.Present(nullptr);
   }
+  if (mark)
+    diag::stage("frame %u: presented", presents);
+  logWindowState(presents);
+  logRendererState(presents, g_instances.size());
   g_instances.clear();
   for (const auto &group : g_stencilGroups) {
     g_stats.haloGroups += group.halo && group.fill;

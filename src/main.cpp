@@ -1,6 +1,7 @@
 // shaderapidx9.dll proxy for Garry's Mod (x64): loads the original as
 // shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
+#include "diag.h"
 #include "d3d_hooks.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
@@ -100,11 +101,11 @@ void forceNoD3D9Ex() {
   const auto findParm = reinterpret_cast<FindParmFn>(vt[10]);
   if (findParm(commandLine, kSwitch)) {
     log("proxy: -nod3d9ex given");
-    return;
+  } else {
+    reinterpret_cast<AppendParmFn>(vt[5])(commandLine, kSwitch, nullptr);
+    log("proxy: -nod3d9ex appended to the command line (%s)",
+        findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
   }
-  reinterpret_cast<AppendParmFn>(vt[5])(commandLine, kSwitch, nullptr);
-  log("proxy: -nod3d9ex appended to the command line (%s)",
-      findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
 }
 
 bool loadOriginal() {
@@ -115,16 +116,22 @@ bool loadOriginal() {
   g_dir = path;
   g_dir.resize(g_dir.find_last_of(L"\\/"));
   g_log = _wfopen((g_dir + L"\\shaderapi_proxy.log").c_str(), L"w");
+  proxy::diag::reinstall();
+  proxy::diag::stage("first CreateInterface: loading shaderapidx9_orig.dll");
   forceNoD3D9Ex();
   g_orig = LoadLibraryW((g_dir + L"\\shaderapidx9_orig.dll").c_str());
   if (!g_orig) {
-    log("proxy: failed to load shaderapidx9_orig.dll (%lu)", GetLastError());
+    const DWORD error = GetLastError();
+    log("proxy: failed to load shaderapidx9_orig.dll (%lu)", error);
+    proxy::diag::stage("FAILED to load shaderapidx9_orig.dll (error %lu): was the game's own DLL renamed to it?", error);
     return false;
   }
   g_origCreateInterface = reinterpret_cast<CreateInterfaceFn>(GetProcAddress(g_orig, "CreateInterface"));
   if (!proxy::d3d::install(g_orig))
     log("proxy: d3d9!Direct3DCreate9 import not found; D3D hooks inactive");
   log("proxy: loaded original at %p", static_cast<void *>(g_orig));
+  proxy::diag::stage("shaderapidx9_orig.dll loaded at %p, CreateInterface %s", static_cast<void *>(g_orig),
+                     g_origCreateInterface ? "found" : "MISSING");
   return g_origCreateInterface != nullptr;
 }
 
@@ -153,6 +160,7 @@ bool deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn factory) {
   using Fn = bool (*)(void *, CreateInterfaceFn);
   g_connectFactory = factory;
   log("proxy: IShaderDeviceMgr::Connect(factory %p)", reinterpret_cast<void *>(factory));
+  proxy::diag::stage("IShaderDeviceMgr::Connect");
   return proxy::original<Fn>(self, 0)(self->real, factory ? connectFactory : nullptr);
 }
 
@@ -162,6 +170,7 @@ bool deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn factory) {
 void deviceMgrShutdown(proxy::Wrapper *self) {
   using Fn = void (*)(void *);
   log("proxy: IShaderDeviceMgr::Shutdown");
+  proxy::diag::stage("IShaderDeviceMgr::Shutdown (the game is quitting)");
   proxy::original<Fn>(self, 4)(self->real);
   proxy::remix::shutdown();
 }
@@ -176,8 +185,10 @@ void *setModeFactory(const char *name, int *rc) {
 }
 CreateInterfaceFn deviceMgrSetMode(proxy::Wrapper *self, void *hwnd, int adapter, const void *mode) {
   using Fn = CreateInterfaceFn (*)(void *, void *, int, const void *);
+  proxy::diag::stage("IShaderDeviceMgr::SetMode(hwnd %p, adapter %d): the engine creates its Direct3D device", hwnd, adapter);
   CreateInterfaceFn factory = proxy::original<Fn>(self, 12)(self->real, hwnd, adapter, mode);
   log("proxy: SetMode(hwnd=%p, adapter=%d) -> factory %p", hwnd, adapter, reinterpret_cast<void *>(factory));
+  proxy::diag::stage("SetMode returned factory %p", reinterpret_cast<void *>(factory));
   if (!factory)
     return nullptr;
   g_setModeFactory = factory;
@@ -556,6 +567,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
   if (reason == DLL_PROCESS_ATTACH) {
     g_self = instance;
     DisableThreadLibraryCalls(instance);
+    proxy::diag::install(instance);
+    proxy::diag::stage("proxy loaded");
     preferCachedDxvkBuffers();
   }
   return TRUE;
