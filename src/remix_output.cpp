@@ -4629,6 +4629,22 @@ void onPresent() {
   // how far the game got.
   static uint32_t presents = 0;
   ++presents;
+  // The runtime refuses a Present from any thread but the one that started
+  // it (REMIXAPI_ERROR_CODE_WRONG_THREAD): the engine's render thread, with
+  // multicore rendering on. Said once each time the thread changes.
+  {
+    static DWORD startThread = GetCurrentThreadId(), lastThread = startThread;
+    if (const DWORD thread = GetCurrentThreadId(); thread != lastThread) {
+      lastThread = thread;
+      if (thread != startThread)
+        diag::stage("frame %u: PRESENT FROM ANOTHER THREAD (%lu, OpenRemix was started on %lu): the engine is rendering "
+                    "on its own thread (multicore rendering, gmod_mcore_test 1 / mat_queue_mode 2) and OpenRemix "
+                    "will not present. Set gmod_mcore_test 0.",
+                    presents, thread, startThread);
+      else
+        diag::stage("frame %u: presenting from the starting thread again", presents);
+    }
+  }
   const bool mark = presents <= 3 || presents == 10 || presents == 100 || presents == 1000;
   if (mark)
     diag::stage("frame %u: presenting", presents);
