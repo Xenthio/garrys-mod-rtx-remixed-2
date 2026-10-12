@@ -106,14 +106,6 @@ void forceNoD3D9Ex() {
     log("proxy: -nod3d9ex appended to the command line (%s)",
         findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
   }
-  // Multicore rendering (gmod_mcore_test 1) has the material system present
-  // from its own thread once a map is loaded. OpenRemix presents on the thread
-  // that started it and refuses the others: the picture then stops at the
-  // first frame of the map. A launch option runs after config.cfg, so this
-  // overrides the saved setting.
-  reinterpret_cast<AppendParmFn>(vt[5])(commandLine, "+gmod_mcore_test", "0");
-  log("proxy: +gmod_mcore_test 0 appended to the command line (multicore rendering is not supported)");
-  proxy::diag::stage("multicore rendering turned off for this run (+gmod_mcore_test 0): OpenRemix presents on one thread");
 }
 
 bool loadOriginal() {
