@@ -690,6 +690,11 @@ struct World {
   // recorded at one version is replayed while it lasts.
   uint64_t submitVersion = 0, batchVersion = ~0ull, stableVersion = ~0ull, stableSince = 0;
   bool batchValid = false;
+  // The same instances as the runtime's scene instances (remix_native_ext.h):
+  // added once per version and drawn by one call a frame.
+  std::vector<uint64_t> sceneInstances;
+  uint64_t sceneVersion = ~0ull;
+  bool sceneValid = false;
   uint64_t replayedFrames = 0;
   uint32_t recordings = 0;
   uint32_t styledLights = 0, skyboxLights = 0, otherLights = 0, surfaceLights = 0;
@@ -1233,7 +1238,24 @@ SecondLayer secondLayer(int base, bool use) {
 
 constexpr uint64_t kBatchId = 0x42535057; // "BSPW"
 
+// The runtime's scene instances (in process: resolved from remix.dll).
+template <typename Fn> Fn sceneFunction(const char *name) {
+  const HMODULE runtime = GetModuleHandleW(L"remix.dll");
+  return runtime ? reinterpret_cast<Fn>(GetProcAddress(runtime, name)) : nullptr;
+}
+
+// Removes the map's scene instances; before their meshes go.
+void dropSceneInstances() {
+  static const auto remove = sceneFunction<PFN_remixapi_RemoveSceneInstancesEXT>("remixapi_RemoveSceneInstancesEXT");
+  if (remove && !g_world.sceneInstances.empty())
+    remove(g_world.sceneInstances.data(), uint32_t(g_world.sceneInstances.size()));
+  g_world.sceneInstances.clear();
+  g_world.sceneValid = false;
+}
+
 void destroyMeshes() {
+  dropSceneInstances();
+  g_world.sceneVersion = ~0ull;
   if (g_world.batchValid && g_world.api) {
     using BatchFn = remixapi_ErrorCode(REMIXAPI_CALL *)(uint64_t);
     if (auto drop = reinterpret_cast<BatchFn>(
@@ -2600,6 +2622,32 @@ void submit(MaterialLookup lookup) {
     return;
   }
   g_world.batchValid = false;
+  // In process there is no bridge: the stable submission becomes the
+  // runtime's scene instances, added once and drawn by one call a frame. The
+  // map is thousands of instances, and describing each to the runtime every
+  // frame was a quarter of the frame (gm_voidplaces: 8200 instances, 4.8 ms).
+  static const auto addScene =
+      batchEnabled ? sceneFunction<PFN_remixapi_AddSceneInstancesEXT>("remixapi_AddSceneInstancesEXT") : nullptr;
+  static const auto drawScene = sceneFunction<PFN_remixapi_DrawSceneInstancesEXT>("remixapi_DrawSceneInstancesEXT");
+  if (g_world.sceneValid && g_world.sceneVersion == g_world.submitVersion && drawScene &&
+      drawScene(nullptr) == REMIXAPI_ERROR_CODE_SUCCESS) {
+    ++g_world.replayedFrames;
+    return;
+  }
+  dropSceneInstances();
+  const bool keep = addScene && drawScene && frame - g_world.stableSince >= 30 &&
+                    g_world.sceneVersion != g_world.submitVersion;
+  bool kept = keep;
+  // An instance of the map: the runtime keeps it, or it is drawn this frame.
+  const auto draw = [&](const remixapi_InstanceInfo &info) {
+    uint64_t instance = 0;
+    if (!keep)
+      api.DrawInstance(&info);
+    else if (addScene(&info, 1, &instance) == REMIXAPI_ERROR_CODE_SUCCESS)
+      g_world.sceneInstances.push_back(instance);
+    else
+      kept = false;
+  };
   // What the camera does not see of the map, as in Source: back faces (except
   // $nocull materials) and what lies in clusters outside the camera cluster's
   // potentially visible set (the runtime locates the camera and each surface
@@ -2663,7 +2711,7 @@ void submit(MaterialLookup lookup) {
     // Paint is seen from its face's front only, and where its face is.
     remixapi_InstanceInfoCameraCullingEXT culling;
     cameraCulling(info, culling, group.noCull, group.skybox);
-    api.DrawInstance(&info);
+    draw(info);
   }
   // Overlays: static decals, blended over the surface below.
   for (auto &[key, group] : g_world.overlayGroups) {
@@ -2689,7 +2737,7 @@ void submit(MaterialLookup lookup) {
     // Paint is seen from its face's front only, and where its face is.
     remixapi_InstanceInfoCameraCullingEXT culling;
     cameraCulling(info, culling, group.noCull, group.skybox);
-    api.DrawInstance(&info);
+    draw(info);
   }
   for (auto &[key, group] : g_world.groups) {
     if (!group.mesh)
@@ -2716,15 +2764,15 @@ void submit(MaterialLookup lookup) {
     info.doubleSided = 1;
     remixapi_InstanceInfoCameraCullingEXT culling;
     cameraCulling(info, culling, group.noCull, group.skybox);
-    api.DrawInstance(&info);
+    draw(info);
   }
   for (const auto &prop : g_world.props) {
     if (prop.skybox)
       continue;
     for (const auto &part : prop.model->parts) {
       const auto &m = g_world.materials[part.material];
-      remixapi_InstanceInfoMaterialOverrideEXT material = {};
-      material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT;
+      remixapi_InstanceInfoMaterialEXT material = {};
+      material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_EXT;
       material.material = m.ref.handle;
       remixapi_InstanceInfoBlendEXT blend = {};
       blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
@@ -2753,8 +2801,18 @@ void submit(MaterialLookup lookup) {
       // draws it: see the runtime's VISIBILITY flag.)
       remixapi_InstanceInfoCameraCullingEXT culling;
       cameraCulling(info, culling, m.noCull, prop.skyTraced);
-      api.DrawInstance(&info);
+      draw(info);
     }
+  }
+  if (keep) {
+    // Attempted once per version: a refused instance leaves the map to
+    // DrawInstance (from the next frame; this one draws what was kept).
+    g_world.sceneVersion = g_world.submitVersion;
+    g_world.sceneValid = kept;
+    ++g_world.recordings;
+    drawScene(nullptr);
+    if (!kept)
+      dropSceneInstances();
   }
   if (record) {
     // Attempted once per version: a failed recording is not retried.
@@ -3088,8 +3146,8 @@ void dumpStatistics(FILE *out) {
             modes[Shading::Unlit], luminous, modes[Shading::SelfIllumBaseAlpha], modes[Shading::SelfIllumMask],
             modes[Shading::SelfIllumMaskAlpha], waiting, dropped, examples.c_str());
   }
-  fprintf(out, "   BSP world batch: %u recordings, valid %d, replayed frames %llu of %llu\n", g_world.recordings,
-          int(g_world.batchValid), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
+  fprintf(out, "   BSP world batch: %u recordings, valid %d (scene instances %zu), replayed frames %llu of %llu\n",
+          g_world.recordings, int(g_world.batchValid || g_world.sceneValid), g_world.sceneInstances.size(), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
   fprintf(out, "   BSP lights: %zu static, %u of them styled, %u surface (texture) lights (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
           g_world.lights.size(), g_world.styleDrivenLights, g_world.surfaceLights, g_world.styledLights,
           g_world.skyboxLights, g_world.otherLights);

@@ -139,7 +139,7 @@ struct CachedMesh {
 std::unordered_map<uint64_t, CachedMesh> g_meshes;
 // Flexed meshes (faces, see flexScale): one runtime mesh per draw whose
 // vertices are refreshed in place when the flex deltas change
-// (remixapi_MeshInfoRefreshGeometryEXT), so the face stays the same mesh and
+// (remixapi_MeshInfoDeformEXT), so the face stays the same mesh and
 // the same instance from frame to frame: motion vectors and denoiser history,
 // which a new mesh every frame did not have (a talking face smeared).
 struct FlexMesh {
@@ -1663,14 +1663,11 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   info.hash = hash ? hash : 1;
   info.surfaces_values = &surface;
   info.surfaces_count = 1;
-  // remixapi_MeshInfoRefreshGeometryEXT (remix_fo4_ext.h): a structure type and
-  // a chain pointer, nothing else.
-  struct {
-    remixapi_StructType sType;
-    void *pNext;
-  } refreshGeometry = {REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT, nullptr};
+  // The mesh registered under this hash, deformed: it stays the same object.
+  remixapi_MeshInfoDeformEXT deform = {};
+  deform.sType = REMIXAPI_STRUCT_TYPE_MESH_DEFORM_EXT;
   if (refresh)
-    info.pNext = &refreshGeometry;
+    info.pNext = &deform;
   remixapi_MeshHandle handle = nullptr;
   if (g_api.CreateMesh(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
     ++g_stats.rejected;
@@ -4251,8 +4248,8 @@ void onPresent() {
       if (inst.stencilGroup >= 0 && inst.stencilRole != kStencilCut) {
         assignStencilMasks();
         const StencilGroup &group = g_stencilGroups[inst.stencilGroup];
-        remixapi_InstanceInfoMaterialOverrideEXT maskMaterial = {};
-        maskMaterial.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT;
+        remixapi_InstanceInfoMaterialEXT maskMaterial = {};
+        maskMaterial.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_EXT;
         maskMaterial.material = inst.material;
         remixapi_InstanceInfoBoneTransformsEXT maskBones = {};
         maskBones.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
@@ -4333,8 +4330,8 @@ void onPresent() {
       }
       if (role == Role::Sky && inst.texture0 && g_skyBrightness != 1.0f)
         inst.material = materialFor(inst.texture0, g_skyBrightness);
-      remixapi_InstanceInfoMaterialOverrideEXT material = {};
-      material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_OVERRIDE_EXT;
+      remixapi_InstanceInfoMaterialEXT material = {};
+      material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_EXT;
       material.material = inst.material;
       remixapi_InstanceInfoBoneTransformsEXT bones = {};
       bones.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
