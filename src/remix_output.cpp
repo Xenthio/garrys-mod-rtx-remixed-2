@@ -3935,10 +3935,15 @@ void logRendererState(uint32_t presents, size_t instances) {
   }
 }
 
+namespace {
+void flushPendingTextures();
+}
+
 void onPresent() {
   sampleGpuPasses();
   if (!g_ready)
     return;
+  flushPendingTextures();
   ++g_stats.frames;
   applySkyDome();
   {
@@ -4718,12 +4723,11 @@ void storeCpuCopy(const void *texture, uint32_t width, uint32_t height, D3DFORMA
   ++cpu->version;
 }
 
-void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
-                     uint32_t pitch, uint32_t levels) {
-  if (!g_ready || !data || !width || !height)
-    return;
-  remixapi_Format remixFormat;
-  uint32_t rowBytes, rows;
+namespace {
+// A level's layout: the runtime's format, the bytes of a row (of a block row
+// for BC formats) and the rows. False for formats that are not forwarded.
+bool textureLayout(D3DFORMAT format, uint32_t width, uint32_t height, remixapi_Format &remixFormat, uint32_t &rowBytes,
+                   uint32_t &rows) {
   const uint32_t blocksW = std::max(1u, (width + 3) / 4), blocksH = std::max(1u, (height + 3) / 4);
   switch (format) {
   case D3DFMT_A8R8G8B8:
@@ -4743,12 +4747,127 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     rows = blocksH;
     break;
   default:
-    ++g_stats.textureSkipped;
-    return;
+    return false;
   }
+  return true;
+}
+
+// A level's bytes, rows packed.
+std::vector<uint8_t> packLevel(const uint8_t *data, uint32_t pitch, uint32_t rowBytes, uint32_t rows) {
   std::vector<uint8_t> pixels(size_t(rowBytes) * rows);
   for (uint32_t r = 0; r < rows; ++r)
     std::memcpy(pixels.data() + size_t(r) * rowBytes, data + size_t(r) * pitch, rowBytes);
+  return pixels;
+}
+
+// A mipmapped texture is given to the runtime with the levels the game wrote,
+// not level 0 alone with a chain for the runtime to build: building one means
+// decoding the BC blocks and filtering every level on the game's thread
+// (10-14 ms a texture, in the frame that loads it), and the result is kept
+// uncompressed, six times the memory. The game writes a texture's levels one
+// after another: they are held here until all are in, then created at once.
+// Level 0 with levels still missing waits until the next Present, where it is
+// created the old way (the runtime builds the chain).
+struct PendingTexture {
+  uint32_t width = 0, height = 0, levels = 0;
+  D3DFORMAT format = D3DFMT_UNKNOWN;
+  std::vector<std::vector<uint8_t>> level;
+  uint64_t contentHash = 0, legacyHash = 0;
+  bool levelZero = false;
+  bool complete() const {
+    for (const auto &bytes : level)
+      if (bytes.empty())
+        return false;
+    return !level.empty();
+  }
+};
+std::unordered_map<const void *, PendingTexture> g_pendingTextures; // g_textureLock
+std::atomic<uint32_t> g_textureChains{0}, g_textureChainsBuilt{0}, g_textureLevelsSeen{0}, g_textureSingle{0};
+
+PendingTexture &pendingTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format,
+                               uint32_t levels) {
+  auto &p = g_pendingTextures[texture];
+  if (p.width != width || p.height != height || p.format != format || p.levels != levels) {
+    p = {};
+    p.width = width;
+    p.height = height;
+    p.format = format;
+    p.levels = levels;
+    p.level.resize(std::max(levels, 1u));
+  }
+  return p;
+}
+
+// Creates the runtime texture from what is held: every level when all are
+// in, else level 0 with a chain the runtime builds. g_textureLock held.
+void createPendingTexture(const void *texture, PendingTexture &p) {
+  remixapi_Format remixFormat;
+  uint32_t rowBytes, rows;
+  if (!p.levelZero || !textureLayout(p.format, p.width, p.height, remixFormat, rowBytes, rows))
+    return;
+  auto t = std::make_shared<RemixTexture>();
+  t->hash = p.contentHash ? p.contentHash : 1;
+  t->legacyHash = p.legacyHash;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.hash = t->hash;
+  info.width = p.width;
+  info.height = p.height;
+  info.depth = 1;
+  info.format = remixFormat;
+  remixapi_TextureInfoGenerateMipsEXT mips = {};
+  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
+  mips.generate = true;
+  std::vector<uint8_t> chain;
+  if (p.levels > 1 && p.complete()) {
+    for (const auto &bytes : p.level)
+      chain.insert(chain.end(), bytes.begin(), bytes.end());
+    info.mipLevels = p.levels;
+    info.data = chain.data();
+    info.dataSize = chain.size();
+    ++g_textureChains;
+  } else {
+    info.mipLevels = 1;
+    info.data = p.level[0].data();
+    info.dataSize = p.level[0].size();
+    if (p.levels > 1) {
+      info.pNext = &mips;
+      ++g_textureChainsBuilt;
+    } else
+      ++g_textureSingle;
+  }
+  const bool created = g_api.CreateTexture(&info, &t->texture) == REMIXAPI_ERROR_CODE_SUCCESS;
+  ++g_stats.textures;
+  if (created) {
+    g_texturesByHash[p.contentHash] = t;
+    g_textures[texture] = std::move(t);
+  }
+}
+
+// Level 0 written with levels that never came: created before the frame is.
+void flushPendingTextures() {
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  for (auto it = g_pendingTextures.begin(); it != g_pendingTextures.end();) {
+    if (it->second.levelZero) {
+      createPendingTexture(it->first, it->second);
+      it = g_pendingTextures.erase(it);
+    } else
+      ++it;
+  }
+}
+} // namespace
+
+void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
+                     uint32_t pitch, uint32_t levels) {
+  if (!g_ready || !data || !width || !height)
+    return;
+  remixapi_Format remixFormat;
+  uint32_t rowBytes, rows;
+  if (!textureLayout(format, width, height, remixFormat, rowBytes, rows)) {
+    ++g_stats.textureSkipped;
+    return;
+  }
+  std::vector<uint8_t> pixels = packLevel(data, pitch, rowBytes, rows);
   // Hashed as the game wrote it, before the X8 channel is made opaque.
   const uint64_t contentHash = dxvk::textureHash(pixels.data(), pixels.size());
   const uint64_t legacyHash = dxvk::legacyTextureHash(pixels.data(), pixels.size());
@@ -4761,37 +4880,49 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   if (auto shared = g_texturesByHash.find(contentHash); shared != g_texturesByHash.end()) {
     if (auto existing = shared->second.lock()) {
       g_textures[texture] = std::move(existing);
+      g_pendingTextures.erase(texture);
       storeCpuCopy(texture, width, height, format, std::move(pixels));
       return;
     }
   }
-  auto t = std::make_shared<RemixTexture>();
-  t->hash = contentHash ? contentHash : 1;
-  t->legacyHash = legacyHash;
-  remixapi_TextureInfo info = {};
-  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
-  info.hash = t->hash;
-  info.width = width;
-  info.height = height;
-  info.depth = 1;
-  info.mipLevels = 1;
-  info.format = remixFormat;
-  info.data = pixels.data();
-  info.dataSize = pixels.size();
-  // Only level 0 is captured: the runtime builds the chain for textures the
-  // game made mipmapped (single-level ones, e.g. lookup gradients, stay so).
-  remixapi_TextureInfoGenerateMipsEXT mips = {};
-  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
-  mips.generate = true;
-  if (levels > 1)
-    info.pNext = &mips;
-  const bool created = g_api.CreateTexture(&info, &t->texture) == REMIXAPI_ERROR_CODE_SUCCESS;
-  ++g_stats.textures;
-  if (created) {
-    g_texturesByHash[contentHash] = t;
-    g_textures[texture] = std::move(t);
-  }
+  auto &p = pendingTexture(texture, width, height, format, levels);
+  p.level[0] = pixels;
+  p.contentHash = contentHash;
+  p.legacyHash = legacyHash;
+  p.levelZero = true;
   storeCpuCopy(texture, width, height, format, std::move(pixels));
+  // Created now with one level or with every level in; else when the last
+  // level is written (onTextureLevel) or at the next Present.
+  if (levels <= 1 || p.complete()) {
+    createPendingTexture(texture, p);
+    g_pendingTextures.erase(texture);
+  }
+}
+
+void onTextureLevel(const void *texture, uint32_t level, uint32_t width, uint32_t height, uint32_t levelWidth,
+                    uint32_t levelHeight, D3DFORMAT format, const uint8_t *data, uint32_t pitch, uint32_t levels) {
+  if (!g_ready || !data || !level || level >= levels || !levelWidth || !levelHeight)
+    return;
+  remixapi_Format remixFormat;
+  uint32_t rowBytes, rows;
+  if (!textureLayout(format, levelWidth, levelHeight, remixFormat, rowBytes, rows))
+    return;
+  // The runtime's levels halve and stop at one: a level of another size is
+  // not one of its chain.
+  if (levelWidth != std::max(1u, width >> level) || levelHeight != std::max(1u, height >> level))
+    return;
+  std::vector<uint8_t> pixels = packLevel(data, pitch, rowBytes, rows);
+  ++g_textureLevelsSeen;
+  if (format == D3DFMT_X8R8G8B8)
+    for (size_t i = 3; i < pixels.size(); i += 4)
+      pixels[i] = 0xff;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  auto &p = pendingTexture(texture, width, height, format, levels);
+  p.level[level] = std::move(pixels);
+  if (p.levelZero && p.complete()) {
+    createPendingTexture(texture, p);
+    g_pendingTextures.erase(texture);
+  }
 }
 
 void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const RECT &rect,
@@ -5021,6 +5152,7 @@ void onTextureCopy(const void *source, const void *destination) {
 void onTextureReleased(const void *texture) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   g_textures.erase(texture);
+  g_pendingTextures.erase(texture);
   auto cpu = g_cpuTextures.find(texture);
   if (cpu != g_cpuTextures.end()) {
     // UI ids name the CPU copy, which UpdateTexture destinations may share.
@@ -5520,6 +5652,10 @@ void dumpStatistics(FILE *out) {
     now.structSize = sizeof(now);
     if (statistics && statistics(&now) == REMIXAPI_ERROR_CODE_SUCCESS) {
       const double changed = double(now.updates - last.updates), uploads = double(now.uploads - last.uploads);
+      fprintf(out, "   texture mip chains since launch: %u as the game wrote them, %u built by the runtime from level 0, "
+                   "%u single-level | levels above 0 seen written %u, textures waiting for levels %zu\n",
+              g_textureChains.load(), g_textureChainsBuilt.load(), g_textureSingle.load(), g_textureLevelsSeen.load(),
+              g_pendingTextures.size());
       fprintf(out, "   runtime textures per frame: created %.2f destroyed %.2f, materials created %.2f destroyed %.2f | "
                    "GPU objects: textures made %.2f released %.2f, materials made %.2f released %.2f, making %.3f ms "
                    "(%.1f KiB staged), releasing %.3f ms | in-place updates: calls %.2f, changed pixels %.2f "

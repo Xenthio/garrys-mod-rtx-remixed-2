@@ -13,7 +13,7 @@ for i in $(seq 1 120); do grep -q done "$D/openremix_bench_state.txt" 2>/dev/nul
 grep -q done "$D/openremix_bench_state.txt" 2>/dev/null || { echo "bench.sh: the session did not finish" >&2; exit 1; }
 rm -f "$O/timings.txt"; : > "$O/timings.request"
 for i in $(seq 1 20); do [ -s "$O/timings.txt" ] && break; sleep 0.25; done; sleep 0.5
-{ cat "$D/openremix_bench_result.txt"; grep -E "^GPU frame|^# pacing|^# Present call|^# longest|^# asynchronous|^# low latency|^# slowest raster|^# the frame that|^# texture images" "$O/timings.txt" 2>/dev/null; } | tee "$DEV/bench-$LABEL.txt"
+{ cat "$D/openremix_bench_result.txt"; grep -E "^GPU frame|^# pacing|^# Present call|^# longest|^# asynchronous|^# low latency|^# slowest raster|^# the frame that|^# texture images|^# slowest surface" "$O/timings.txt" 2>/dev/null; } | tee "$DEV/bench-$LABEL.txt"
 cp "$D/openremix_bench_frames.txt" "$DEV/bench-$LABEL-frames.txt"
 # The whole dump: its "# slow" lines list every frame over 40 ms.
 cp "$O/timings.txt" "$DEV/bench-$LABEL-timings.txt" 2>/dev/null

@@ -233,6 +233,9 @@ struct TextureLock {
 };
 std::mutex g_textureLocks;
 std::unordered_map<const void *, TextureLock> g_lockedTextures;
+// A texture level's key in g_lockedTextures (a surface's is the surface):
+// levels are few and the objects far apart.
+const void *levelKey(const void *texture, UINT level) { return static_cast<const uint8_t *>(texture) + level; }
 
 using TextureLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, D3DLOCKED_RECT *, const RECT *,
                                                        DWORD);
@@ -328,25 +331,33 @@ ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
 HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
                                           const RECT *rect, DWORD flags) {
   const HRESULT hr = g_textureLockRect(self, level, locked, rect, flags);
-  if (SUCCEEDED(hr) && level == 0 && locked && !(flags & D3DLOCK_READONLY)) {
+  if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
-    g_lockedTextures[self] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch), rect != nullptr,
-                              rect ? *rect : RECT{}};
+    g_lockedTextures[levelKey(self, level)] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch),
+                                               rect != nullptr, rect ? *rect : RECT{}};
   }
   return hr;
 }
 
 HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level) {
-  if (level == 0) {
-    TextureLock l;
-    {
-      std::lock_guard<std::mutex> lock(g_textureLocks);
-      auto it = g_lockedTextures.find(self);
-      if (it != g_lockedTextures.end()) {
-        l = it->second;
-        g_lockedTextures.erase(it);
-      }
+  TextureLock l;
+  {
+    std::lock_guard<std::mutex> lock(g_textureLocks);
+    auto it = g_lockedTextures.find(levelKey(self, level));
+    if (it != g_lockedTextures.end()) {
+      l = it->second;
+      g_lockedTextures.erase(it);
     }
+  }
+  if (level != 0) {
+    // The levels above 0, whole: the runtime gets the chain the game wrote.
+    D3DSURFACE_DESC desc, top;
+    if (l.bits && SUCCEEDED(self->GetLevelDesc(level, &desc)) && SUCCEEDED(self->GetLevelDesc(0, &top)) &&
+        (!l.hasRect || (l.rect.left == 0 && l.rect.top == 0 && UINT(l.rect.right) >= desc.Width &&
+                        UINT(l.rect.bottom) >= desc.Height)))
+      remix::onTextureLevel(self, level, top.Width, top.Height, desc.Width, desc.Height, desc.Format, l.bits, l.pitch,
+                            self->GetLevelCount());
+  } else {
     D3DSURFACE_DESC desc;
     if (l.bits && SUCCEEDED(self->GetLevelDesc(0, &desc))) {
       // The shader API locks whole levels with an explicit rect; partial
@@ -418,6 +429,22 @@ HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self) {
       else {
         ++g_stats.partialTextureLocks;
         remix::onTexturePartialUpload(texture, desc.Width, desc.Height, desc.Format, l.rect, l.bits, l.pitch);
+      }
+    } else if (whole) {
+      // A level above 0 of a mipmapped texture: the runtime gets the chain
+      // the game wrote (remix::onTextureLevel).
+      IDirect3DTexture9 *container = nullptr;
+      if (SUCCEEDED(self->GetContainer(IID_IDirect3DTexture9, reinterpret_cast<void **>(&container))) && container) {
+        container->Release(); // the texture outlives its surfaces' use here
+        D3DSURFACE_DESC top;
+        const UINT levels = container->GetLevelCount();
+        if (SUCCEEDED(container->GetLevelDesc(0, &top)))
+          for (UINT level = 1; level < levels; ++level)
+            if (std::max(1u, top.Width >> level) == desc.Width && std::max(1u, top.Height >> level) == desc.Height) {
+              remix::onTextureLevel(container, level, top.Width, top.Height, desc.Width, desc.Height, desc.Format,
+                                    l.bits, l.pitch, levels);
+              break;
+            }
       }
     }
   }

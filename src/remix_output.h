@@ -90,6 +90,9 @@ void onDraw(const Draw &draw);
 // row, or per block row for BC formats; `levels`: the texture's mip count).
 void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
                      uint32_t pitch, uint32_t levels);
+// A whole level above 0 was written (`width`, `height`: level 0's).
+void onTextureLevel(const void *texture, uint32_t level, uint32_t width, uint32_t height, uint32_t levelWidth,
+                    uint32_t levelHeight, D3DFORMAT format, const uint8_t *data, uint32_t pitch, uint32_t levels);
 // A sub-rectangle of level 0 was written (`data` points at the rect's first row).
 void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const RECT &rect,
                             const uint8_t *data, uint32_t pitch);
