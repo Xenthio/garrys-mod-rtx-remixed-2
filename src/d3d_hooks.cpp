@@ -1612,6 +1612,10 @@ void *patchImport(HMODULE module, const char *dll, const char *name, void *hook)
 
 } // namespace
 
+void *patchModuleImport(HMODULE module, const char *dll, const char *name, void *hook) {
+  return patchImport(module, dll, name, hook);
+}
+
 bool install(HMODULE module) {
   g_create = reinterpret_cast<CreateFn>(
       patchImport(module, "d3d9.dll", "Direct3DCreate9", reinterpret_cast<void *>(&direct3DCreate9)));

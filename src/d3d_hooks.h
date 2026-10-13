@@ -8,6 +8,10 @@
 // creates. Every draw the game issues passes through here.
 namespace proxy::d3d {
 
+// Rewrites `module`'s import table entry for dll!name; returns what it held
+// (nullptr when the module does not import it).
+void *patchModuleImport(HMODULE module, const char *dll, const char *name, void *hook);
+
 // Hooks `module`'s import of d3d9!Direct3DCreate9. Call once, before the
 // shader API creates its device.
 bool install(HMODULE module);

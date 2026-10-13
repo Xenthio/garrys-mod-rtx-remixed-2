@@ -14,12 +14,15 @@
 #include <algorithm>
 #include <tlhelp32.h>
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -424,11 +427,165 @@ DWORD WINAPI profilerThread(void *) {
   }
 }
 
+// The engine asks every loose search path for a file before its packages
+// (.vpk), each time it wants it: an animation block of a ragdoll or an NPC is
+// asked for hundreds of times in three or more directories that do not have
+// it. gm_construct, a scripted minute of play: 19,000 failed opens, 456 ms,
+// most of them in the few frames that load a model. A read-only open that
+// found no file is remembered for kMissSeconds and fails at once until then
+// (filesystem_stdio.dll's CreateFileA/W; OPENREMIX_PROXY_FILE_MISSES=0 leaves
+// them alone). Not under garrysmod\data, which scripts and tools write at any
+// time; an open that may create the file forgets it.
+//
+// Dev aid (with OPENREMIX_PROXY_STALLS): the opens on the presenting thread
+// to shaderapi_proxy_opens.txt beside the stalls: per path, the calls, how
+// many failed, how many of those were answered from memory, and the time.
+struct FileOpens {
+  unsigned calls = 0, failed = 0, remembered = 0;
+  double ms = 0;
+};
+std::mutex g_openLock;
+std::map<std::string, FileOpens> g_opens;
+bool g_noteOpens = false;
+using CreateFileAFn = HANDLE(WINAPI *)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+using CreateFileWFn = HANDLE(WINAPI *)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+CreateFileAFn g_createFileA = nullptr;
+CreateFileWFn g_createFileW = nullptr;
+
+constexpr ULONGLONG kMissSeconds = 3;
+struct FileMiss {
+  ULONGLONG tick = 0;
+  DWORD error = 0;
+};
+std::mutex g_missLock;
+std::unordered_map<std::string, FileMiss> g_misses;
+
+void noteOpen(const std::string &path, bool failed, bool remembered, const LARGE_INTEGER &began) {
+  LARGE_INTEGER now, frequency;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&frequency);
+  unsigned long thread = 0;
+  double frame = 0;
+  if (!proxy::remix::frameInProgress(thread, frame) || thread != GetCurrentThreadId())
+    return;
+  std::lock_guard<std::mutex> lock(g_openLock);
+  auto &o = g_opens[path];
+  ++o.calls;
+  o.failed += failed;
+  o.remembered += remembered;
+  o.ms += double(now.QuadPart - began.QuadPart) * 1000 / double(frequency.QuadPart);
+}
+
+// `path` lowercased with backslashes; false for one that is never remembered.
+bool missKey(std::string &path) {
+  for (char &c : path) {
+    if (static_cast<unsigned char>(c) >= 128)
+      return false;
+    c = c == '/' ? '\\' : char(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return !path.empty() && path.find("\\garrysmod\\data\\") == std::string::npos;
+}
+
+template <typename Open>
+HANDLE openFile(std::string path, DWORD access, DWORD disposition, Open &&open) {
+  static const bool remember = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_FILE_MISSES", v, sizeof(v)) && v[0] == '0');
+  }();
+  LARGE_INTEGER began;
+  if (g_noteOpens)
+    QueryPerformanceCounter(&began);
+  const bool keyed = remember && missKey(path);
+  const bool reading = disposition == OPEN_EXISTING && !(access & ~(GENERIC_READ | FILE_GENERIC_READ));
+  if (keyed) {
+    std::lock_guard<std::mutex> lock(g_missLock);
+    auto found = g_misses.find(path);
+    if (found != g_misses.end()) {
+      if (reading && GetTickCount64() - found->second.tick < kMissSeconds * 1000) {
+        const DWORD error = found->second.error;
+        if (g_noteOpens)
+          noteOpen(path, true, true, began);
+        SetLastError(error);
+        return INVALID_HANDLE_VALUE;
+      }
+      g_misses.erase(found);
+    }
+  }
+  const HANDLE file = open();
+  const DWORD error = GetLastError();
+  if (keyed && reading && file == INVALID_HANDLE_VALUE &&
+      (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
+    std::lock_guard<std::mutex> lock(g_missLock);
+    if (g_misses.size() > 200000)
+      g_misses.clear();
+    g_misses[path] = {GetTickCount64(), error};
+  }
+  if (g_noteOpens)
+    noteOpen(path, file == INVALID_HANDLE_VALUE, false, began);
+  SetLastError(error);
+  return file;
+}
+
+HANDLE WINAPI createFileA(LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security, DWORD disposition,
+                          DWORD flags, HANDLE model) {
+  return openFile(name ? name : "", access, disposition,
+                  [&] { return g_createFileA(name, access, share, security, disposition, flags, model); });
+}
+
+HANDLE WINAPI createFileW(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security, DWORD disposition,
+                          DWORD flags, HANDLE model) {
+  std::string narrow;
+  for (const wchar_t *c = name; c && *c; ++c)
+    narrow += *c < 128 ? char(*c) : char(0xff); // not ASCII: never remembered
+  return openFile(std::move(narrow), access, disposition,
+                  [&] { return g_createFileW(name, access, share, security, disposition, flags, model); });
+}
+
+void hookFileOpens() {
+  HMODULE fs = GetModuleHandleW(L"filesystem_stdio.dll");
+  if (!fs)
+    return;
+  g_createFileA = reinterpret_cast<CreateFileAFn>(
+      proxy::d3d::patchModuleImport(fs, "KERNEL32.dll", "CreateFileA", reinterpret_cast<void *>(&createFileA)));
+  g_createFileW = reinterpret_cast<CreateFileWFn>(
+      proxy::d3d::patchModuleImport(fs, "KERNEL32.dll", "CreateFileW", reinterpret_cast<void *>(&createFileW)));
+  log("file opens: CreateFileA %p CreateFileW %p\n", reinterpret_cast<void *>(g_createFileA),
+      reinterpret_cast<void *>(g_createFileW));
+}
+
+void writeFileOpens(bool reset) {
+  std::lock_guard<std::mutex> lock(g_openLock);
+  if (reset)
+    g_opens.clear();
+  FILE *f = _wfopen((g_dir + L"\\shaderapi_proxy_opens.txt").c_str(), L"w");
+  if (!f)
+    return;
+  FileOpens all;
+  std::vector<std::pair<double, const std::pair<const std::string, FileOpens> *>> sorted;
+  for (const auto &entry : g_opens) {
+    all.calls += entry.second.calls;
+    all.failed += entry.second.failed;
+    all.remembered += entry.second.remembered;
+    all.ms += entry.second.ms;
+    sorted.emplace_back(entry.second.ms, &entry);
+  }
+  std::sort(sorted.rbegin(), sorted.rend());
+  fprintf(f, "%u opens on the presenting thread, %u failed (%u of them remembered), %.1f ms, %zu paths\n", all.calls,
+          all.failed, all.remembered, all.ms, g_opens.size());
+  for (const auto &[ms, entry] : sorted)
+    fprintf(f, "%8.2f ms %4u calls %4u failed %4u remembered %s\n", ms, entry->second.calls, entry->second.failed,
+            entry->second.remembered, entry->first.c_str());
+  fclose(f);
+}
+
 // Dev aid (OPENREMIX_PROXY_STALLS=<ms>): what the presenting thread runs in
 // the frames that take longer than <ms>. It is sampled only while its frame
 // has already run that long, so shaderapi_proxy_stalls.txt (rewritten every
-// 10 s, for those 10 s) holds the stalls alone: "<samples> <ip> < <code addresses up its
+// 2 s) holds the stalls alone: "<samples> <ip> < <code addresses up its
 // stack>" (a scan of the stack's top, not an unwind: stale addresses may show).
+// It counts from launch, or from the last `shaderapi_proxy_stalls.reset` (a
+// file next to the DLL, removed when seen: dev/bench.sh makes one as a run
+// begins, so the file is that run's).
 DWORD WINAPI stallThread(void *parameter) {
   const double limit = double(reinterpret_cast<uintptr_t>(parameter));
   std::map<std::string, unsigned> counts;
@@ -437,6 +594,7 @@ DWORD WINAPI stallThread(void *parameter) {
   static DWORD64 stack[384];
   ULONGLONG written = GetTickCount64();
   unsigned samples = 0;
+  g_noteOpens = true;
 
   for (;;) {
     Sleep(1);
@@ -481,8 +639,14 @@ DWORD WINAPI stallThread(void *parameter) {
         ++samples;
       }
     }
-    if (GetTickCount64() - written > 10000) {
+    if (GetTickCount64() - written > 2000) {
       written = GetTickCount64();
+      const bool reset = DeleteFileW((g_dir + L"\\shaderapi_proxy_stalls.reset").c_str());
+      if (reset) {
+        counts.clear();
+        samples = 0;
+      }
+      writeFileOpens(reset);
       std::vector<std::pair<unsigned, std::string>> sorted;
       for (const auto &[chain, count] : counts)
         sorted.emplace_back(count, chain);
@@ -493,8 +657,6 @@ DWORD WINAPI stallThread(void *parameter) {
           fprintf(f, "%u %s\n", count, chain.c_str());
         fclose(f);
       }
-      counts.clear(); // each file is its own 10 s
-      samples = 0;
     }
   }
 }
@@ -535,6 +697,7 @@ extern "C" __declspec(dllexport) void *CreateInterface(const char *name, int *re
   static bool threadsStarted = false;
   if (!threadsStarted) {
     threadsStarted = true;
+    hookFileOpens();
     CloseHandle(CreateThread(nullptr, 0, statisticsThread, nullptr, 0, nullptr));
     CloseHandle(CreateThread(nullptr, 0, profilerThread, nullptr, 0, nullptr));
     char stalls[16] = {};
