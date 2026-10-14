@@ -1,5 +1,7 @@
 #include "source_fs.h"
 
+#include "lzma_source.h"
+
 #include <windows.h>
 
 #include <algorithm>
@@ -149,7 +151,21 @@ struct SearchPath {
 // Stored (uncompressed) zip entries: name -> (data offset, size).
 struct Pak {
   std::vector<uint8_t> data;
-  std::unordered_map<std::string, std::pair<uint32_t, uint32_t>> entries;
+  // An entry: where its data starts, its stored size, its size, and whether
+  // it is LZMA compressed (zip method 14; decoded when first read).
+  struct Entry {
+    uint32_t start = 0, stored = 0, size = 0;
+    bool lzma = false;
+  };
+  std::unordered_map<std::string, Entry> entries;
+  std::unordered_map<std::string, std::vector<uint8_t>> decoded;
+  // An entry's bytes (nullptr: one that does not decode).
+  const std::vector<uint8_t> *bytes(const std::string &key, const Entry &e) {
+    auto [it, added] = decoded.try_emplace(key);
+    if (added && !lzma::decodeZip(data.data() + e.start, e.stored, e.size, it->second))
+      it->second.clear();
+    return it->second.size() == e.size ? &it->second : nullptr;
+  }
 };
 
 std::mutex g_lock;
@@ -284,15 +300,16 @@ void setPakfile(std::vector<uint8_t> zip) {
   const uint32_t count = u16(eocd + 10);
   size_t at = u32(eocd + 16);
   for (uint32_t i = 0; i < count && at + 46 <= d.size() && u32(at) == 0x02014b50; ++i) {
-    const uint32_t method = u16(at + 10), size = u32(at + 20), nameLength = u16(at + 28), extra = u16(at + 30),
-                   comment = u16(at + 32), local = u32(at + 42);
+    const uint32_t method = u16(at + 10), stored = u32(at + 20), size = u32(at + 24), nameLength = u16(at + 28),
+                   extra = u16(at + 30), comment = u16(at + 32), local = u32(at + 42);
     if (at + 46 + nameLength > d.size())
       break;
     std::string name(reinterpret_cast<const char *>(d.data() + at + 46), nameLength);
-    if (method == 0 && local + 30 <= d.size() && u32(local) == 0x04034b50) {
+    // Stored (0), or LZMA (14: newer maps compress their pakfile).
+    if ((method == 0 || method == 14) && local + 30 <= d.size() && u32(local) == 0x04034b50) {
       const uint32_t start = local + 30 + u16(local + 26) + u16(local + 28);
-      if (uint64_t(start) + size <= d.size())
-        g_pak.entries[normalize(name)] = {start, size};
+      if (uint64_t(start) + stored <= d.size())
+        g_pak.entries[normalize(name)] = {start, stored, method == 0 ? stored : size, method == 14};
     }
     at += 46 + nameLength + extra + comment;
   }
@@ -303,7 +320,7 @@ bool size(const std::string &path, uint64_t &out) {
   index();
   const std::string key = normalize(path);
   if (auto it = g_pak.entries.find(key); it != g_pak.entries.end()) {
-    out = it->second.second;
+    out = it->second.size;
     return true;
   }
   for (const auto &p : g_paths) {
@@ -327,11 +344,18 @@ bool read(const std::string &path, std::vector<uint8_t> &out, uint64_t offset, u
   index();
   const std::string key = normalize(path);
   if (auto it = g_pak.entries.find(key); it != g_pak.entries.end()) {
-    const auto [start, total] = it->second;
-    if (offset > total)
+    const Pak::Entry &e = it->second;
+    if (offset > e.size)
       return false;
-    length = std::min<uint64_t>(length, total - offset);
-    out.assign(g_pak.data.begin() + start + offset, g_pak.data.begin() + start + offset + length);
+    length = std::min<uint64_t>(length, e.size - offset);
+    if (e.lzma) {
+      const auto *bytes = g_pak.bytes(key, e);
+      if (!bytes)
+        return false;
+      out.assign(bytes->begin() + ptrdiff_t(offset), bytes->begin() + ptrdiff_t(offset + length));
+      return true;
+    }
+    out.assign(g_pak.data.begin() + e.start + offset, g_pak.data.begin() + e.start + offset + length);
     return true;
   }
   for (const auto &p : g_paths) {

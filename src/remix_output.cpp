@@ -77,6 +77,7 @@ struct Stats {
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
   // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
+  std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0};
   std::atomic<uint32_t> pbrDraws{0}, pbrNormalDraws{0}, pbrMapDraws{0}, pbrMetalDraws{0}, pbrNotBase{0}, pbrMapsMissing{0}, pbrCreated{0};
   // Flexed draws (facial animation, see flexScale): rebuilt this frame, and flex streams whose scale was 0.
   std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0};
@@ -1128,6 +1129,8 @@ struct SceneFog {
   bool read = false;
 } g_sceneFog;
 float g_fogMaxDensity = 1;
+// The main camera is in water (bsp::waterAt): set with the cameras each frame.
+bool g_cameraInWater = false;
 std::atomic<uint32_t> g_fogSent{0}, g_fogFrames{0};
 float g_fogSample[8] = {}; // mode, start, end, max density, colour, sent end (statistics)
 
@@ -1159,6 +1162,10 @@ void sendSceneFog() {
     return;
   const SceneFog fog = g_sceneFog;
   g_sceneFog.read = false;
+  // Under water the game's fog is the water's, which the camera medium shows
+  // already: the runtime keeps the fog it had above.
+  if (g_cameraInWater)
+    return;
   remixapi_FogInfo info = {};
   info.sType = REMIXAPI_STRUCT_TYPE_FOG_INFO;
   const float density = std::clamp(g_fogMaxDensity, 0.0f, 1.0f);
@@ -3367,6 +3374,13 @@ void onDraw(const Draw &d) {
   }
   if (!view.perspective) {
     ++g_stats.flat; // HUD / VGUI
+    // The Refract shader drawn flat is a screen effect refracting a copy of
+    // the frame (the water's $underwateroverlay, screen overlays), which the
+    // runtime does not have: drawn, it covered the view (white under water).
+    if (engine_materials::bound().known && nameStarts(engine_materials::bound().shader, "refract")) {
+      ++g_stats.refractOverlaysDropped;
+      return;
+    }
     captureUi(d);
     return;
   }
@@ -4417,6 +4431,26 @@ void onPresent() {
     environment.enabled = skyKnown;
     environment.radiance = {skyRadiance[0], skyRadiance[1], skyRadiance[2]};
 
+    // Under water (the map's water leaves at the eye): the runtime sees
+    // through the water's medium (remixapi_CameraMediumEXT), as Source's
+    // underwater fog shows it. OPENREMIX_PROXY_UNDERWATER=0: not sent.
+    static const bool underwater = envScale("OPENREMIX_PROXY_UNDERWATER", 1) > 0;
+    remixapi_CameraMediumEXT medium = {};
+    medium.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_EXT;
+    {
+      float eye[3], color[3], distance = 0;
+      for (int i = 0; i < 3; ++i)
+        eye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
+                   main->view[14] * main->view[i * 4 + 2]);
+      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance);
+      if (g_cameraInWater) {
+        medium.inside = 1;
+        medium.transmittanceColor = {color[0], color[1], color[2]};
+        medium.transmittanceMeasurementDistance = distance;
+        ++g_stats.underwaterFrames;
+      }
+    }
+    environment.pNext = &medium;
     remixapi_CameraInfo camera = {};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
     auto setup = [&](remixapi_CameraType type, const View &v) {
@@ -5877,6 +5911,10 @@ void dumpStatistics(FILE *out) {
             pinned, g_stats.emissiveCreated.exchange(0), g_stats.emissiveEvicted.exchange(0),
             g_stats.emissiveFailed.exchange(0), g_stats.emissiveNoTexture.exchange(0) / f,
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
+    fprintf(out,
+            "   under water (bsp water leaves at the eye; OPENREMIX_PROXY_UNDERWATER): %.0f%% of frames | flat Refract "
+            "screen effects dropped per frame %.1f\n",
+            100.0 * g_stats.underwaterFrames.exchange(0) / std::max(1.0, f), g_stats.refractOverlaysDropped.exchange(0) / f);
     fprintf(out,
             "   PBR conversions (pbr_rules; OPENREMIX_PROXY_PBR=%d) per frame: %.1f draws, with a normal map %.1f, a "
             "roughness map %.1f, a metal map %.1f | stayed diffuse: not the material's base texture %.1f | a map not uploaded %.1f | "

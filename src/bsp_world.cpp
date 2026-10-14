@@ -1,6 +1,7 @@
 #include "bsp_world.h"
 
 #include "engine_lights.h"
+#include "lzma_source.h"
 #include "source_fs.h"
 #include "texture_categories.h"
 #include "texture_formats.h"
@@ -13,6 +14,7 @@
 #include <remix/remix_native_ext.h>
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <array>
 #include <cmath>
@@ -42,6 +44,7 @@ enum Lump {
   kDispInfo = 26,
   kDispVerts = 33,
   kGameLump = 35,
+  kLeafWaterData = 36,
   kPakfile = 40,
   kTexDataStringData = 43,
   kTexDataStringTable = 44,
@@ -90,6 +93,10 @@ struct Leaf {
   int16_t mins[3], maxs[3];
   uint16_t firstLeafFace, numLeafFaces, firstLeafBrush, numLeafBrushes;
   int16_t waterData, padding;
+};
+struct LeafWater {
+  float surfaceZ, minZ;
+  int16_t surfaceTexInfo, padding;
 };
 struct Model {
   float mins[3], maxs[3], origin[3];
@@ -153,20 +160,46 @@ public:
     int32_t first;
     std::memcpy(&first, data.data() + 8, 4);
     versionFirst = version == 21 && first >= 0 && first <= 8;
+    // Compressed lumps ("LZMA": TF2's and other newer maps), decoded once.
+    // One that does not decode reads as missing.
+    unpacked.assign(64, {});
+    for (int i = 0; i < 64; ++i) {
+      size_t offset, length;
+      if (span(i, offset, length) && length >= 4 && std::memcmp(data.data() + offset, "LZMA", 4) == 0) {
+        compressed.push_back(i);
+        if (!lzma::decodeSource(data.data() + offset, length, unpacked[size_t(i)]))
+          unpacked[size_t(i)].clear();
+      }
+    }
     return true;
   }
   bool versionFirst = false;
-  template <typename T> std::pair<const T *, size_t> lump(int index) const {
+  std::vector<std::vector<uint8_t>> unpacked; // decoded compressed lumps, by index
+  std::vector<int> compressed;                // their indices
+  // A lump's place in the file (as stored: compressed or not).
+  bool span(int index, size_t &offset, size_t &length) const {
     int32_t header[4];
     std::memcpy(header, data.data() + 8 + index * 16, 16);
     const int32_t ofs = versionFirst ? header[1] : header[0], len = versionFirst ? header[2] : header[1];
-    const size_t offset = size_t(ofs), length = size_t(len);
-    if (ofs < 0 || len < 0 || offset + length > data.size() || length % sizeof(T))
+    offset = size_t(ofs);
+    length = size_t(len);
+    return ofs >= 0 && len >= 0 && offset + length <= data.size();
+  }
+  template <typename T> std::pair<const T *, size_t> lump(int index) const {
+    size_t offset, length;
+    if (!span(index, offset, length))
       return {nullptr, 0};
-    // Compressed lumps ("LZMA") are not supported (PC maps are uncompressed).
-    if (length >= 4 && std::memcmp(data.data() + offset, "LZMA", 4) == 0)
+    const uint8_t *at = data.data() + offset;
+    if (length >= 4 && std::memcmp(at, "LZMA", 4) == 0) {
+      const auto &decoded = unpacked[size_t(index)];
+      at = decoded.data();
+      length = decoded.size();
+      if (!length)
+        return {nullptr, 0};
+    }
+    if (length % sizeof(T))
       return {nullptr, 0};
-    return {reinterpret_cast<const T *>(data.data() + offset), length / sizeof(T)};
+    return {reinterpret_cast<const T *>(at), length / sizeof(T)};
   }
   int32_t lumpVersion(int index) const {
     int32_t v;
@@ -236,9 +269,22 @@ bool parseKeyValues(const std::string &text, KeyValues &out) {
         if (i >= tokens.size())
           break;
         if (tokens[i] == "{") {
+          // A nested block: its name, and its values as "name.key" ("proxies"
+          // { "animatedtexture" { "animatedtextureframerate" "30" } }).
           ++i;
-          skip();
-          block.emplace(k, std::string()); // a nested block: its name ("proxies" { "mwenvmaptint" { } })
+          block.emplace(k, std::string());
+          while (i < tokens.size() && tokens[i] != "}") {
+            const std::string kk = lower(plain(tokens[i++]));
+            if (i >= tokens.size())
+              break;
+            if (tokens[i] == "{") {
+              ++i;
+              skip();
+            } else {
+              block[k + "." + kk] = plain(tokens[i++]);
+            }
+          }
+          ++i;
         } else {
           block[k] = plain(tokens[i++]);
         }
@@ -580,6 +626,10 @@ struct Material {
   bool alphaTest = false, modulate = false;
   bool noCull = false; // $nocull: Source draws both sides
   bool owned = false; // ref.handle created here (water)
+  // Water: a translucent body of this colour (linear) and measurement
+  // distance (remixapi_CameraMediumEXT when the camera is in it).
+  bool waterBody = false;
+  float waterColor[3] = {}, waterDistance = 0;
   uint8_t alphaRef = 179;
   MaterialRef ref;
   bool resolved = false;
@@ -683,8 +733,22 @@ struct CullStatistics {
   uint32_t backFaces = 0, visibility = 0, twoSided = 0, skybox = 0, instances = 0;
 };
 
+// A water material's $normalmap, uploaded here from its file (the engine's
+// own upload is of the frame its proxy shows now): every frame of its largest
+// mip, played through one dynamic texture at its AnimatedTexture rate.
+struct WaterNormal {
+  std::string name;
+  uint32_t width = 0, height = 0;
+  std::vector<std::vector<uint8_t>> frames; // RGBA8 (kept only when animated)
+  float fps = 0;
+  uint64_t hash = 0;
+  remixapi_TextureHandle texture = nullptr;
+  int shown = 0;
+};
+
 struct World {
   const remixapi_Interface *api = nullptr;
+  std::vector<std::unique_ptr<WaterNormal>> waterNormals; // by water material, shared by name
   std::string map;
   std::vector<Material> materials;
   std::unordered_map<std::string, int> materialIndex;
@@ -694,6 +758,7 @@ struct World {
   std::vector<Node> nodes;
   std::vector<Plane> planes;
   std::vector<int16_t> leafAreas;
+  std::vector<int> leafWater; // the water material a leaf is in (-1: none)
   std::vector<uint8_t> leafPlayable; // empty, in a cluster, outside the 3D skybox
   int skyArea = -1;
   std::map<std::array<int32_t, 5>, OverlayGroup> overlayGroups;
@@ -703,7 +768,9 @@ struct World {
   LayerStatistics layers;
   CullStatistics cull;
   std::unordered_map<std::string, int> overlayMaterialIndex;
-  uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0;
+  uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0, waterNormalCount = 0, waterAnimated = 0,
+           waterDownFaces = 0;
+  std::string waterNormalFailure; // the last water normal map not loaded, and why
   // Prop placements by 64-unit cell of their origin, for matching engine draws.
   std::unordered_map<uint64_t, std::vector<uint32_t>> propCells;
   std::map<std::array<int32_t, 6>, Group> groups;
@@ -1101,6 +1168,143 @@ bool emissiveEnabled() {
   return enabled;
 }
 
+// OPENREMIX_PROXY_WATER_NORMALS=0: water without its normal map (a flat surface).
+bool waterNormalsEnabled() {
+  static const bool on = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_NORMALS", v, sizeof(v)) && v[0] == '0');
+  }();
+  return on;
+}
+
+// Every frame of a VTF's largest mip as RGBA8 (R in the lowest byte), at
+// most 64 MB of them. Else why not: a missing file, a format not read here.
+const char *vtfFrames(const std::string &name, uint32_t &width, uint32_t &height,
+                      std::vector<std::vector<uint8_t>> &out) {
+  const std::string path = "materials/" + lower(name) + ".vtf";
+  std::vector<uint8_t> header;
+  uint64_t total = 0;
+  if (!fs::size(path, total))
+    return "no file";
+  if (!fs::read(path, header, 0, 80) || header.size() < 64 || std::memcmp(header.data(), "VTF", 4) != 0)
+    return "not read, or not a VTF";
+  uint16_t w, h, frames;
+  uint32_t flags;
+  int32_t format;
+  std::memcpy(&w, header.data() + 16, 2);
+  std::memcpy(&h, header.data() + 18, 2);
+  std::memcpy(&flags, header.data() + 20, 4);
+  std::memcpy(&frames, header.data() + 24, 2);
+  std::memcpy(&format, header.data() + 52, 4);
+  frames = std::max<uint16_t>(frames, 1);
+  uint32_t blockBytes = 0, pixelBytes = 0;
+  int order[4] = {0, 1, 2, 3}; // where r, g, b, a are in a pixel (-1: none)
+  switch (format) {
+  case 0: pixelBytes = 4; break;                                             // RGBA8888
+  case 2: pixelBytes = 3; order[3] = -1; break;                              // RGB888
+  case 3: pixelBytes = 3; order[0] = 2; order[2] = 0; order[3] = -1; break;  // BGR888
+  case 12: pixelBytes = 4; order[0] = 2; order[2] = 0; break;                // BGRA8888
+  case 16: pixelBytes = 4; order[0] = 2; order[2] = 0; order[3] = -1; break; // BGRX8888
+  case 13: case 20: blockBytes = 8; break;                                   // DXT1
+  case 15: blockBytes = 16; break;                                           // DXT5
+  default: return "a format not read here";
+  }
+  const uint64_t level = blockBytes ? uint64_t((w + 3) / 4) * ((h + 3) / 4) * blockBytes : uint64_t(w) * h * pixelBytes;
+  const uint32_t faces = (flags & 0x4000) ? 6 : 1;
+  // The largest mip ends the file: every frame (and face) of it.
+  const uint64_t bytes = level * frames * faces;
+  if (!w || !h || uint64_t(w) * h * 4 * frames > (64u << 20) || bytes > total)
+    return "too large, or shorter than its header says";
+  std::vector<uint8_t> data;
+  if (!fs::read(path, data, total - bytes, bytes) || data.size() != bytes)
+    return "its image not read";
+  out.clear();
+  for (uint32_t f = 0; f < frames; ++f) {
+    const uint8_t *src = data.data() + level * f * faces;
+    if (blockBytes) {
+      out.push_back(blockBytes == 8 ? formats::decodeBC1(src, w, h) : formats::decodeBC3(src, w, h));
+      continue;
+    }
+    std::vector<uint8_t> rgba(size_t(w) * h * 4);
+    for (size_t p = 0; p < size_t(w) * h; ++p)
+      for (int c = 0; c < 4; ++c)
+        rgba[p * 4 + c] = order[c] < 0 ? 255 : src[p * pixelBytes + size_t(order[c])];
+    out.push_back(std::move(rgba));
+  }
+  width = w;
+  height = h;
+  return nullptr;
+}
+
+// The texture of a water material's $normalmap (nullptr: none), made once per
+// name. fps: its AnimatedTexture rate (0: the first frame only, as Source
+// shows a $bumpframe nothing animates).
+WaterNormal *waterNormal(const std::string &name, float fps) {
+  for (auto &known : g_world.waterNormals)
+    if (known->name == name)
+      return known->texture ? known.get() : nullptr;
+  auto normal = std::make_unique<WaterNormal>();
+  normal->name = name;
+  WaterNormal *made = normal.get();
+  g_world.waterNormals.push_back(std::move(normal));
+  std::vector<std::vector<uint8_t>> frames;
+  const char *failure = g_world.api ? vtfFrames(name, made->width, made->height, frames) : "no runtime";
+  if (failure || frames.empty()) {
+    g_world.waterNormalFailure = name + ": " + (failure ? failure : "no frames");
+    return nullptr;
+  }
+  const bool animated = frames.size() > 1 && fps > 0;
+  made->hash = XXH3_64bits_withSeed(name.data(), name.size(), 0x77617465726e726dull) | 1;
+  remixapi_TextureInfoDynamicEXT dynamic = {};
+  dynamic.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_DYNAMIC_EXT;
+  dynamic.dynamic = 1;
+  remixapi_TextureInfoGenerateMipsEXT mips = {};
+  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
+  mips.generate = 1;
+  mips.pNext = animated ? &dynamic : nullptr;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.pNext = &mips;
+  info.hash = made->hash;
+  info.width = made->width;
+  info.height = made->height;
+  info.depth = info.mipLevels = 1;
+  info.format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+  info.data = frames[0].data();
+  info.dataSize = frames[0].size();
+  if (g_world.api->CreateTexture(&info, &made->texture) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    made->texture = nullptr;
+    g_world.waterNormalFailure = name + ": the runtime refused its texture";
+    return nullptr;
+  }
+  ++g_world.waterNormalCount;
+  if (animated) {
+    made->fps = fps;
+    made->frames = std::move(frames);
+    ++g_world.waterAnimated;
+  }
+  return made;
+}
+
+// Animated water normals show the frame of the time (submit, every frame).
+void animateWaterNormals() {
+  static const auto update = reinterpret_cast<PFN_remixapi_UpdateTextureEXT>(
+      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateTextureEXT")));
+  static const ULONGLONG start = GetTickCount64();
+  const double seconds = double(GetTickCount64() - start) / 1000;
+  for (auto &normal : g_world.waterNormals) {
+    if (!update || !normal->texture || normal->frames.size() < 2)
+      continue;
+    const int frame = int(uint64_t(seconds * normal->fps) % normal->frames.size());
+    if (frame == normal->shown)
+      continue;
+    const auto &pixels = normal->frames[size_t(frame)];
+    if (update(normal->texture, 0, 0, normal->width, normal->height, REMIXAPI_FORMAT_R8G8B8A8_UNORM, pixels.data(),
+               normal->width * 4) == REMIXAPI_ERROR_CODE_SUCCESS)
+      normal->shown = frame;
+  }
+}
+
 // Index into g_world.materials, or -1 for materials left to the engine
 // (translucent: its blended draws are kept) or ignored by rtx.conf. brush:
 // for the map's own faces, which rtx.conf does not remove (its ignore list
@@ -1118,9 +1322,12 @@ int materialByName(const std::string &name, bool brush) {
   KeyValues kv;
   if (loadMaterial(m.name, kv) && kv.shader == "water") {
     // Water: Source draws it from render targets (refraction, reflection),
-    // which have no counterpart here. A smooth surface of its fog color
-    // (linear), blended by opacity: murky water (short $fogend, inches) is
-    // nearly opaque, clear water lets the bottom through.
+    // which have no counterpart here. A translucent body (the runtime's thick
+    // translucent material): Fresnel reflection, and below the surface the
+    // bottom fading into the fog colour with depth, nearly gone at $fogend as
+    // Source's water fog has it. OPENREMIX_PROXY_WATER_TRANSLUCENT=0: a smooth
+    // sheet of its fog colour (linear) blended by an opacity from $fogend
+    // (murky water, a short $fogend, nearly opaque).
     float fog[3] = {100, 110, 120};
     const std::string &color = kv.values["$fogcolor"];
     const size_t digits = color.find_first_of("0123456789");
@@ -1152,9 +1359,73 @@ int materialByName(const std::string &name, bool brush) {
     replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
     replacement.materialHash = waterKey;
     opaque.pNext = waterKey ? &replacement : nullptr;
+    // Its $normalmap, sampled as the Water shader samples it: animated by an
+    // AnimatedTexture proxy, moved by a TextureScroll proxy on $bumptransform,
+    // and with $scroll1 set ("multi-texture") averaged with two more scrolling
+    // samples ($scroll1, $scroll2; not with a $flowmap, which Source prefers).
+    const auto &proxies = kv.blocks["proxies"];
+    auto proxy = [&](const char *key) {
+      const auto it = proxies.find(key);
+      return it == proxies.end() ? std::string() : lower(it->second);
+    };
+    const float fps = proxy("animatedtexture.animatedtexturevar") == "$normalmap"
+                          ? (proxies.count("animatedtexture.animatedtextureframerate")
+                                 ? float(std::atof(proxy("animatedtexture.animatedtextureframerate").c_str()))
+                                 : 15.0f)
+                          : 0.0f;
+    WaterNormal *normal = waterNormalsEnabled() && kv.values.count("$normalmap")
+                              ? waterNormal(lower(kv.values["$normalmap"]), fps)
+                              : nullptr;
+    remixapi_MaterialNormalEncodingEXT encoding = {};
+    encoding.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_NORMAL_ENCODING_EXT;
+    encoding.encoding = 5;
+    encoding.pNext = opaque.pNext;
+    remixapi_MaterialNormalScrollEXT scroll = {};
+    scroll.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_NORMAL_SCROLL_EXT;
+    scroll.pNext = &encoding;
+    scroll.layers = 1;
+    wchar_t normalPath[32];
+    if (normal) {
+      if (proxy("texturescroll.texturescrollvar") == "$bumptransform") {
+        const float rate = float(std::atof(proxy("texturescroll.texturescrollrate").c_str()));
+        const float angle = float(std::atof(proxy("texturescroll.texturescrollangle").c_str())) * 3.14159265f / 180;
+        scroll.base[0] = rate * std::cos(angle);
+        scroll.base[1] = rate * std::sin(angle);
+      }
+      float scroll1[3] = {}, scroll2[3] = {};
+      if (kv.values.count("$scroll1"))
+        parseColor(kv.values["$scroll1"], scroll1);
+      if (kv.values.count("$scroll2"))
+        parseColor(kv.values["$scroll2"], scroll2);
+      if (std::fabs(scroll1[0]) > 0 && !kv.values.count("$flowmap")) {
+        scroll.layers = 3;
+        std::copy_n(scroll1, 2, scroll.layer1);
+        std::copy_n(scroll2, 2, scroll.layer2);
+      }
+      opaque.pNext = &scroll;
+      swprintf(normalPath, 32, L"0x%llX", static_cast<unsigned long long>(normal->hash));
+    }
+    static const bool translucentWater = [] {
+      char v[8] = {};
+      return !(GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_TRANSLUCENT", v, sizeof(v)) && v[0] == '0');
+    }();
+    // The fog colour is what passes at the measurement distance: a distance
+    // at which 5% of light (by luminance) is left at $fogend.
+    remixapi_MaterialInfoTranslucentEXT translucent = {};
+    translucent.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
+    translucent.pNext = opaque.pNext;
+    translucent.refractiveIndex = 1.333f;
+    translucent.transmittanceColor = opaque.albedoConstant;
+    {
+      const auto &c = opaque.albedoConstant;
+      const float luminance = std::clamp(0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z, 1e-4f, 0.95f);
+      translucent.transmittanceMeasurementDistance = std::max(fogEnd, 1.0f) * std::log(luminance) / std::log(0.05f);
+    }
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
-    info.pNext = &opaque;
+    info.pNext = translucentWater ? static_cast<void *>(&translucent) : &opaque;
+    if (normal)
+      info.normalTexture = normalPath;
     info.hash = XXH3_64bits(key.data(), key.size()) | 1;
     info.filterMode = 1;
     info.wrapModeU = info.wrapModeV = 1;
@@ -1162,6 +1433,15 @@ int materialByName(const std::string &name, bool brush) {
       m.resolved = m.owned = true;
       ++g_world.waterMaterials;
     }
+    m.waterBody = true;
+    // Both sides: a map's water has a downward face only in places (seen from
+    // below Source draws the upward one with its $bottommaterial). One-sided,
+    // light and shadow rays from under the water crossed it where it had one
+    // and not elsewhere: sharp-edged dark patches on the bottom. Its downward
+    // faces are left out (build): the upward ones serve both sides.
+    m.noCull = true;
+    std::memcpy(m.waterColor, &translucent.transmittanceColor, sizeof(m.waterColor));
+    m.waterDistance = translucent.transmittanceMeasurementDistance;
     slot = int(g_world.materials.size());
     g_world.materials.push_back(std::move(m));
     return slot;
@@ -1308,6 +1588,10 @@ void destroyMeshes() {
   for (auto &m : g_world.materials)
     if (m.owned && m.ref.handle && g_world.api)
       g_world.api->DestroyMaterial(m.ref.handle);
+  for (auto &normal : g_world.waterNormals)
+    if (normal->texture && g_world.api)
+      g_world.api->DestroyTexture(normal->texture);
+  g_world.waterNormals.clear();
   for (auto &[key, group] : g_world.overlayGroups)
     if (group.mesh && g_world.api)
       g_world.api->DestroyMesh(group.mesh);
@@ -1443,6 +1727,7 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
   std::memcpy(&count, directory, 4);
   size_t start = 0, length = 0;
   uint16_t version = 0;
+  bool compressedProps = false;
   for (int32_t i = 0; i < count && size_t(4 + (i + 1) * 16) <= bytes; ++i) {
     int32_t id, offset, size;
     uint16_t flags;
@@ -1451,16 +1736,25 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
     std::memcpy(&version, directory + 10 + i * 16, 2);
     std::memcpy(&offset, directory + 12 + i * 16, 4);
     std::memcpy(&size, directory + 16 + i * 16, 4);
-    if (id == 0x73707270 && !(flags & 1) && offset > 0 && size > 0 && size_t(offset) + size <= file.size()) {
+    // Flag 1: compressed (an LZMA blob there; size is the decoded size).
+    if (id == 0x73707270 && offset > 0 && size > 0 && size_t(offset) < file.size() &&
+        ((flags & 1) || size_t(offset) + size <= file.size())) {
       start = size_t(offset);
       length = size_t(size);
+      compressedProps = (flags & 1) != 0;
       break;
     }
   }
   // sprp v4 (HL2-era) .. v12: origin 0, angles 12, model 24, skin 32 in all.
   if (!length || version < 4)
     return;
-  const std::vector<uint8_t> lump(file.begin() + start, file.begin() + start + length);
+  std::vector<uint8_t> lump;
+  if (compressedProps) {
+    if (!lzma::decodeSource(file.data() + start, file.size() - start, lump))
+      return;
+  } else {
+    lump.assign(file.begin() + start, file.begin() + start + length);
+  }
   const int32_t names = i32(lump, 0);
   size_t at = 4 + size_t(std::max(names, 0)) * 128;
   const int32_t leaves = i32(lump, at);
@@ -1962,6 +2256,25 @@ bool build(const Bsp &bsp) {
     return slot = materialByName(std::string(name, strnlen(name, stringsLength - stringTable[nameId])), true);
   };
 
+  // Leaves under water: the water material each one is in, for a camera
+  // inside it (waterAt).
+  {
+    const auto [waterData, waterDataCount] = bsp.lump<LeafWater>(kLeafWaterData);
+    const auto [infos, infoCount] = bsp.lump<TexInfo>(kTexInfo);
+    g_world.leafWater.assign(leafCount, -1);
+    for (size_t l = 0; leafs && waterData && infos && l < leafCount; ++l) {
+      const int16_t w = leafs[l].waterData;
+      if (!(leafs[l].contents & 0x20) || w < 0 || size_t(w) >= waterDataCount) // CONTENTS_WATER
+        continue;
+      const int16_t surface = waterData[w].surfaceTexInfo;
+      if (surface < 0 || size_t(surface) >= infoCount)
+        continue;
+      const int m = material(infos[surface].texData);
+      if (m >= 0 && g_world.materials[size_t(m)].waterBody)
+        g_world.leafWater[l] = m;
+    }
+  }
+
   constexpr float kCell = 2048;
   // skybox: a face of the 3D skybox baked into world space. Such faces and
   // $nocull materials get groups of their own (the camera's culling is per
@@ -2364,6 +2677,11 @@ bool build(const Bsp &bsp) {
       }
       g_world.triangles += uint32_t((size - 1) * (size - 1) * 2);
       ++g_world.displacements;
+    } else if (face.dispInfo < 0 && g_world.materials[size_t(m)].waterBody && normal[2] < 0) {
+      // Water is two-sided (see materialByName): its upward faces cover it,
+      // and a downward face at the same place stopped rays going down at once
+      // (no depth seen through the water there).
+      ++g_world.waterDownFaces;
     } else if (face.dispInfo < 0) {
       g_world.layers.brushFaces += secondLayer(m, false).present;
       Geometry &g = groupFor(centroid, sky, m, skyboxFace);
@@ -2584,6 +2902,7 @@ void submit(MaterialLookup lookup) {
     return;
   const auto &api = *g_world.api;
   const uint64_t frame = g_world.frames++;
+  animateWaterNormals();
   // Materials resolve once the engine has uploaded their textures (at map
   // load, as a rule): every frame at first, then twice a second.
   if (frame < 600 || frame % 30 == 0)
@@ -2885,6 +3204,25 @@ void submit(MaterialLookup lookup) {
   }
 }
 
+bool waterAt(const float eye[3], float color[3], float &distance) {
+  if (!g_active || g_world.leafWater.empty())
+    return false;
+  int index = 0;
+  for (int guard = 0; index >= 0 && guard < 4096; ++guard) {
+    if (size_t(index) >= g_world.nodes.size() || size_t(g_world.nodes[index].plane) >= g_world.planes.size())
+      return false;
+    const auto &plane = g_world.planes[g_world.nodes[index].plane];
+    index = g_world.nodes[index].children[dot(plane.normal, eye) - plane.dist >= 0 ? 0 : 1];
+  }
+  const int leaf = index < 0 ? -1 - index : -1;
+  if (leaf < 0 || size_t(leaf) >= g_world.leafWater.size() || g_world.leafWater[size_t(leaf)] < 0)
+    return false;
+  const Material &m = g_world.materials[size_t(g_world.leafWater[size_t(leaf)])];
+  std::memcpy(color, m.waterColor, sizeof(m.waterColor));
+  distance = m.waterDistance;
+  return distance > 0;
+}
+
 int areaAt(const float p[3]) {
   int index = 0;
   for (int guard = 0; index >= 0 && guard < 4096; ++guard) {
@@ -3099,12 +3437,15 @@ void dumpStatistics(FILE *out) {
           "   BSP world %s: faces %u displacements %u (sky %u) triangles %u | materials %u/%zu resolved | groups %zu "
           "(meshes %u) | left to the engine: translucent %u, ignored %u | rtx.conf-ignored brush materials kept %u | sky camera %d\n"
           "   BSP static props: %zu placements (%u in the 3D skybox left to the engine), %zu models (%u failed), %u parts | overlays %u "
-          "(%u triangles, %zu groups) | water materials %u\n",
+          "(%u triangles, %zu groups) | water materials %u, with normal maps %u (animated %u; "
+          "OPENREMIX_PROXY_WATER_NORMALS), downward faces left out %u%s%s\n",
           g_world.map.c_str(), g_world.faces, g_world.displacements, g_world.skyFaces, g_world.triangles, resolved,
           g_world.materials.size(), g_world.groups.size(), meshes, g_world.skippedTranslucent, g_world.skippedIgnored, g_world.keptIgnored,
           int(g_world.skyCamera), g_world.props.size(), g_world.skyProps, g_world.propModels.size(),
           g_world.propModelsFailed, g_world.propParts, g_world.overlays, g_world.overlayTriangles,
-          g_world.overlayGroups.size(), g_world.waterMaterials);
+          g_world.overlayGroups.size(), g_world.waterMaterials, g_world.waterNormalCount, g_world.waterAnimated,
+          g_world.waterDownFaces,
+          g_world.waterNormalFailure.empty() ? "" : " | not loaded: ", g_world.waterNormalFailure.c_str());
   {
     const auto &l = g_world.layers;
     uint32_t meshes = 0, waiting = 0;

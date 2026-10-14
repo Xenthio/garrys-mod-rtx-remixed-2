@@ -1,4 +1,4 @@
-project('gmodrtx', 'cpp', version: '0.1.0',
+project('gmodrtx', ['cpp', 'c'], version: '0.1.0',
         default_options: ['cpp_std=c++17', 'warning_level=2', 'buildtype=release', 'b_ndebug=if-release'])
 
 # 64-bit only (Garry's Mod x86-64 branch): configure with cross/x86_64-w64-mingw32.txt.
@@ -21,7 +21,7 @@ shared_library('shaderapidx9',
   'src/dxvk_hash.cpp', 'src/texture_categories.cpp', 'src/source_fs.cpp', 'src/bsp_world.cpp', 'src/engine_hooks.cpp',
   'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp', 'src/engine_shadows.cpp',
   'src/engine_materials.cpp', 'src/engine_nocull.cpp', 'src/pbr_rules.cpp',
-  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp',
+  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'deps/lzma/LzmaDec.c',
   include_directories: include_directories(remix_inc, sdl_inc, 'deps/xxhash'),
   name_prefix: '',
   vs_module_defs: 'shaderapidx9.def',
