@@ -53,6 +53,10 @@ constexpr int kMatrixProjection = 1;
 constexpr unsigned kSlotGetMatrix = 12;
 // IShaderAPI slot 34: int GetCurrentNumBones() const
 constexpr unsigned kSlotGetCurrentNumBones = 34;
+// IShaderDynamicAPI: MaterialFogMode_t GetSceneFogMode(), void
+// GetSceneFogColor(unsigned char *rgb); IShaderAPI: void GetFogDistances(float
+// *start, float *end, float *fogZ). (tools/sdk_vtables64.py, like the above.)
+constexpr unsigned kSlotGetSceneFogMode = 4, kSlotGetSceneFogColor = 5, kSlotGetFogDistances = 213;
 constexpr unsigned kMaxBones = 53; // cModel[53] starting at c58
 
 remixapi_Interface g_api = {};
@@ -959,6 +963,73 @@ struct WorldView {
   float view[16], projection[16];
 };
 std::vector<WorldView> g_worldViews;
+
+// The scene fog of the last world view of the frame (the main view; the 3D
+// skybox's, drawn before it, has its own), read from the shader API at the
+// view's world_lists marker, for remixapi_SetFogState: OpenRemix's
+// volumetrics take their medium from it. `maxDensity`: $fogmaxdensity, which
+// the shader API has no getter for, from the fog register of the view's
+// draws (c16.z; kept from the last frame that had one).
+struct SceneFog {
+  int mode = 0; // MaterialFogMode_t: 0 none, 1 linear, 2 linear below a height
+  uint8_t color[3] = {};
+  float start = 0, end = 0, z = 0;
+  bool read = false;
+} g_sceneFog;
+float g_fogMaxDensity = 1;
+std::atomic<uint32_t> g_fogSent{0}, g_fogFrames{0};
+float g_fogSample[8] = {}; // mode, start, end, max density, colour, sent end (statistics)
+
+void readSceneFog() {
+  auto *vtbl = *static_cast<void ***>(g_shaderApi);
+  SceneFog fog;
+  fog.mode = reinterpret_cast<int (*)(void *)>(vtbl[kSlotGetSceneFogMode])(g_shaderApi);
+  reinterpret_cast<void (*)(void *, unsigned char *)>(vtbl[kSlotGetSceneFogColor])(g_shaderApi, fog.color);
+  reinterpret_cast<void (*)(void *, float *, float *, float *)>(vtbl[kSlotGetFogDistances])(g_shaderApi, &fog.start,
+                                                                                            &fog.end, &fog.z);
+  fog.read = true;
+  g_sceneFog = fog;
+}
+
+// Once a frame, before Present. Source's fog is linear from `start` to `end`,
+// where it covers $fogmaxdensity of what is behind. OpenRemix makes of linear
+// fog the exponential medium that leaves 5% at the `end` it is given: the end
+// sent is the distance at which the game's fog, continued at its mean rate,
+// would leave 5%. (The clear stretch before `start` is not kept.)
+// OPENREMIX_PROXY_FOG=0: no fog is sent.
+void sendSceneFog() {
+  static const bool enabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_FOG", v, sizeof(v)) && v[0] == '0');
+  }();
+  static auto set = reinterpret_cast<PFN_remixapi_SetFogState>(
+      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_SetFogState"));
+  if (!set)
+    return;
+  const SceneFog fog = g_sceneFog;
+  g_sceneFog.read = false;
+  remixapi_FogInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_FOG_INFO;
+  const float density = std::clamp(g_fogMaxDensity, 0.0f, 1.0f);
+  const bool valid = enabled && fog.read && (fog.mode == 1 || fog.mode == 2) && std::isfinite(fog.start) &&
+                     std::isfinite(fog.end) && fog.end > 1 && fog.end > fog.start && density > 0.005f;
+  float sentEnd = 0;
+  if (valid) {
+    const float left = std::max(1 - density, 0.05f);
+    sentEnd = fog.end * std::log(0.05f) / std::log(left);
+    info.mode = 3; // D3DFOG_LINEAR
+    info.color = {fog.color[0] / 255.0f, fog.color[1] / 255.0f, fog.color[2] / 255.0f};
+    info.end = sentEnd;
+    info.scale = 1 / sentEnd;
+    ++g_fogSent;
+  }
+  ++g_fogFrames;
+  set(&info);
+  std::lock_guard<std::mutex> lock(g_transientSampleLock);
+  const float sample[8] = {float(fog.read ? fog.mode : -1), fog.start, fog.end, density, float(fog.color[0]),
+                           float(fog.color[1]), float(fog.color[2]), sentEnd};
+  std::copy_n(sample, 8, g_fogSample);
+}
 
 // D3DBLEND / D3DBLENDOP / D3DCMP to the Vulkan enums InstanceInfoBlendEXT uses.
 uint32_t vkBlendFactor(uint32_t d3d) {
@@ -2947,6 +3018,14 @@ void onDraw(const Draw &d) {
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
     return;
+  // $fogmaxdensity of the view being drawn (see SceneFog): cFogParams.z of a
+  // world draw whose vertex shader computes fog.
+  if (g_worldLists > 0 && d.mainTarget && d.vertexProgram && d.vsConstants) {
+    const auto &constants = vsprog::info(*d.vertexProgram).constants;
+    const float density = d.vsConstants[16 * 4 + 2];
+    if (std::binary_search(constants.begin(), constants.end(), uint16_t(16)) && density >= 0 && density <= 1)
+      g_fogMaxDensity = density;
+  }
   if (d.stencil || d.texture0Target || d.target)
     census(d);
   if (!d.mainTarget) {
@@ -4725,6 +4804,7 @@ void onPresent() {
     diag::stage("OPENREMIX_PROXY_CRASH_TEST: faulting on purpose");
     *reinterpret_cast<volatile int *>(uintptr_t(0x10)) = 1;
   }
+  sendSceneFog();
   {
     Timer present(g_usPresent, &g_totalUs[4]);
     g_api.Present(nullptr);
@@ -5650,6 +5730,16 @@ void dumpStatistics(FILE *out) {
         std::lock_guard<std::mutex> lock(g_transientSampleLock);
         std::copy_n(g_modulationSample, 4, m);
       }
+      float fog[8];
+      {
+        std::lock_guard<std::mutex> lock(g_transientSampleLock);
+        std::copy_n(g_fogSample, 8, fog);
+      }
+      const uint32_t fogFrames = g_fogFrames.exchange(0);
+      fprintf(out,
+              "   scene fog (remixapi_SetFogState; OPENREMIX_PROXY_FOG): sent in %u of %u frames | last: mode %.0f (-1 not "
+              "read), start %.0f, end %.0f, max density %.3f, colour %.0f %.0f %.0f -> end sent %.0f\n",
+              g_fogSent.exchange(0), fogFrames, fog[0], fog[1], fog[2], fog[3], fog[4], fog[5], fog[6], fog[7]);
       fprintf(out,
               "   draws tinted by their modulation colour (pixel shader c1: render colour x alpha, as the texture factor) per "
               "frame: %.1f, of them adding nothing (not drawn) %.1f, masked by the base texture's alpha "
@@ -5861,6 +5951,7 @@ bool onMarker(const char *text) {
             w.projection[8 + c] = -w.projection[8 + c];
         }
         g_worldViews.push_back(w);
+        readSceneFog();
       }
     }
     depth(g_worldLists, v);
