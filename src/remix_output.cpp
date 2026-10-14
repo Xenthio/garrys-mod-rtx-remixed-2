@@ -62,13 +62,15 @@ HWND g_hiddenWindow = nullptr;
 void *g_shaderApi = nullptr;
 uint64_t g_frame = 0;
 
+float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g_transientSampleLock)
+
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
       badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
-      emissiveLightDraws{0}, unlitVertexColorDraws{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
+      emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
   // Flexed draws (facial animation, see flexScale): rebuilt this frame, and flex streams whose scale was 0.
   std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0};
@@ -174,6 +176,9 @@ struct RemixTexture {
   // dxvk::legacyTextureHash of the upload (0: none): a second key mods may
   // replace its material by (remixapi_MaterialInfoReplacementHashEXT).
   uint64_t legacyHash = 0;
+  // An X8R8G8B8 upload's hash with X made 0xff (0: none), a second key in
+  // g_texturesByHash: the engine leaves X unwritten in some of its uploads.
+  uint64_t opaqueHash = 0;
   std::vector<uint64_t> emissive; // its unlit / self-illuminated variants (g_emissiveMaterials keys)
   // A render-target texture's contents (onTargetPixels): a dynamic runtime
   // texture of this size, rewritten in place (remixapi_UpdateTextureEXT).
@@ -3476,6 +3481,66 @@ void onDraw(const Draw &d) {
   if (d.texture0Target)
     d3d::requestTargetContents(d.texture0);
   inst.blend = blendState(d);
+  // The modulation colour: the entity's render colour and alpha (a tinted
+  // volumetric light shaft, a prop painted with the colour tool, a fading
+  // effect) times the material's $color and $alpha. VertexLitGeneric,
+  // UnlitGeneric and UnlitTwoTexture take it in pixel shader c1, linear
+  // (g_DiffuseModulation), and multiply the texture by it: here the texture
+  // factor, whose rgb the runtime decodes as sRGB. (Their vertex shaders' c47
+  // is not it: 16, 16, 16, 1 under UnlitTwoTexture.) A mesh drawn with its own
+  // COLOR0 keeps that (the colour stage has two arguments), and so does a
+  // draw whose modulation is white.
+  if (d.psConstants && bound.known && !multiply && !hasColors && !decalKind &&
+      (nameStarts(bound.shader, "vertexlitgeneric") || nameStarts(bound.shader, "unlitgeneric") ||
+       nameStarts(bound.shader, "unlittwotexture"))) {
+    const float *m = d.psConstants + 1 * 4;
+    uint32_t factor = 0;
+    for (int c = 0; c < 4; ++c) {
+      float v = std::isfinite(m[c]) ? std::clamp(m[c], 0.0f, 1.0f) : 1.0f;
+      if (c < 3)
+        v = v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1 / 2.4f) - 0.055f;
+      else if (!d.blend)
+        v = 1;
+      factor |= uint32_t(v * 255.0f + 0.5f) << (c == 3 ? 24 : 16 - c * 8);
+    }
+    // $blendtintbybasealpha (VertexLitGeneric: a player model's clothes in
+    // the player's colour): the tint counts where the base texture's alpha
+    // says so, lerp(base, base x tint, base alpha). The runtime's colour
+    // operation 7.
+    float value = 0;
+    const bool byBaseAlpha = !d.blend && engine_materials::currentFloat("$blendtintbybasealpha", value) && value != 0;
+    // The same switch with a near-black $color2 and $phongalbedotint is a
+    // metalness idiom (Modern Warfare base weapons: "$color2 [0 0 0]"): the
+    // alpha marks metal, whose diffuse colour the tint removes and whose
+    // albedo-coloured Phong highlight is then all it shows. There is no such
+    // highlight here, and the tint alone left brass and steel black: these
+    // keep their texture's colour.
+    const bool metalIdiom = byBaseAlpha && std::max({m[0], m[1], m[2]}) < 0.25f &&
+                            engine_materials::currentFloat("$phongalbedotint", value) && value != 0;
+    g_stats.modulatedMetal += metalIdiom;
+    if (factor != 0xffffffffu && !metalIdiom) {
+      ++g_stats.modulatedDraws;
+      {
+        std::lock_guard<std::mutex> lock(g_transientSampleLock);
+        std::copy_n(m, 4, g_modulationSample);
+      }
+      // What adds nothing is not drawn (Source keeps faded effects alive).
+      if (additiveDraw && (!(factor & 0xffffff) || (d.srcBlend == D3DBLEND_SRCALPHA && !(factor >> 24)))) {
+        ++g_stats.modulatedBlack;
+        return;
+      }
+      g_stats.modulatedMasked += byBaseAlpha;
+      inst.blend.tFactor = factor;
+      inst.blend.textureColorOperation = byBaseAlpha ? 7 : 3;
+      inst.blend.textureColorArg1Source = 1;
+      inst.blend.textureColorArg2Source = 3;
+      if (d.blend) {
+        inst.blend.textureAlphaOperation = 3;
+        inst.blend.textureAlphaArg1Source = 1;
+        inst.blend.textureAlphaArg2Source = 3;
+      }
+    }
+  }
   if (unlitColors) {
     ++g_stats.unlitVertexColorDraws;
     // $vertexalpha: the vertices' alpha fades the texture's (the runtime's
@@ -4772,7 +4837,7 @@ struct PendingTexture {
   uint32_t width = 0, height = 0, levels = 0;
   D3DFORMAT format = D3DFMT_UNKNOWN;
   std::vector<std::vector<uint8_t>> level;
-  uint64_t contentHash = 0, legacyHash = 0;
+  uint64_t contentHash = 0, legacyHash = 0, opaqueHash = 0;
   bool levelZero = false;
   bool complete() const {
     for (const auto &bytes : level)
@@ -4808,6 +4873,7 @@ void createPendingTexture(const void *texture, PendingTexture &p) {
   auto t = std::make_shared<RemixTexture>();
   t->hash = p.contentHash ? p.contentHash : 1;
   t->legacyHash = p.legacyHash;
+  t->opaqueHash = p.opaqueHash;
   remixapi_TextureInfo info = {};
   info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
   info.hash = t->hash;
@@ -4840,6 +4906,9 @@ void createPendingTexture(const void *texture, PendingTexture &p) {
   ++g_stats.textures;
   if (created) {
     g_texturesByHash[p.contentHash] = t;
+    if (t->opaqueHash)
+      if (auto &alias = g_texturesByHash[t->opaqueHash]; alias.expired())
+        alias = t;
     g_textures[texture] = std::move(t);
   }
 }
@@ -4872,12 +4941,23 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   const uint64_t contentHash = dxvk::textureHash(pixels.data(), pixels.size());
   const uint64_t legacyHash = dxvk::legacyTextureHash(pixels.data(), pixels.size());
   noteReplacementKey(contentHash, 'T');
-  if (format == D3DFMT_X8R8G8B8)
+  // The X bytes are whatever the engine's conversion left there (unwritten
+  // memory for some textures): a texture is also found by its hash with X
+  // 0xff, which a file's pixels predict (bsp_world textureHashes).
+  uint64_t opaqueHash = 0;
+  if (format == D3DFMT_X8R8G8B8) {
     for (size_t i = 3; i < pixels.size(); i += 4)
       pixels[i] = 0xff;
+    opaqueHash = dxvk::textureHash(pixels.data(), pixels.size());
+    if (opaqueHash == contentHash)
+      opaqueHash = 0;
+  }
 
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
-  if (auto shared = g_texturesByHash.find(contentHash); shared != g_texturesByHash.end()) {
+  for (uint64_t hash : {contentHash, opaqueHash}) {
+    auto shared = hash ? g_texturesByHash.find(hash) : g_texturesByHash.end();
+    if (shared == g_texturesByHash.end())
+      continue;
     if (auto existing = shared->second.lock()) {
       g_textures[texture] = std::move(existing);
       g_pendingTextures.erase(texture);
@@ -4889,6 +4969,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   p.level[0] = pixels;
   p.contentHash = contentHash;
   p.legacyHash = legacyHash;
+  p.opaqueHash = opaqueHash;
   p.levelZero = true;
   storeCpuCopy(texture, width, height, format, std::move(pixels));
   // Created now with one level or with every level in; else when the last
@@ -5103,17 +5184,20 @@ void applyTargetPixels() {
   for (auto &t : g_targetPixels) {
     if (targetUpdateEntry() && createTargetTexture(t))
       continue;
-    uint64_t previous = 0;
+    uint64_t previous = 0, previousOpaque = 0;
     {
       std::lock_guard<std::recursive_mutex> lock(g_textureLock);
-      if (auto it = g_textures.find(t.texture); it != g_textures.end())
+      if (auto it = g_textures.find(t.texture); it != g_textures.end()) {
         previous = it->second->hash;
+        previousOpaque = it->second->opaqueHash;
+      }
     }
     onTextureUpload(t.texture, t.width, t.height, t.format, t.pixels.data(), t.width * 4, 1);
     // The image changes while the view moves: no trail of dead records.
     std::lock_guard<std::recursive_mutex> lock(g_textureLock);
-    if (auto it = g_texturesByHash.find(previous); it != g_texturesByHash.end() && it->second.expired())
-      g_texturesByHash.erase(it);
+    for (uint64_t hash : {previous, previousOpaque})
+      if (auto it = g_texturesByHash.find(hash); it != g_texturesByHash.end() && it->second.expired())
+        g_texturesByHash.erase(it);
   }
   g_targetPixels.clear();
 }
@@ -5560,6 +5644,20 @@ void dumpStatistics(FILE *out) {
             pinned, g_stats.emissiveCreated.exchange(0), g_stats.emissiveEvicted.exchange(0),
             g_stats.emissiveFailed.exchange(0), g_stats.emissiveNoTexture.exchange(0) / f,
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
+    {
+      float m[4];
+      {
+        std::lock_guard<std::mutex> lock(g_transientSampleLock);
+        std::copy_n(g_modulationSample, 4, m);
+      }
+      fprintf(out,
+              "   draws tinted by their modulation colour (pixel shader c1: render colour x alpha, as the texture factor) per "
+              "frame: %.1f, of them adding nothing (not drawn) %.1f, masked by the base texture's alpha "
+              "($blendtintbybasealpha) %.1f | not tinted: near-black tint by base alpha with $phongalbedotint (a "
+              "metalness mask) %.1f | last: %.3f %.3f %.3f x %.3f\n",
+              g_stats.modulatedDraws.exchange(0) / f, g_stats.modulatedBlack.exchange(0) / f,
+              g_stats.modulatedMasked.exchange(0) / f, g_stats.modulatedMetal.exchange(0) / f, m[0], m[1], m[2], m[3]);
+    }
   fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f\n",
           g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f);
   fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f\n",
