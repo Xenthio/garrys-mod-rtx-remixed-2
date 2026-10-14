@@ -238,6 +238,7 @@ bool parseKeyValues(const std::string &text, KeyValues &out) {
         if (tokens[i] == "{") {
           ++i;
           skip();
+          block.emplace(k, std::string()); // a nested block: its name ("proxies" { "mwenvmaptint" { } })
         } else {
           block[k] = plain(tokens[i++]);
         }
@@ -525,6 +526,46 @@ engine_materials::Shading materialShading(KeyValues &kv, std::vector<uint64_t> &
   if (!out.mask.empty())
     maskCandidates = textureHashes(out.mask);
   return out;
+}
+
+// A VMT's PBR conversion (pbr_rules), from its static values.
+pbr::Material materialPbr(KeyValues &kv) {
+  auto text = [&](const char *k) {
+    const auto it = kv.values.find(k);
+    return it == kv.values.end() ? std::string() : lower(it->second);
+  };
+  auto number = [&](const char *k) {
+    const auto it = kv.values.find(k);
+    return it == kv.values.end() ? 0.0f : float(std::atof(it->second.c_str()));
+  };
+  pbr::Inputs in;
+  in.shader = kv.shader;
+  in.base = text("$basetexture");
+  in.bump = text("$bumpmap");
+  in.envmapMask = text("$envmapmask");
+  in.phongExponentTexture = text("$phongexponenttexture");
+  in.ssbump = number("$ssbump") != 0;
+  in.phong = number("$phong") != 0;
+  in.envmap = !text("$envmap").empty();
+  in.baseAlphaPhongMask = number("$basemapalphaphongmask") != 0;
+  in.baseAlphaEnvmapMask = number("$basealphaenvmapmask") != 0;
+  in.normalAlphaEnvmapMask = number("$normalmapalphaenvmapmask") != 0;
+  in.envmapSphere = number("$envmapsphere") != 0;
+  in.envmapMode = number("$envmapmode") != 0;
+  in.phongExponent = number("$phongexponent");
+  if (kv.values.count("$envmaptint"))
+    in.hasEnvmapTint = parseColor(kv.values["$envmaptint"], in.envmapTint);
+  in.phongAlbedoTint = number("$phongalbedotint") != 0;
+  in.blendTintByBaseAlpha = number("$blendtintbybasealpha") != 0;
+  if (kv.values.count("$color2"))
+    in.hasColor2 = parseColor(kv.values["$color2"], in.color2);
+  const auto &proxies = kv.blocks["proxies"];
+  in.mwb = pbr::mwbBase(in.base) || proxies.count("mwenvmaptint") || proxies.count("arc9envmaptint");
+  if (kv.values.count("$phongboost"))
+    in.phongBoost = number("$phongboost");
+  in.surfaceProp = text("$surfaceprop");
+  in.luminance = textureLuminance;
+  return pbr::convert(in);
 }
 
 // --- World geometry -----------------------------------------------------------
@@ -1142,6 +1183,8 @@ int materialByName(const std::string &name, bool brush) {
       m.candidates = textureHashes(kv.values["$basetexture"]);
     if (emissiveEnabled())
       m.shading = materialShading(kv, m.maskCandidates);
+    if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active)
+      m.shading.base = lower(kv.values["$basetexture"]);
   }
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
@@ -2448,6 +2491,24 @@ std::vector<uint64_t> textureCandidates(const std::string &name) {
   return textureHashes(name);
 }
 
+float textureLuminance(const std::string &name) {
+  static std::mutex lock;
+  static std::unordered_map<std::string, float> known;
+  {
+    std::lock_guard<std::mutex> guard(lock);
+    if (auto it = known.find(name); it != known.end())
+      return it->second;
+  }
+  ensureFileSystem();
+  float rgba[4];
+  const float value = textureMean(name, rgba) ? 0.2126f * rgba[0] + 0.7152f * rgba[1] + 0.0722f * rgba[2] : -1.0f;
+  std::lock_guard<std::mutex> guard(lock);
+  if (known.size() > 8192)
+    known.clear();
+  known[name] = value;
+  return value;
+}
+
 bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   std::string mapName = lower(requestedMap);
   if (mapName.rfind("maps/", 0) == 0)
@@ -2531,7 +2592,9 @@ void submit(MaterialLookup lookup) {
         continue;
       // A mask the engine never uploads (a format the proxy does not take)
       // must not keep the surface untextured: lit after ten seconds.
-      const bool emissive = m.shading.mode != engine_materials::Shading::Lit && !m.maskDropped;
+      // (A PBR conversion waits for its maps as well.)
+      const bool emissive =
+          (m.shading.mode != engine_materials::Shading::Lit || m.shading.pbr.active) && !m.maskDropped;
       for (uint64_t h : m.candidates) {
         auto ref = lookup(h, emissive ? &m.shading : nullptr, &m.maskCandidates);
         if (!ref.handle && emissive && frame >= 600 && (ref = lookup(h, nullptr, nullptr)).handle)

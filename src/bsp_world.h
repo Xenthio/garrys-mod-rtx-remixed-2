@@ -32,6 +32,9 @@ using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materi
 // under: its largest mips, from the VTF file. Empty: no file, or a format the
 // proxy does not upload. Render thread.
 std::vector<uint64_t> textureCandidates(const std::string &name);
+// A texture's mean luminance as stored (0..1, gamma; its smallest mip), or
+// -1 when its file is missing or in a format not read. Cached by name.
+float textureLuminance(const std::string &name);
 
 // Loads `maps/<mapName>.bsp` from the search paths; an empty name unloads.
 // Returns whether the map's world is now provided from the BSP.

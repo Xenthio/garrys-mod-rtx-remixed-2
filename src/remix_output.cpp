@@ -76,6 +76,8 @@ struct Stats {
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
+  // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
+  std::atomic<uint32_t> pbrDraws{0}, pbrNormalDraws{0}, pbrMapDraws{0}, pbrMetalDraws{0}, pbrNotBase{0}, pbrMapsMissing{0}, pbrCreated{0};
   // Flexed draws (facial animation, see flexScale): rebuilt this frame, and flex streams whose scale was 0.
   std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0};
   // Eye draws (the Eyes shader), and the iris overlays made for them.
@@ -543,11 +545,58 @@ engine_materials::Shading shadingFor(const void *texture, const engine_materials
   return bound;
 }
 
+// A PBR conversion's maps as uploaded textures (0: none).
+struct PbrMaps {
+  bool use = false; // the conversion applies
+  uint64_t normal = 0, maps[2] = {}; // roughness, metallic
+};
+
+// The maps of `s`'s conversion for a draw of `t`: none unless `t` is the
+// material's base texture (another texture on sampler 0 is not what its maps
+// belong to). complete: every map it names is uploaded. Caller holds
+// g_textureLock.
+PbrMaps pbrMapsFor(const RemixTexture &t, const engine_materials::Shading &s, bool knownBase, bool *complete = nullptr) {
+  PbrMaps maps;
+  if (complete)
+    *complete = true;
+  if (!s.pbr.active)
+    return maps;
+  if (!knownBase) {
+    const auto &candidates = namedTexture(s.base).candidates;
+    if (s.base.empty() || (maskTextureHash(s.base, false) != t.hash &&
+                           std::find(candidates.begin(), candidates.end(), t.hash) == candidates.end())) {
+      ++g_stats.pbrNotBase;
+      return maps;
+    }
+  }
+  maps.use = true;
+  auto resolve = [&](const std::string &name) -> uint64_t {
+    if (name.empty())
+      return 0;
+    if (name == s.base)
+      return t.hash;
+    const uint64_t hash = maskTextureHash(name, false);
+    if (!hash && complete)
+      *complete = false;
+    return hash;
+  };
+  maps.normal = resolve(s.pbr.normal);
+  bool missing = !s.pbr.normal.empty() && !maps.normal;
+  for (int i = 0; i < 2; ++i) {
+    maps.maps[i] = resolve(s.pbr.maps[i].texture);
+    missing |= !s.pbr.maps[i].texture.empty() && !maps.maps[i];
+  }
+  g_stats.pbrMapsMissing += missing;
+  return maps;
+}
+
 // The variant of a texture's material that shows it as `s` says, with the
-// mask texture `maskHash` (0: none). Caller holds g_textureLock.
+// mask texture `maskHash` (0: none) and the PBR maps `pbr` (unused: diffuse).
+// Caller holds g_textureLock.
 EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shading &s, uint64_t maskHash, bool lights,
-                                 uint64_t *materialHash = nullptr) {
+                                 uint64_t *materialHash = nullptr, const PbrMaps &pbr = {}) {
   using engine_materials::Shading;
+  const bool emits = s.mode != Shading::Lit;
   static const float scale = envScale("OPENREMIX_PROXY_EMISSIVE_SCALE", 1.0f);
   // Tints are continuous (proxies animate them): 1/64 steps bound the variants.
   struct Key {
@@ -555,6 +604,12 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     float maskScale;
     uint16_t tint[3];
     uint8_t mode, lights;
+    // The PBR conversion: its maps; roughness, metallic, then per map
+    // exponent, bias, scale; in use | ssbump << 1, then per map invert | curve
+    // << 1 | channel << 2.
+    uint64_t normal, maps[2];
+    float pbr[8];
+    uint8_t pbrBits[3];
   } key;
   std::memset(&key, 0, sizeof(key)); // hashed as bytes
   key.mask = maskHash;
@@ -563,6 +618,21 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     key.tint[c] = uint16_t(std::lround(std::clamp(std::isfinite(s.tint[c]) ? s.tint[c] : 0.0f, 0.0f, 64.0f) * 64));
   key.mode = uint8_t(s.mode);
   key.lights = lights;
+  if (pbr.use) {
+    const auto &p = s.pbr;
+    key.normal = pbr.normal;
+    key.pbr[0] = p.roughness;
+    key.pbr[1] = p.metallic;
+    key.pbrBits[0] = uint8_t(1 | p.ssbump << 1);
+    for (int i = 0; i < 2; ++i) {
+      const auto &m = p.maps[i];
+      key.maps[i] = pbr.maps[i];
+      key.pbr[2 + 3 * i] = m.exponent;
+      key.pbr[3 + 3 * i] = m.bias;
+      key.pbr[4 + 3 * i] = m.scale;
+      key.pbrBits[1 + i] = uint8_t(m.invert | (m.curve & 1) << 1 | (m.channel & 3) << 2);
+    }
+  }
   uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), t.hash);
   if (!hash || hash == t.hash)
     hash = ~t.hash;
@@ -572,9 +642,29 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   variant.lastFrame = g_frame;
   if (variant.handle)
     return &variant;
-  wchar_t path[32], maskPath[32];
+  wchar_t path[32], maskPath[32], normalPath[32], mapPaths[2][32];
   swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
   swprintf(maskPath, 32, L"0x%llX", static_cast<unsigned long long>(maskHash));
+  swprintf(normalPath, 32, L"0x%llX", static_cast<unsigned long long>(pbr.normal));
+  for (int i = 0; i < 2; ++i)
+    swprintf(mapPaths[i], 32, L"0x%llX", static_cast<unsigned long long>(pbr.maps[i]));
+  // PBR: Source's normal maps are tangent space with DirectX's green.
+  remixapi_MaterialNormalEncodingEXT encoding = {};
+  encoding.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_NORMAL_ENCODING_EXT;
+  encoding.encoding = s.pbr.ssbump ? 4 : 2;
+  remixapi_MaterialPbrRemapEXT remap = {};
+  remap.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_REMAP_EXT;
+  remixapi_MaterialPbrChannelEXT *remaps[2] = {&remap.roughness, &remap.metallic};
+  for (int i = 0; i < 2; ++i) {
+    const auto &m = s.pbr.maps[i];
+    *remaps[i] = {m.channel, m.invert, m.curve, m.exponent, m.bias, m.scale};
+  }
+  remixapi_MaterialInfoPbrEXT enable = {};
+  enable.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
+  enable.enabled = 1;
+  remixapi_MaterialInfoReplacementHashEXT replacement = {};
+  replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
+  replacement.materialHash = t.legacyHash;
   remixapi_MaterialInfoEmissionEXT emission = {};
   emission.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_EMISSION_EXT;
   emission.suppressLightGeneration = !lights;
@@ -585,10 +675,27 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
               : s.mode == Shading::SelfIllumMaskAlpha ? REMIXAPI_SELF_ILLUMINATION_MASK_EMISSIVE_ALPHA_EXT
                                                       : REMIXAPI_SELF_ILLUMINATION_MASK_NONE_EXT;
   self.maskScale = std::isfinite(s.maskScale) && s.maskScale > 0 ? s.maskScale : 1;
-  // As the lit material (ensureMaterial), plus the emission.
+  // As the lit material (ensureMaterial), plus the emission and the PBR
+  // conversion. A lit one keeps the texture's legacy key, as that material.
+  void *chain = emits ? static_cast<void *>(&self) : t.legacyHash ? &replacement : nullptr;
   remixapi_MaterialInfoOpaqueEXT opaque = {};
   opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-  opaque.pNext = &self;
+  if (pbr.use) {
+    remap.pNext = chain;
+    enable.pNext = &remap;
+    chain = &enable;
+    if (pbr.normal) {
+      encoding.pNext = chain;
+      chain = &encoding;
+    }
+    opaque.roughnessConstant = s.pbr.roughness;
+    opaque.metallicConstant = s.pbr.metallic;
+    if (pbr.maps[0])
+      opaque.roughnessTexture = mapPaths[0];
+    if (pbr.maps[1])
+      opaque.metallicTexture = mapPaths[1];
+  }
+  opaque.pNext = chain;
   opaque.albedoConstant = {1, 1, 1};
   opaque.opacityConstant = 1;
   opaque.alphaTestType = 7;
@@ -598,10 +705,14 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   info.pNext = &opaque;
   info.hash = hash;
   info.albedoTexture = path;
+  if (pbr.use && pbr.normal)
+    info.normalTexture = normalPath;
   if (maskHash)
     info.emissiveTexture = maskPath;
-  info.emissiveIntensity = scale;
-  info.emissiveColorConstant = {key.tint[0] / 64.0f, key.tint[1] / 64.0f, key.tint[2] / 64.0f};
+  if (emits) {
+    info.emissiveIntensity = scale;
+    info.emissiveColorConstant = {key.tint[0] / 64.0f, key.tint[1] / 64.0f, key.tint[2] / 64.0f};
+  }
   info.filterMode = 1;
   info.wrapModeU = info.wrapModeV = 1;
   if (g_api.CreateMaterial(&info, &variant.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -609,7 +720,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     ++g_stats.emissiveFailed;
     return nullptr;
   }
-  ++g_stats.emissiveCreated;
+  ++(emits ? g_stats.emissiveCreated : g_stats.pbrCreated);
   // Evicted variants (animated tints) leave their keys behind.
   if (t.emissive.size() >= 256)
     t.emissive.erase(std::remove_if(t.emissive.begin(), t.emissive.end(),
@@ -619,22 +730,56 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   return &variant;
 }
 
+// The draw counts of a PBR conversion.
+void countPbr(const PbrMaps &maps) {
+  if (!maps.use)
+    return;
+  ++g_stats.pbrDraws;
+  g_stats.pbrNormalDraws += maps.normal != 0;
+  g_stats.pbrMapDraws += maps.maps[0] != 0;
+  g_stats.pbrMetalDraws += maps.maps[1] != 0;
+}
+
 // A draw's material: the texture's lit one, or its unlit / self-illuminated
-// variant (falling back to the lit one when its mask texture is not known).
+// variant (falling back to the lit one when its mask texture is not known),
+// with the material's PBR conversion.
 remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s) {
   using engine_materials::Shading;
-  if (s.mode == Shading::Lit)
+  if (s.mode == Shading::Lit && !s.pbr.active)
     return materialFor(texture);
   const bool masked = s.mode == Shading::SelfIllumMask || s.mode == Shading::SelfIllumMaskAlpha;
   const uint64_t maskHash = masked ? maskTextureHash(s.mask) : 0;
-  if (masked && !maskHash)
+  if (masked && !maskHash && !s.pbr.active)
     return materialFor(texture);
   const bool lights = emissiveLights(s, false);
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_textures.find(texture);
   if (it == g_textures.end())
     return nullptr;
-  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights)) {
+  const PbrMaps maps = pbrMapsFor(*it->second, s, false);
+  if (masked && !maskHash) {
+    // Lit, with the conversion.
+    Shading lit = s;
+    lit.mode = Shading::Lit;
+    if (!maps.use)
+      return ensureMaterial(*it->second, 0);
+    if (EmissiveMaterial *variant = ensureEmissive(*it->second, lit, 0, false, nullptr, maps)) {
+      countPbr(maps);
+      return variant->handle;
+    }
+    return ensureMaterial(*it->second, 0);
+  }
+  if (s.mode == Shading::Lit) {
+    if (!maps.use)
+      return ensureMaterial(*it->second, 0);
+    if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, 0, false, nullptr, maps)) {
+      countPbr(maps);
+      return variant->handle;
+    }
+    return ensureMaterial(*it->second, 0);
+  }
+  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights, nullptr, maps)) {
+    countPbr(maps);
     switch (s.mode) {
     case Shading::Unlit: ++g_stats.unlitDraws; break;
     case Shading::SelfIllumBaseAlpha: ++g_stats.selfIllumDraws; break;
@@ -679,7 +824,12 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   if (!texture)
     return {};
   bsp::MaterialRef ref;
-  if (!emission || emission->mode == Shading::Lit) {
+  // Its PBR conversion waits for the maps it names.
+  bool complete = true;
+  const PbrMaps maps = emission ? pbrMapsFor(*texture, *emission, true, &complete) : PbrMaps{};
+  if (!complete)
+    return {};
+  if (!emission || (emission->mode == Shading::Lit && !maps.use)) {
     ref.handle = ensureMaterial(*texture, 0);
     ref.keep = std::move(texture);
     return ref;
@@ -697,7 +847,8 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
       return {};
   }
   uint64_t materialHash = 0;
-  EmissiveMaterial *variant = ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash);
+  EmissiveMaterial *variant =
+      ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash, maps);
   if (!variant)
     return {};
   ++variant->pins;
@@ -3594,8 +3745,10 @@ void onDraw(const Draw &d) {
     // albedo-coloured Phong highlight is then all it shows. There is no such
     // highlight here, and the tint alone left brass and steel black: these
     // keep their texture's colour.
-    const bool metalIdiom = byBaseAlpha && std::max({m[0], m[1], m[2]}) < 0.25f &&
-                            engine_materials::currentFloat("$phongalbedotint", value) && value != 0;
+    // (A PBR conversion that reads that alpha as metal: always.)
+    const bool metalIdiom = byBaseAlpha && ((std::max({m[0], m[1], m[2]}) < 0.25f &&
+                                             engine_materials::currentFloat("$phongalbedotint", value) && value != 0) ||
+                                            (shading.pbr.active && shading.pbr.metalByBaseAlpha));
     g_stats.modulatedMetal += metalIdiom;
     if (factor != 0xffffffffu && !metalIdiom) {
       ++g_stats.modulatedDraws;
@@ -5724,6 +5877,13 @@ void dumpStatistics(FILE *out) {
             pinned, g_stats.emissiveCreated.exchange(0), g_stats.emissiveEvicted.exchange(0),
             g_stats.emissiveFailed.exchange(0), g_stats.emissiveNoTexture.exchange(0) / f,
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
+    fprintf(out,
+            "   PBR conversions (pbr_rules; OPENREMIX_PROXY_PBR=%d) per frame: %.1f draws, with a normal map %.1f, a "
+            "roughness map %.1f, a metal map %.1f | stayed diffuse: not the material's base texture %.1f | a map not uploaded %.1f | "
+            "lit PBR materials created %u\n",
+            pbr::enabled() ? 1 : 0, g_stats.pbrDraws.exchange(0) / f, g_stats.pbrNormalDraws.exchange(0) / f,
+            g_stats.pbrMapDraws.exchange(0) / f, g_stats.pbrMetalDraws.exchange(0) / f, g_stats.pbrNotBase.exchange(0) / f,
+            g_stats.pbrMapsMissing.exchange(0) / f, g_stats.pbrCreated.exchange(0));
     {
       float m[4];
       {

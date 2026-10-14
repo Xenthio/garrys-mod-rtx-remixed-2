@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <string>
 
+#include "pbr_rules.h"
+
 // What the Source material of a draw does with its base texture besides
 // being lit: unlit shaders show it as it is, self-illuminated materials
 // ($selfillum) show the masked part of it as it is. Read from the engine's
@@ -30,6 +32,7 @@ struct Shading {
   float maskScale = 1;       // emitted share = mask * maskScale (above one: overbright)
   std::string mask;          // mask texture ("models/x/y_mask"), SelfIllumMask / MaskAlpha
   std::string base;          // $basetexture's name ("" when unknown), also of Lit materials
+  pbr::Material pbr;         // its PBR conversion (pbr_rules), of the lit surface shaders
 };
 
 // The shading a VMT's shader name selects: Unlit for the unlit shaders,

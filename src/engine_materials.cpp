@@ -1,4 +1,5 @@
 #include "engine_materials.h"
+#include "bsp_world.h"
 #include "remix_output.h"
 
 #include <windows.h>
@@ -69,10 +70,12 @@ constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 // MaterialVarType_t: float 0, string 1, vector 2, texture 3, int 4, fourcc 5, undefined 6, matrix 7, material 8.
-constexpr uint8_t kTypeFloat = 0, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
+constexpr uint8_t kTypeFloat = 0, kTypeString = 1, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
 // MaterialVarFlags_t.
 constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
-              kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagTranslucent = 1 << 21;
+              kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagEnvmapSphere = 1 << 17,
+              kFlagBaseAlphaEnvmapMask = 1 << 20, kFlagTranslucent = 1 << 21, kFlagNormalAlphaEnvmapMask = 1 << 22,
+              kFlagEnvmapMode = 1 << 25;
 
 struct Expected {
   bool shaderApi; // else materialsystem.dll
@@ -162,7 +165,8 @@ using NameFn = const char *(*)(void *);
 using IntFn = int (*)(void *);
 using FloatFn = float (*)(void *);
 using VecFn = const float *(*)(void *);
-NameFn g_materialName = nullptr, g_shaderName = nullptr, g_varName = nullptr, g_subRectName = nullptr;
+NameFn g_materialName = nullptr, g_shaderName = nullptr, g_varName = nullptr, g_subRectName = nullptr,
+       g_varString = nullptr;
 IntFn g_varInt = nullptr;
 FloatFn g_varFloat = nullptr;
 VecFn g_varVec = nullptr;
@@ -185,13 +189,18 @@ struct Entry {
   // Indices into the shader params (-1: the shader has no such parameter).
   int16_t flags = -1, color = -1, color2 = -1, tint = -1, mask = -1, maskScale = -1, envmapMask = -1,
           envmapMaskAlpha = -1, fresnel = -1, fresnelRange = -1, base = -1;
+  // PBR inputs (pbr_rules), of the lit surface shaders.
+  int16_t bump = -1, ssbump = -1, phong = -1, phongExponent = -1, phongExponentTexture = -1, baseAlphaPhongMask = -1,
+          envmap = -1, envmapTint = -1, phongAlbedoTint = -1, blendTintByBaseAlpha = -1, phongBoost = -1,
+          surfaceProp = -1;
+  bool pbrCapable = false;
   std::string name, shaderName;
   bool decalShader = false, modulate = false, lightmapped = false; // by shader name
   // A texture var's name, by the ITexture last seen in it.
   struct TextureName {
     void *texture = nullptr;
     std::string name;
-  } maskTexture, baseTexture;
+  } maskTexture, baseTexture, bumpTexture, exponentTexture, envmapMaskTexture;
 };
 std::unordered_map<void *, Entry> g_entries; // render thread
 Shading g_current;                           // render thread
@@ -272,6 +281,7 @@ void resolve(Entry &e, void *material) {
     e.modulate = shaderLower.compare(0, 13, "decalmodulate") == 0;
     for (const char *world : {"lightmappedgeneric", "worldvertextransition", "lightmapped_4wayblend", "decalbasetimeslightmap"})
       e.lightmapped |= shaderLower.compare(0, std::strlen(world), world) == 0;
+    e.pbrCapable = pbr::capable(shaderLower);
   }
   {
     std::lock_guard<std::mutex> lock(g_stats.lock);
@@ -293,6 +303,18 @@ void resolve(Entry &e, void *material) {
       {"$selfillumfresnel", &Entry::fresnel},
       {"$selfillumfresnelminmaxexp", &Entry::fresnelRange},
       {"$basetexture", &Entry::base},
+      {"$bumpmap", &Entry::bump},
+      {"$ssbump", &Entry::ssbump},
+      {"$phong", &Entry::phong},
+      {"$phongexponent", &Entry::phongExponent},
+      {"$phongexponenttexture", &Entry::phongExponentTexture},
+      {"$basemapalphaphongmask", &Entry::baseAlphaPhongMask},
+      {"$envmap", &Entry::envmap},
+      {"$envmaptint", &Entry::envmapTint},
+      {"$phongalbedotint", &Entry::phongAlbedoTint},
+      {"$blendtintbybasealpha", &Entry::blendTintByBaseAlpha},
+      {"$phongboost", &Entry::phongBoost},
+      {"$surfaceprop", &Entry::surfaceProp},
   };
   for (int i = 0; i < e.count; ++i) {
     void *var = paramAt(e, i);
@@ -375,6 +397,46 @@ void read(Entry &e, Shading &out) {
     if (!(out.maskScale > 0))
       out.mode = Shading::Lit;
   }
+}
+
+// The material's PBR inputs, as its shader reads them now.
+void readPbr(Entry &e, int flags, Shading &out) {
+  auto number = [&](int index) {
+    void *var = paramAt(e, index);
+    return defined(var) ? g_varFloat(var) : 0.0f;
+  };
+  pbr::Inputs in;
+  in.shader = lower(e.shaderName.c_str());
+  in.base = out.base;
+  in.bump = textureName(e.bumpTexture, paramAt(e, e.bump));
+  in.envmapMask = textureName(e.envmapMaskTexture, paramAt(e, e.envmapMask));
+  in.phongExponentTexture = textureName(e.exponentTexture, paramAt(e, e.phongExponentTexture));
+  in.ssbump = number(e.ssbump) != 0;
+  in.phong = number(e.phong) != 0;
+  in.envmap = defined(paramAt(e, e.envmap));
+  in.baseAlphaPhongMask = number(e.baseAlphaPhongMask) != 0;
+  in.baseAlphaEnvmapMask = (flags & kFlagBaseAlphaEnvmapMask) != 0;
+  in.normalAlphaEnvmapMask = (flags & kFlagNormalAlphaEnvmapMask) != 0;
+  in.envmapSphere = (flags & kFlagEnvmapSphere) != 0;
+  in.envmapMode = (flags & kFlagEnvmapMode) != 0;
+  in.phongExponent = number(e.phongExponent);
+  if (defined(paramAt(e, e.envmapTint))) {
+    in.hasEnvmapTint = true;
+    vec3(e, e.envmapTint, in.envmapTint);
+  }
+  in.phongAlbedoTint = number(e.phongAlbedoTint) != 0;
+  in.blendTintByBaseAlpha = number(e.blendTintByBaseAlpha) != 0;
+  if (defined(paramAt(e, e.color2))) {
+    in.hasColor2 = true;
+    vec3(e, e.color2, in.color2);
+  }
+  in.mwb = pbr::mwbBase(in.base);
+  if (void *boost = paramAt(e, e.phongBoost); defined(boost))
+    in.phongBoost = g_varFloat(boost);
+  if (void *prop = paramAt(e, e.surfaceProp); defined(prop) && varType(prop) == kTypeString)
+    in.surfaceProp = lower(g_varString(prop));
+  in.luminance = bsp::textureLuminance;
+  out.pbr = pbr::convert(in);
 }
 
 } // namespace
@@ -465,6 +527,7 @@ bool install(const void *const *shaderApiVtable) {
   g_materialName = reinterpret_cast<NameFn>(at(kGetName));
   g_shaderName = reinterpret_cast<NameFn>(at(kShaderName));
   g_varName = reinterpret_cast<NameFn>(at(kVarName));
+  g_varString = reinterpret_cast<NameFn>(at(kVarString));
   g_varInt = reinterpret_cast<IntFn>(at(kVarInt));
   g_varFloat = reinterpret_cast<FloatFn>(at(kVarFloat));
   g_varVec = reinterpret_cast<VecFn>(at(kVarVec));
@@ -577,6 +640,10 @@ void onBind(void *material) {
   if (e.base >= 0)
     if (void *var = e.params[e.base]; var && *static_cast<uintptr_t *>(var) == g_materialSystem.base + kVarVtable)
       g_current.base = textureName(e.baseTexture, var);
+  if (e.pbrCapable && pbr::enabled()) {
+    void *flagsVar = paramAt(e, e.flags);
+    readPbr(e, flagsVar ? g_varInt(flagsVar) : 0, g_current);
+  }
   remix::onMaterialBound(g_current, e.name.c_str());
   if (g_current.mode == Shading::Lit)
     return;
