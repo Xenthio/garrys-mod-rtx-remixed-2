@@ -4,6 +4,7 @@
 #include <d3d9.h>
 
 #include <cstdint>
+#include <vector>
 #include <cstdio>
 
 // Converts the draws the original shader API issues into Remix API calls
@@ -45,8 +46,9 @@ struct Draw {
   const D3DVERTEXELEMENT9 *elements = nullptr; // terminated by D3DDECL_END
   const void *declaration = nullptr;
   const float *vsConstants = nullptr;          // 256 float4 registers
-  const float *psConstants = nullptr;          // 32 float4 pixel shader registers
+  const float *psConstants = nullptr;          // 224 float4 pixel shader registers
   const void *vertexShader = nullptr;          // IDirect3DVertexShader9 identity
+  const void *pixelShader = nullptr;           // IDirect3DPixelShader9 identity
   const vsprog::Program *vertexProgram = nullptr; // it, decoded (nullptr: not seen at creation)
   const void *texture0 = nullptr;              // texture bound to sampler 0 (base texture)
   const void *texture1 = nullptr;              // texture bound to sampler 1 (Eyes shader: the iris)
@@ -76,9 +78,25 @@ struct Draw {
   uint32_t targetWidth = 0, targetHeight = 0, targetFormat = 0;
   bool texture0Target = false;
   uint32_t forkCategories = 0; // dxvk-remix fork InstanceCategories (render state 42, set by l4d2-rtx)
+  // For host passes (screen-space effects replayed by the runtime).
+  const void *const *textures = nullptr;        // the 16 pixel samplers' textures
+  uint32_t textureTargets = 0;                  // bit n: textures[n] is a render-target texture
+  const DWORD (*samplerStates)[16] = nullptr;   // [sampler][D3DSAMPLERSTATETYPE]
+  const int32_t *psConstantsI = nullptr;        // 16 int4 pixel shader registers
+  const int32_t *vsConstantsI = nullptr;        // 16 int4 vertex shader registers
+  uint32_t psBools = 0, vsBools = 0;            // 16 boolean registers each
+  D3DVIEWPORT9 viewport = {};
+  RECT scissor = {};
+  bool scissorTest = false;
 };
 
 bool enabled();
+
+// A texture's contents as the proxy keeps them (its CPU copy): size, the
+// version its contents are at, whether the pixels are BGRA (else RGBA) and,
+// when `pixels` is given, the pixels themselves, decoded. False: unknown.
+bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint32_t &version, bool &bgra,
+                   std::vector<uint8_t> *pixels);
 
 // Called from IDirect3D9::CreateDevice. May redirect presentation to a hidden
 // window; `gameWindow` receives Remix's output.

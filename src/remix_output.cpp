@@ -8,6 +8,7 @@
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
+#include "host_passes.h"
 #include "particles.h"
 #include "texture_categories.h"
 #include <unordered_set>
@@ -1422,6 +1423,34 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
 
 // Appends a 2D draw to this frame's UI draw list: positions go through the
 // draw's model-view-projection registers to screen pixels.
+// The draw's D3D blend as the runtime's UI blend flags: the default alpha
+// blend as is; modulate overlays (DrawMaterialOverlay, env_screenoverlay:
+// DESTCOLOR/SRCCOLOR), additive HUD elements (kill icons, additive fonts:
+// SRCALPHA/ONE) and opaque fills keep their own.
+uint32_t uiBlendFlags(const Draw &d) {
+  auto factor = [](uint32_t blend) -> uint32_t { // D3DBLEND -> VkBlendFactor
+    switch (blend) {
+    case D3DBLEND_ZERO: return 0;
+    case D3DBLEND_ONE: return 1;
+    case D3DBLEND_SRCCOLOR: return 2;
+    case D3DBLEND_INVSRCCOLOR: return 3;
+    case D3DBLEND_DESTCOLOR: return 4;
+    case D3DBLEND_INVDESTCOLOR: return 5;
+    case D3DBLEND_SRCALPHA: return 6;
+    case D3DBLEND_INVSRCALPHA: return 7;
+    case D3DBLEND_DESTALPHA: return 8;
+    case D3DBLEND_INVDESTALPHA: return 9;
+    case D3DBLEND_SRCALPHASAT: return 14;
+    default: return 6;
+    }
+  };
+  const uint32_t src = d.blend ? d.srcBlend : D3DBLEND_ONE, dst = d.blend ? d.dstBlend : D3DBLEND_ZERO;
+  if (src == D3DBLEND_SRCALPHA && dst == D3DBLEND_INVSRCALPHA)
+    return 0; // the default
+  return REMIXAPI_UI_NATIVE_CUSTOM_BLEND | factor(src) << REMIXAPI_UI_NATIVE_SRC_BLEND_SHIFT |
+         factor(dst) << REMIXAPI_UI_NATIVE_DST_BLEND_SHIFT;
+}
+
 void captureUi(const Draw &d) {
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *tex = findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 0);
@@ -1560,6 +1589,7 @@ void captureUi(const Draw &d) {
   }
   remixapi_UIDrawCommand command = {};
   command.textureId = texture;
+  command.flags = uiBlendFlags(d);
   command.indexCount = uint32_t(indices.size());
   command.indexOffset = uint32_t(g_uiIndices.size());
   for (uint32_t i : indices)
@@ -1918,10 +1948,88 @@ remixapi_ErrorCode g_modsResult = REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE;
 // Dev aid: `bin/remix_screenshot.request` (its contents: an absolute PNG path,
 // or empty for bin/remix_screenshot.png) asks for a screenshot of the next
 // presented frame.
+// Dev aid: `shaderapi_proxy_flat.request` (next to the DLL) appends every flat
+// (non-perspective) draw of the next three frames to shaderapi_proxy_flat.txt:
+// material, shader, texture, blend state, colour and screen bounds, and the
+// first pixel shader registers (effect parameters).
+int g_dumpFlatFrames = 0;   // render thread
+FILE *g_dumpFlat = nullptr; // render thread
+void serviceFlatDumpRequest() {
+  if (g_dumpFlatFrames) {
+    if (--g_dumpFlatFrames == 0 && g_dumpFlat) {
+      fclose(g_dumpFlat);
+      g_dumpFlat = nullptr;
+    }
+    return;
+  }
+  if (g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_flat.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  DeleteFileW(request.c_str());
+  g_dumpFlat = _wfopen((g_moduleDir + L"\\shaderapi_proxy_flat.txt").c_str(), L"a");
+  if (g_dumpFlat) {
+    fprintf(g_dumpFlat, "== frames from %llu\n", (unsigned long long)g_frame);
+    g_dumpFlatFrames = 3;
+  }
+}
+void dumpFlat(const Draw &d) {
+  if (!g_dumpFlat)
+    return;
+  const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+  const auto *col = findElement(d.elements, D3DDECLUSAGE_COLOR, 0);
+  float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+  uint32_t color = 0xffffffff;
+  if (pos && d.vsConstants) {
+    const float *mvp = d.vsConstants + kRegModelViewProj * 4;
+    const auto &s = d.streams[pos->Stream];
+    for (uint32_t v = d.minIndex; v < d.minIndex + d.numVertices && s.data; ++v) {
+      const uint64_t at = uint64_t(s.offset) + uint64_t(int64_t(d.baseVertex) + v) * s.stride;
+      if (at + pos->Offset + 12 > s.size)
+        break;
+      float p[3];
+      std::memcpy(p, s.data + at + pos->Offset, 12);
+      float clip[4];
+      for (int k = 0; k < 4; ++k)
+        clip[k] = p[0] * mvp[k * 4] + p[1] * mvp[k * 4 + 1] + p[2] * mvp[k * 4 + 2] + mvp[k * 4 + 3];
+      const float w = std::fabs(clip[3]) > 1e-6f ? clip[3] : 1.0f;
+      const float x = (clip[0] / w * 0.5f + 0.5f) * g_displayWidth, y = (0.5f - clip[1] / w * 0.5f) * g_displayHeight;
+      x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+      if (v == d.minIndex && col && col->Type == D3DDECLTYPE_D3DCOLOR && at + col->Offset + 4 <= s.size &&
+          col->Stream == pos->Stream)
+        std::memcpy(&color, s.data + at + col->Offset, 4);
+    }
+  }
+  const auto &b = engine_materials::bound();
+  fprintf(g_dumpFlat,
+          "f%llu %s [%s] tex0=%p%s%s tex1=%p blend=%d %u/%u op%u sep=%d write=%x alphaTest=%d stencil=%d z=%d prim=%u verts=%u "
+          "color(argb)=%08x bounds=%.0f,%.0f-%.0f,%.0f target=%ux%u main=%d",
+          (unsigned long long)g_frame, engine_materials::currentName(), b.known ? b.shader : "?", d.texture0,
+          d.texture0Target ? "(target)" : "", d.texture0 && !uiTextureFor(d.texture0) ? "(no ui)" : "", d.texture1,
+          int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.separateAlpha), d.colorWrite, int(d.alphaTest),
+          int(d.stencil), int(d.depthTest), d.primCount, d.numVertices, color, x0, y0, x1, y1, d.targetWidth,
+          d.targetHeight, int(d.mainTarget));
+  if (d.psConstants) {
+    fprintf(g_dumpFlat, " ps:");
+    for (int r = 0; r < 8; ++r)
+      fprintf(g_dumpFlat, " c%d=(%.3g %.3g %.3g %.3g)", r, d.psConstants[r * 4], d.psConstants[r * 4 + 1],
+              d.psConstants[r * 4 + 2], d.psConstants[r * 4 + 3]);
+  }
+  fprintf(g_dumpFlat, "\n");
+}
+
 void serviceScreenshotRequest() {
   // Checked every 16th frame: a file system call per frame shows in profiles.
   if (g_frame % 16)
     return;
+  // Dev aid: shaderapi_proxy_ui.request toggles the developer panel as F12
+  // does (posted to the window, whose thread owns the panel's input).
+  const std::wstring ui = g_moduleDir + L"\\shaderapi_proxy_ui.request";
+  if (GetFileAttributesW(ui.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    DeleteFileW(ui.c_str());
+    PostMessageW(g_gameWindow, WM_KEYUP, VK_F12, 0);
+  }
   const std::wstring request = g_moduleDir + L"\\remix_screenshot.request";
   if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
     return;
@@ -3196,7 +3304,24 @@ void onDraw(const Draw &d) {
   }
   if (d.stencil || d.texture0Target || d.target)
     census(d);
+  // Flat draws into render-target textures or sampling them are the engine's
+  // screen-space passes (effects): replayed by the runtime, not drawn here.
+  // So are the draws of screenspace_general materials (addons' own shaders)
+  // whatever their projection: a sky dome drawn against a depth buffer, say.
+  const auto &material = engine_materials::bound();
+  if (hostpass::wants(d)) {
+    float projection[16];
+    getMatrix(kMatrixProjection, projection);
+    const bool perspective = std::fabs(std::fabs(projection[11]) - 1.0f) < 1e-3f && std::fabs(projection[15]) < 1e-3f;
+    const bool custom = material.known && nameStarts(material.shader, "screenspace_general");
+    if ((!perspective || custom) && hostpass::recordDraw(d, projection))
+      return;
+  }
   if (!d.mainTarget) {
+    // The engine's depth pass (addons' depth buffers): the runtime's own depth
+    // stands in for the geometry.
+    if (d.target && material.known && nameStarts(material.shader, "depthwrite") && hostpass::recordDepth(d))
+      return;
     ++g_stats.offTarget;
     return;
   }
@@ -3384,6 +3509,7 @@ void onDraw(const Draw &d) {
   }
   if (!view.perspective) {
     ++g_stats.flat; // HUD / VGUI
+    dumpFlat(d);
     // The Refract shader drawn flat is a screen effect refracting a copy of
     // the frame (the water's $underwateroverlay, screen overlays), which the
     // runtime does not have: drawn, it covered the view (white under water).
@@ -3746,7 +3872,7 @@ void onDraw(const Draw &d) {
   // draw whose modulation is white.
   if (d.psConstants && bound.known && !multiply && !hasColors && !decalKind &&
       (nameStarts(bound.shader, "vertexlitgeneric") || nameStarts(bound.shader, "unlitgeneric") ||
-       nameStarts(bound.shader, "unlittwotexture"))) {
+       nameStarts(bound.shader, "unlittwotexture")))) {
     const float *m = d.psConstants + 1 * 4;
     uint32_t factor = 0;
     for (int c = 0; c < 4; ++c) {
@@ -4968,6 +5094,7 @@ void onPresent() {
   sampleFramePerformance();
   logFrameSpike();
   serviceScreenshotRequest();
+  serviceFlatDumpRequest();
   // The first frames, for the diagnostics log: a crash while rendering shows
   // how far the game got.
   static uint32_t presents = 0;
@@ -5002,6 +5129,7 @@ void onPresent() {
     *reinterpret_cast<volatile int *>(uintptr_t(0x10)) = 1;
   }
   sendSceneFog();
+  hostpass::submit(g_dumpFlat);
   {
     Timer present(g_usPresent, &g_totalUs[4]);
     g_api.Present(nullptr);
@@ -6129,6 +6257,37 @@ extern "C" __declspec(dllexport) int __cdecl openremix_set_legacy_variable(const
 }
 
 namespace proxy::remix {
+bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint32_t &version, bool &bgra,
+                   std::vector<uint8_t> *pixels) {
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  auto it = g_cpuTextures.find(texture);
+  if (it == g_cpuTextures.end())
+    return false;
+  const auto &t = *it->second;
+  const bool wide = t.format == D3DFMT_A8R8G8B8 || t.format == D3DFMT_X8R8G8B8;
+  if (!wide && t.format != D3DFMT_DXT1 && t.format != D3DFMT_DXT5)
+    return false;
+  width = t.width;
+  height = t.height;
+  version = t.version;
+  bgra = wide;
+  if (pixels) {
+    if (t.format == D3DFMT_DXT1)
+      *pixels = formats::decodeBC1(t.data.data(), t.width, t.height);
+    else if (t.format == D3DFMT_DXT5)
+      *pixels = formats::decodeBC3(t.data.data(), t.width, t.height);
+    else {
+      *pixels = t.data;
+      if (t.format == D3DFMT_X8R8G8B8)
+        for (size_t i = 3; i < pixels->size(); i += 4)
+          (*pixels)[i] = 0xff;
+    }
+    if (pixels->size() != size_t(width) * height * 4)
+      return false;
+  }
+  return true;
+}
+
 bool onMarker(const char *text) {
   constexpr char kPrefix[] = "openremix:";
   if (!text || std::strncmp(text, kPrefix, sizeof(kPrefix) - 1) != 0)

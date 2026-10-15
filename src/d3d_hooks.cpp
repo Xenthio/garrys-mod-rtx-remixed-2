@@ -8,6 +8,8 @@
 #include "bsp_world.h"
 #include "remix_output.h"
 #include "vertex_program.h"
+#include "dxvk_hash.h"
+#include "host_passes.h"
 
 #include <algorithm>
 #include <psapi.h>
@@ -18,6 +20,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
 #include <vector>
 
 namespace proxy::d3d {
@@ -37,10 +40,14 @@ enum : unsigned {
   kCreateIndexBuffer = 27,
   kUpdateSurface = 30,
   kUpdateTexture = 31,
+  kStretchRect = 34,
   kSetRenderTarget = 37,
+  kSetViewport = 47,
   kClear = 43,
   kSetRenderState = 57,
   kSetTexture = 65,
+  kSetSamplerState = 69,
+  kSetScissorRect = 75,
   kDrawPrimitive = 81,
   kDrawIndexedPrimitive = 82,
   kDrawPrimitiveUP = 83,
@@ -49,9 +56,15 @@ enum : unsigned {
   kCreateVertexShader = 91,
   kSetVertexShader = 92,
   kSetVertexShaderConstantF = 94,
+  kSetVertexShaderConstantI = 96,
+  kSetVertexShaderConstantB = 98,
   kSetStreamSource = 100,
   kSetIndices = 104,
+  kCreatePixelShader = 106,
+  kSetPixelShader = 107,
   kSetPixelShaderConstantF = 109,
+  kSetPixelShaderConstantI = 111,
+  kSetPixelShaderConstantB = 113,
   kCreateQuery = 118,
   // IDirect3DQuery9
   kQueryIssue = 6,
@@ -471,19 +484,85 @@ IDirect3DIndexBuffer9 *g_indices = nullptr;
 IDirect3DVertexDeclaration9 *g_decl = nullptr;
 std::unordered_map<IDirect3DVertexDeclaration9 *, std::vector<D3DVERTEXELEMENT9>> g_declElements;
 float g_vsConstants[256 * 4] = {};
-// Pixel shader registers c0..c31 (what Source's shader model 2 shaders use):
-// the factors particle shaders apply per pixel (soft-particle depth scale).
-float g_psConstants[32 * 4] = {};
+// Pixel shader registers c0..c223: the factors particle shaders apply per
+// pixel (soft-particle depth scale), and every constant of a screen-space
+// pass replayed by the runtime (host passes).
+float g_psConstants[224 * 4] = {};
+int32_t g_psConstantsI[16 * 4] = {}, g_vsConstantsI[16 * 4] = {};
+uint32_t g_psBools = 0, g_vsBools = 0;
 IDirect3DSurface9 *g_backBuffer = nullptr;
 IDirect3DSurface9 *g_renderTarget0 = nullptr;
 IDirect3DBaseTexture9 *g_texture0 = nullptr;
 IDirect3DBaseTexture9 *g_texture1 = nullptr;
+IDirect3DBaseTexture9 *g_textures[16] = {}; // every pixel sampler's texture
+uint32_t g_textureTargets = 0;              // bit n: g_textures[n] is a render-target texture
+DWORD g_samplerStates[16][16] = {};         // [sampler][D3DSAMPLERSTATETYPE]
+D3DVIEWPORT9 g_viewport = {};
+RECT g_scissor = {};
 DWORD g_renderStates[256] = {};
 // Vertex shaders decoded at creation (vsprog): the draws whose shader builds
 // the geometry (particles) are run through it on the CPU. A shader object's
 // address is reused after its release, by a shader created anew.
 std::mutex g_vertexProgramLock;
 std::unordered_map<IDirect3DVertexShader9 *, std::shared_ptr<const vsprog::Program>> g_vertexPrograms;
+// Every shader's D3D9 bytecode, by its object (vertex and pixel; guarded by
+// g_vertexProgramLock): screen-space passes are replayed on the runtime with
+// the game's own shaders (dxso), and OPENREMIX_PROXY_DUMP_SHADERS=1 writes
+// each to shaderapi_proxy_shaders\{vs,ps}_<hash>.bin at creation.
+std::unordered_map<const void *, std::shared_ptr<const std::vector<uint32_t>>> g_shaderCode;
+IDirect3DPixelShader9 *g_pixelShader = nullptr; // render thread
+// This DLL's directory (the game's bin\\win64), for the dump.
+const std::wstring &moduleDir() {
+  static const std::wstring dir = [] {
+    wchar_t path[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&moduleDir), &self);
+    GetModuleFileNameW(self, path, MAX_PATH);
+    std::wstring d = path;
+    d.resize(d.find_last_of(L"\\/"));
+    return d;
+  }();
+  return dir;
+}
+// The bytecode's length in DWORDs: the version token, instructions (their
+// operand counts in bits 24..27 from shader model 2) and comment blocks
+// (their length in bits 16..30) up to the END token.
+size_t shaderWords(const DWORD *function) {
+  size_t i = 1;
+  for (; i < (1u << 20); ++i) {
+    const uint32_t token = function[i];
+    if (token == 0x0000ffffu)
+      return i + 1;
+    if ((token & 0xffffu) == 0xfffeu)
+      i += (token >> 16) & 0x7fffu;
+    else if (!(token & 0x80000000u))
+      i += (token >> 24) & 0xfu;
+  }
+  return 0;
+}
+void keepShaderCode(const void *shader, const DWORD *function, const char *kind) {
+  const size_t words = function ? shaderWords(function) : 0;
+  if (!words)
+    return;
+  auto code = std::make_shared<std::vector<uint32_t>>(function, function + words);
+  static const bool dump = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_SHADERS", v, sizeof(v)) && v[0] == '1';
+  }();
+  if (dump) {
+    const std::wstring dir = moduleDir() + L"\\shaderapi_proxy_shaders";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t name[64];
+    swprintf(name, 64, L"\\%hs_%016llx.bin", kind, (unsigned long long)proxy::dxvk::textureHash(reinterpret_cast<const uint8_t *>(code->data()), words * 4));
+    if (FILE *f = _wfopen((dir + name).c_str(), L"wb")) {
+      fwrite(code->data(), 4, words, f);
+      fclose(f);
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+  g_shaderCode[shader] = std::move(code);
+}
 IDirect3DVertexShader9 *g_vertexShader = nullptr;
 std::shared_ptr<const vsprog::Program> g_vertexProgram; // of g_vertexShader (nullptr: unknown)
 std::atomic<uint32_t> g_vertexProgramsCreated{0};       // changes g_vertexProgram may have missed
@@ -520,6 +599,8 @@ using CreateVertexShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, co
 using SetVertexShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DVertexShader9 *);
 using SetVertexShaderConstantFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const float *, UINT);
 using SetPixelShaderConstantFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const float *, UINT);
+using CreatePixelShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const DWORD *, IDirect3DPixelShader9 **);
+using SetPixelShaderFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DPixelShader9 *);
 using SetStreamSourceFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, IDirect3DVertexBuffer9 *, UINT,
                                                        UINT);
 using SetIndicesFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DIndexBuffer9 *);
@@ -548,11 +629,26 @@ CreateVertexShaderFn g_createVertexShader = nullptr;
 SetVertexShaderFn g_setVertexShader = nullptr;
 SetVertexShaderConstantFFn g_setVertexShaderConstantF = nullptr;
 SetPixelShaderConstantFFn g_setPixelShaderConstantF = nullptr;
+CreatePixelShaderFn g_createPixelShader = nullptr;
+SetPixelShaderFn g_setPixelShader = nullptr;
 SetStreamSourceFn g_setStreamSource = nullptr;
 SetIndicesFn g_setIndices = nullptr;
 CreateQueryFn g_createQuery = nullptr;
 using ClearFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, const D3DRECT *, DWORD, D3DCOLOR, float, DWORD);
 ClearFn g_clear = nullptr;
+using StretchRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, IDirect3DSurface9 *, const RECT *,
+                                                   IDirect3DSurface9 *, const RECT *, D3DTEXTUREFILTERTYPE);
+using SetViewportFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const D3DVIEWPORT9 *);
+using SetScissorRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const RECT *);
+using SetSamplerStateFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+using SetShaderConstantIFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const int *, UINT);
+using SetShaderConstantBFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, const BOOL *, UINT);
+StretchRectFn g_stretchRect = nullptr;
+SetViewportFn g_setViewport = nullptr;
+SetScissorRectFn g_setScissorRect = nullptr;
+SetSamplerStateFn g_setSamplerState = nullptr;
+SetShaderConstantIFn g_setVertexShaderConstantI = nullptr, g_setPixelShaderConstantI = nullptr;
+SetShaderConstantBFn g_setVertexShaderConstantB = nullptr, g_setPixelShaderConstantB = nullptr;
 QueryIssueFn g_queryIssue = nullptr;
 QueryGetDataFn g_queryGetData = nullptr;
 // Occlusion queries between Issue(BEGIN) and Issue(END).
@@ -738,6 +834,11 @@ HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect
     g_texture0 = texture;
   else if (stage == 1)
     g_texture1 = texture;
+  if (stage < 16) {
+    g_textures[stage] = texture;
+    const bool target = texture && !g_targetTextures.empty() && g_targetTextures.count(texture) != 0;
+    g_textureTargets = (g_textureTargets & ~(1u << stage)) | (target ? 1u << stage : 0u);
+  }
 
   return g_setTexture(dev, stage, texture);
 }
@@ -764,7 +865,21 @@ HRESULT STDMETHODCALLTYPE createVertexShader(IDirect3DDevice9 *dev, const DWORD 
     g_vertexPrograms[*out] = std::move(program);
     ++g_vertexProgramsCreated;
   }
+  if (SUCCEEDED(hr) && out && *out)
+    keepShaderCode(*out, function, "vs");
   return hr;
+}
+
+HRESULT STDMETHODCALLTYPE createPixelShader(IDirect3DDevice9 *dev, const DWORD *function, IDirect3DPixelShader9 **out) {
+  const HRESULT hr = g_createPixelShader(dev, function, out);
+  if (SUCCEEDED(hr) && out && *out)
+    keepShaderCode(*out, function, "ps");
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE setPixelShader(IDirect3DDevice9 *dev, IDirect3DPixelShader9 *shader) {
+  g_pixelShader = shader;
+  return g_setPixelShader(dev, shader);
 }
 
 HRESULT STDMETHODCALLTYPE setVertexShader(IDirect3DDevice9 *dev, IDirect3DVertexShader9 *shader) {
@@ -787,9 +902,75 @@ HRESULT STDMETHODCALLTYPE setVertexShaderConstantF(IDirect3DDevice9 *dev, UINT s
 }
 
 HRESULT STDMETHODCALLTYPE setPixelShaderConstantF(IDirect3DDevice9 *dev, UINT start, const float *data, UINT count) {
-  if (data && start < 32)
-    std::memcpy(&g_psConstants[start * 4], data, std::min(count, 32 - start) * 16);
+  if (data && start < 224)
+    std::memcpy(&g_psConstants[start * 4], data, std::min(count, 224 - start) * 16);
   return g_setPixelShaderConstantF(dev, start, data, count);
+}
+
+HRESULT STDMETHODCALLTYPE setPixelShaderConstantI(IDirect3DDevice9 *dev, UINT start, const int *data, UINT count) {
+  if (data && start < 16)
+    std::memcpy(&g_psConstantsI[start * 4], data, std::min(count, 16 - start) * 16);
+  return g_setPixelShaderConstantI(dev, start, data, count);
+}
+
+HRESULT STDMETHODCALLTYPE setVertexShaderConstantI(IDirect3DDevice9 *dev, UINT start, const int *data, UINT count) {
+  if (data && start < 16)
+    std::memcpy(&g_vsConstantsI[start * 4], data, std::min(count, 16 - start) * 16);
+  return g_setVertexShaderConstantI(dev, start, data, count);
+}
+
+void setBools(uint32_t &bools, UINT start, const BOOL *data, UINT count) {
+  for (UINT i = 0; data && start + i < 16 && i < count; ++i)
+    bools = (bools & ~(1u << (start + i))) | (data[i] ? 1u << (start + i) : 0u);
+}
+
+HRESULT STDMETHODCALLTYPE setPixelShaderConstantB(IDirect3DDevice9 *dev, UINT start, const BOOL *data, UINT count) {
+  setBools(g_psBools, start, data, count);
+  return g_setPixelShaderConstantB(dev, start, data, count);
+}
+
+HRESULT STDMETHODCALLTYPE setVertexShaderConstantB(IDirect3DDevice9 *dev, UINT start, const BOOL *data, UINT count) {
+  setBools(g_vsBools, start, data, count);
+  return g_setVertexShaderConstantB(dev, start, data, count);
+}
+
+HRESULT STDMETHODCALLTYPE setSamplerState(IDirect3DDevice9 *dev, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value) {
+  if (sampler < 16 && unsigned(type) < 16)
+    g_samplerStates[sampler][type] = value;
+  return g_setSamplerState(dev, sampler, type, value);
+}
+
+HRESULT STDMETHODCALLTYPE setViewport(IDirect3DDevice9 *dev, const D3DVIEWPORT9 *viewport) {
+  if (viewport)
+    g_viewport = *viewport;
+  return g_setViewport(dev, viewport);
+}
+
+HRESULT STDMETHODCALLTYPE setScissorRect(IDirect3DDevice9 *dev, const RECT *rect) {
+  if (rect)
+    g_scissor = *rect;
+  return g_setScissorRect(dev, rect);
+}
+
+// The back buffer (nullptr) or a render-target texture a surface belongs to;
+// false for any other surface.
+bool copySurface(IDirect3DSurface9 *surface, const void *&texture) {
+  texture = nullptr;
+  if (surface == g_backBuffer)
+    return surface != nullptr;
+  IDirect3DTexture9 *container = levelZeroTexture(surface);
+  if (!container || !g_targetTextures.count(container))
+    return false;
+  texture = container;
+  return true;
+}
+
+HRESULT STDMETHODCALLTYPE stretchRect(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, const RECT *srcRect,
+                                      IDirect3DSurface9 *dst, const RECT *dstRect, D3DTEXTUREFILTERTYPE filter) {
+  const void *from = nullptr, *to = nullptr;
+  if (copySurface(src, from) && copySurface(dst, to) && from != to)
+    hostpass::recordCopy(from, srcRect, to, dstRect, filter != D3DTEXF_POINT && filter != D3DTEXF_NONE);
+  return g_stretchRect(dev, src, srcRect, dst, dstRect, filter);
 }
 
 HRESULT STDMETHODCALLTYPE setStreamSource(IDirect3DDevice9 *dev, UINT stream, IDirect3DVertexBuffer9 *vb, UINT offset,
@@ -934,6 +1115,8 @@ HRESULT STDMETHODCALLTYPE queryIssue(IDirect3DQuery9 *query, DWORD flags) {
 // this target draws them again, with that view's matrices.
 HRESULT STDMETHODCALLTYPE clear(IDirect3DDevice9 *dev, DWORD count, const D3DRECT *rects, DWORD flags, D3DCOLOR color,
                                 float z, DWORD stencil) {
+  if ((flags & D3DCLEAR_TARGET) && count == 0 && g_renderTargetTexture)
+    hostpass::recordClear(g_renderTargetTexture, color);
   if (flags & D3DCLEAR_ZBUFFER) {
     auto it = g_occludersDrawn.find(g_renderTarget0);
     if (it != g_occludersDrawn.end() && it->second == g_d3dFrame) {
@@ -970,6 +1153,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.vsConstants = g_vsConstants;
   d.psConstants = g_psConstants;
   d.vertexShader = g_vertexShader;
+  d.pixelShader = g_pixelShader;
   d.vertexProgram = g_vertexProgram.get();
   d.mainTarget = g_renderTarget0 == g_backBuffer;
   d.texture0 = g_texture0;
@@ -1008,6 +1192,16 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
       d.targetFormat = it->second.format;
     }
   d.texture0Target = g_texture0 && g_targetTextures.count(g_texture0) != 0;
+  d.textures = reinterpret_cast<const void *const *>(g_textures);
+  d.textureTargets = g_textureTargets;
+  d.samplerStates = g_samplerStates;
+  d.psConstantsI = g_psConstantsI;
+  d.vsConstantsI = g_vsConstantsI;
+  d.psBools = g_psBools;
+  d.vsBools = g_vsBools;
+  d.viewport = g_viewport;
+  d.scissor = g_scissor;
+  d.scissorTest = g_renderStates[D3DRS_SCISSORTESTENABLE] != 0;
   d.forkCategories = g_renderStates[42]; // unused by D3D9; dxvk-remix fork category tag
   d.elements = decl->second.data();
   d.declaration = g_decl;
@@ -1533,6 +1727,14 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kCreateIndexBuffer, &createIndexBuffer, g_createIndexBuffer);
   hookSlot(vt, kSetRenderTarget, &setRenderTarget, g_setRenderTarget);
   hookSlot(vt, kClear, &clear, g_clear);
+  hookSlot(vt, kStretchRect, &stretchRect, g_stretchRect);
+  hookSlot(vt, kSetViewport, &setViewport, g_setViewport);
+  hookSlot(vt, kSetScissorRect, &setScissorRect, g_setScissorRect);
+  hookSlot(vt, kSetSamplerState, &setSamplerState, g_setSamplerState);
+  hookSlot(vt, kSetVertexShaderConstantI, &setVertexShaderConstantI, g_setVertexShaderConstantI);
+  hookSlot(vt, kSetVertexShaderConstantB, &setVertexShaderConstantB, g_setVertexShaderConstantB);
+  hookSlot(vt, kSetPixelShaderConstantI, &setPixelShaderConstantI, g_setPixelShaderConstantI);
+  hookSlot(vt, kSetPixelShaderConstantB, &setPixelShaderConstantB, g_setPixelShaderConstantB);
   hookSlot(vt, kSetTexture, &setTexture, g_setTexture);
   hookSlot(vt, kSetRenderState, &setRenderState, g_setRenderState);
   hookSlot(vt, kDrawPrimitive, &drawPrimitive, g_drawPrimitive);
@@ -1542,6 +1744,8 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kSetVertexDeclaration, &setVertexDeclaration, g_setVertexDeclaration);
   hookSlot(vt, kCreateVertexShader, &createVertexShader, g_createVertexShader);
   hookSlot(vt, kSetVertexShader, &setVertexShader, g_setVertexShader);
+  hookSlot(vt, kCreatePixelShader, &createPixelShader, g_createPixelShader);
+  hookSlot(vt, kSetPixelShader, &setPixelShader, g_setPixelShader);
   hookSlot(vt, kSetVertexShaderConstantF, &setVertexShaderConstantF, g_setVertexShaderConstantF);
   hookSlot(vt, kSetPixelShaderConstantF, &setPixelShaderConstantF, g_setPixelShaderConstantF);
   hookSlot(vt, kSetStreamSource, &setStreamSource, g_setStreamSource);
@@ -1623,6 +1827,20 @@ bool install(HMODULE module) {
 }
 
 bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+bool targetTexture(const void *texture, uint32_t &width, uint32_t &height, uint32_t &format) {
+  auto it = g_targetTextures.find(texture);
+  if (it == g_targetTextures.end())
+    return false;
+  width = it->second.width;
+  height = it->second.height;
+  format = it->second.format;
+  return true;
+}
+std::shared_ptr<const std::vector<uint32_t>> shaderCode(const void *shader) {
+  std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+  auto it = g_shaderCode.find(shader);
+  return it == g_shaderCode.end() ? nullptr : it->second;
+}
 void requestTargetContents(const void *texture) { wantTargetContents(texture); }
 
 void dumpStatistics(FILE *out) {
@@ -1706,6 +1924,7 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   buffer shadows: %zu buffers, %.1f MiB; partial texture locks %u\n", shadowCount,
           shadowBytes / 1048576.0, g_stats.partialTextureLocks.exchange(0));
   remix::dumpStatistics(out);
+  hostpass::dumpStatistics(out);
 }
 
 } // namespace proxy::d3d

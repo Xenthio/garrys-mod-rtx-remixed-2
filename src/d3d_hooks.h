@@ -1,4 +1,7 @@
 #pragma once
+#include <cstdint>
+#include <memory>
+#include <vector>
 #include <windows.h>
 
 #include <cstdio>
@@ -23,6 +26,11 @@ bool backBufferBound();
 // addon's 2D vignette): its 2D draws are rasterized by D3D and its contents
 // read back (remix::onTargetPixels) while it stays wanted.
 void requestTargetContents(const void *texture);
+
+// A render-target texture's size and D3DFORMAT (false: not one).
+bool targetTexture(const void *texture, uint32_t &width, uint32_t &height, uint32_t &format);
+// A shader object's D3D9 bytecode (nullptr: not seen at creation).
+std::shared_ptr<const std::vector<uint32_t>> shaderCode(const void *shader);
 
 // Writes per-interval draw statistics and resets the interval counters.
 void dumpStatistics(FILE *out);

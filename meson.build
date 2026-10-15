@@ -16,13 +16,26 @@ if sdl_inc == ''
   sdl_inc = remix_inc / '..' / '..' / 'subprojects' / 'SDL3-3.4.14' / 'include'
 endif
 
+subdir('deps/dxso')
+
+# The proxy's own host-pass shaders (src/shaders), SPIR-V as C arrays.
+glslang = find_program('glslangValidator')
+host_shaders = []
+foreach shader : ['host_depth.vert', 'host_depth.frag', 'host_frame_depth.frag']
+  host_shaders += custom_target(shader + '.inc',
+    input: 'src/shaders' / shader, output: shader + '.inc',
+    command: [glslang, '-V', '--vn', shader.replace('.', '_'), '-o', '@OUTPUT@', '@INPUT@'])
+endforeach
+
 shared_library('shaderapidx9',
   'src/main.cpp', 'src/vtable_proxy.cpp', 'src/d3d_hooks.cpp', 'src/remix_output.cpp', 'src/texture_formats.cpp',
   'src/dxvk_hash.cpp', 'src/texture_categories.cpp', 'src/source_fs.cpp', 'src/bsp_world.cpp', 'src/engine_hooks.cpp',
   'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp', 'src/engine_shadows.cpp',
   'src/engine_materials.cpp', 'src/engine_nocull.cpp', 'src/pbr_rules.cpp',
-  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'deps/lzma/LzmaDec.c',
+  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp',
+  'deps/lzma/LzmaDec.c', host_shaders,
   include_directories: include_directories(remix_inc, sdl_inc, 'deps/xxhash'),
+  dependencies: [dxso_dep],
   name_prefix: '',
   vs_module_defs: 'shaderapidx9.def',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'],
