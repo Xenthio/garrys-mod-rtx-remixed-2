@@ -71,6 +71,7 @@ struct Draw {
   uint32_t stencilRef = 0, stencilMask = 0xffffffff, stencilWriteMask = 0xffffffff;
   uint32_t stencilFail = D3DSTENCILOP_KEEP, stencilZFail = D3DSTENCILOP_KEEP;
   uint32_t zFunc = D3DCMP_LESSEQUAL; // D3DRS_ZFUNC
+  uint32_t fillMode = D3DFILL_SOLID;  // D3DRS_FILLMODE (the Wireframe shader: D3DFILL_WIREFRAME)
   bool zEnable = true, zWrite = true;
   // Render target 0 when it is a render-target texture (nullptr: the back
   // buffer or a plain surface), and whether sampler 0 holds such a texture.

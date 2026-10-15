@@ -1182,6 +1182,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.stencilFail = g_renderStates[D3DRS_STENCILFAIL];
   d.stencilZFail = g_renderStates[D3DRS_STENCILZFAIL];
   d.zFunc = g_renderStates[D3DRS_ZFUNC];
+  d.fillMode = g_renderStates[D3DRS_FILLMODE];
   d.zEnable = g_renderStates[D3DRS_ZENABLE] != D3DZB_FALSE;
   d.zWrite = g_renderStates[D3DRS_ZWRITEENABLE] != 0;
   if (g_renderTargetTexture)

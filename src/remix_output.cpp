@@ -75,7 +75,7 @@ struct Stats {
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
-      emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
+      emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, wireframeDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
   // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
   std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0};
@@ -1003,6 +1003,9 @@ struct Instance {
   // its blend state, whatever that is (rasterOnly), unless particles are
   // traced; its depth state is the draw's.
   bool particle = false, rasterOnly = false;
+  // Drawn as its triangles' edges (D3DFILL_WIREFRAME: the Wireframe shader,
+  // $wireframe): a raster-only overlay of lines (remixapi_InstanceInfoWireframeEXT).
+  bool wireframe = false;
   // What its pixel shader does beyond texture x colour, for the runtime's
   // sprite overlays (remixapi_InstanceInfoSpriteEXT flags; 0: nothing).
   uint32_t spriteFlags = 0;
@@ -3872,7 +3875,7 @@ void onDraw(const Draw &d) {
   // draw whose modulation is white.
   if (d.psConstants && bound.known && !multiply && !hasColors && !decalKind &&
       (nameStarts(bound.shader, "vertexlitgeneric") || nameStarts(bound.shader, "unlitgeneric") ||
-       nameStarts(bound.shader, "unlittwotexture")))) {
+       nameStarts(bound.shader, "unlittwotexture") || nameStarts(bound.shader, "wireframe"))) {
     const float *m = d.psConstants + 1 * 4;
     uint32_t factor = 0;
     for (int c = 0; c < 4; ++c) {
@@ -4035,6 +4038,20 @@ void onDraw(const Draw &d) {
   }
   if (!stencilRole(d, inst))
     return;
+  // D3DFILL_WIREFRAME (the Wireframe shader; any material with $wireframe):
+  // the edges of its triangles, unlit, in its colour (texture x modulation x
+  // vertex colour, as the draw's), with the draw's depth state. Not traced: a
+  // line has no surface.
+  if (d.fillMode == D3DFILL_WIREFRAME) {
+    inst.wireframe = inst.rasterOnly = true;
+    inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+    inst.persistent = false;
+    inst.depthTest = d.depthTest && inst.depthTest;
+    inst.depthWrite = d.zWrite;
+    inst.categories &= ~(REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC |
+                         REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET);
+    ++g_stats.wireframeDraws;
+  }
   g_instances.push_back(inst);
   // Eyes (Source's Eyes shader; not EyeRefract): the draw above is the eyeball
   // with its sclera texture, sampler 0. The iris and pupil are a second
@@ -4889,9 +4906,16 @@ void onPresent() {
         overlayOrder.order = uint32_t(&inst - g_instances.data()) + 1;
         info.pNext = &overlayOrder;
       }
-      // A particle's depth state is its draw's ($ignorez glows).
+      // A particle's depth state is its draw's ($ignorez glows), as is a
+      // wireframe draw's (lines over the scene, or through it with $ignorez).
+      remixapi_InstanceInfoWireframeEXT wireframe = {};
+      if (inst.wireframe) {
+        wireframe.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_WIREFRAME_EXT;
+        wireframe.pNext = info.pNext;
+        info.pNext = &wireframe;
+      }
       remixapi_InstanceRasterStateEXT overlayState = {};
-      if (inst.particle && inst.rasterOnly) {
+      if ((inst.particle || inst.wireframe) && inst.rasterOnly) {
         overlayState.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_RASTER_STATE_EXT;
         overlayState.pNext = info.pNext;
         overlayState.depthTest = inst.depthTest;
@@ -6086,6 +6110,8 @@ void dumpStatistics(FILE *out) {
     }
   fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f\n",
           g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f);
+  fprintf(out, "   wireframe draws (D3DFILL_WIREFRAME, raster-only lines) per frame: %.1f\n",
+          g_stats.wireframeDraws.exchange(0) / f);
   fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f\n",
           g_stats.flexed.exchange(0) / f, g_stats.flexRefreshed.exchange(0) / f, g_flexMeshes.size(),
           g_stats.flexUnscaled.exchange(0) / f);
