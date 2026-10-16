@@ -2140,16 +2140,9 @@ bool startRemix() {
   // thresholds tuned for meter-scale scenes; with Source's light intensities
   // nearly every pixel takes the maximum 4 shadow rays (~10 ms on c8m1).
   setDefault("rtx.native.pathtrace.adaptiveLocalSampling", "0");
-  // Hundreds of mod lights, mostly behind walls, would otherwise take most
-  // samples from a nearby flashlight: RIS over 4 candidates weighs their
-  // unshadowed contributions (spot cones included) before the shadow ray.
-  setDefault("rtx.native.pathtrace.sphereCandidates", "4");
   // Source units are inches: the runtime converts its meter-based defaults
   // (denoiser hit distances, visibility-guiding cells) with the scene scale.
   setDefault("rtx.native.pathtrace.sceneScale", "0.0254");
-  // Hundreds of mod lights, mostly behind walls: reservoir reuse (ReSTIR DI)
-  // keeps the visible samples instead of re-drawing from the light tree.
-  setDefault("rtx.native.pathtrace.restir", "1");
   // Static world brushes (onPresent) would otherwise make every ray traverse
   // a static and a dynamic acceleration structure.
   setDefault("rtx.native.pathtrace.combinedTlas", "1");
