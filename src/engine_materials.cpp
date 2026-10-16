@@ -441,28 +441,6 @@ void readPbr(Entry &e, int flags, Shading &out) {
 
 } // namespace
 
-Shading::Mode shaderMode(const char *shaderName) {
-  const std::string name = lower(shaderName);
-  auto is = [&](const char *prefix) {
-    const size_t n = std::strlen(prefix);
-    // The shader or one of its hardware fallbacks ("unlitgeneric_dx8").
-    return name.compare(0, n, prefix) == 0 && (name.size() == n || name[n] == '_');
-  };
-  if (is("unlitgeneric") || is("unlittwotexture") || is("monitorscreen") || is("sprite"))
-    return Shading::Unlit;
-  if (is("vertexlitgeneric") || is("lightmappedgeneric"))
-    return Shading::SelfIllumBaseAlpha;
-  return Shading::Lit;
-}
-
-float fresnelShare(float minimum, float maximum, float exponent) {
-  // The shaders emit mask * saturate(min + (max - min) * (N.V)^exp): the mean
-  // of (N.V)^exp over the projected hemisphere is 2 / (exp + 2).
-  if (!std::isfinite(minimum) || !std::isfinite(maximum) || !std::isfinite(exponent) || exponent < 0)
-    return 1;
-  return std::clamp(minimum + (maximum - minimum) * 2 / (exponent + 2), 0.0f, 1.0f);
-}
-
 bool install(const void *const *shaderApiVtable) {
   static std::atomic<bool> done{false};
   if (done.exchange(true))

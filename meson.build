@@ -31,8 +31,8 @@ shared_library('shaderapidx9',
   'src/main.cpp', 'src/vtable_proxy.cpp', 'src/d3d_hooks.cpp', 'src/remix_output.cpp', 'src/texture_formats.cpp',
   'src/dxvk_hash.cpp', 'src/texture_categories.cpp', 'src/source_fs.cpp', 'src/bsp_world.cpp', 'src/engine_hooks.cpp',
   'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp', 'src/engine_shadows.cpp',
-  'src/engine_materials.cpp', 'src/engine_nocull.cpp', 'src/pbr_rules.cpp',
-  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp',
+  'src/engine_materials.cpp', 'src/material_shading.cpp', 'src/engine_nocull.cpp', 'src/pbr_rules.cpp',
+  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/bake_sky.cpp',
   'deps/lzma/LzmaDec.c', host_shaders,
   include_directories: include_directories(remix_inc, sdl_inc, 'deps/xxhash'),
   dependencies: [dxso_dep],
@@ -40,3 +40,41 @@ shared_library('shaderapidx9',
   vs_module_defs: 'shaderapidx9.def',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'],
 )
+
+bake_charts_test = executable('bsp-bake-charts-test', 'tests/bake_charts.cpp',
+  include_directories: include_directories('src'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('BSP surface lightmap chart mapping', bake_charts_test)
+
+# A diagnostic map host: reads installed content without injecting into the game.
+executable('bsp-replay', 'tools/bsp_replay.cpp', 'tools/replay_settings.cpp', 'tools/replay_timing.cpp',
+  'src/bsp_world.cpp', 'src/source_fs.cpp', 'src/lzma_source.cpp',
+  'src/texture_formats.cpp', 'src/texture_categories.cpp', 'src/pbr_rules.cpp',
+  'src/material_shading.cpp', 'deps/lzma/LzmaDec.c',
+  include_directories: include_directories('src', remix_inc, 'deps/xxhash'),
+  dependencies: meson.get_compiler('cpp').find_library('user32'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+
+replay_settings_test = executable('replay-settings-test', 'tests/replay_settings.cpp', 'tools/replay_settings.cpp',
+  include_directories: include_directories('tools', remix_inc),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Replay camera settings and Source orientation', replay_settings_test)
+replay_timing_test = executable('replay-timing-test', 'tests/replay_timing.cpp', 'tools/replay_timing.cpp',
+  include_directories: include_directories('tools', remix_inc),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Replay steady-state GPU timing window', replay_timing_test)
+
+shader_bytecode_test = executable('shader-bytecode-test', 'tests/shader_bytecode.cpp',
+  include_directories: include_directories('src'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Bounded D3D9 shader bytecode capture', shader_bytecode_test)
+
+d3d_method_test = executable('d3d-method-test', 'tests/d3d_method.cpp',
+  include_directories: include_directories('src'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('D3D9 resource methods across distinct vtables', d3d_method_test)
+
+bake_sky_test = executable('bake-sky-test', 'tests/bake_sky.cpp', 'src/bake_sky.cpp',
+  include_directories: include_directories('src', remix_inc),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Map-load bake sky ownership and animation isolation', bake_sky_test)

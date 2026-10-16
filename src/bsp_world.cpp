@@ -1,6 +1,6 @@
 #include "bsp_world.h"
+#include "bake_charts.h"
 
-#include "engine_lights.h"
 #include "lzma_source.h"
 #include "source_fs.h"
 #include "texture_categories.h"
@@ -12,6 +12,7 @@
 #include <windows.h>
 
 #include <remix/remix_native_ext.h>
+#include <remix/remix_bake_ext.h>
 
 #include <algorithm>
 #include <memory>
@@ -46,6 +47,7 @@ enum Lump {
   kGameLump = 35,
   kLeafWaterData = 36,
   kPakfile = 40,
+  kCubemaps = 42,
   kTexDataStringData = 43,
   kTexDataStringTable = 44,
   kOverlays = 45,
@@ -616,14 +618,15 @@ pbr::Material materialPbr(KeyValues &kv) {
 
 // --- World geometry -----------------------------------------------------------
 struct Material {
-  std::string name;
+  std::string name, baseTexture;
   std::vector<uint64_t> candidates; // texture hashes, largest mip first
   // Unlit or self-illuminated (materialShading), and its mask's hashes.
   engine_materials::Shading shading;
   std::vector<uint64_t> maskCandidates;
   bool maskDropped = false; // the mask was never uploaded: lit instead
   uint32_t categories = 0;
-  bool alphaTest = false, modulate = false;
+  bool alphaTest = false, modulate = false, blended = false;
+  float opacity = 1;
   bool noCull = false; // $nocull: Source draws both sides
   bool owned = false; // ref.handle created here (water)
   // Water: a translucent body of this colour (linear) and measurement
@@ -638,6 +641,7 @@ struct Material {
 struct Geometry {
   std::vector<remixapi_HardcodedVertex> vertices;
   std::vector<uint32_t> indices;
+  std::vector<lightmaps::Chart> lightmaps;
 };
 
 // Faces sharing a spatial cell and draw state: one mesh (a surface per
@@ -669,6 +673,7 @@ struct PropPart {
 struct PropModel {
   std::vector<PropPart> parts;
   bool engineParts = false; // translucent or ignored meshes the engine still draws
+  std::vector<std::string> engineMaterials;
 };
 struct Prop {
   float transform[3][4];
@@ -774,6 +779,9 @@ struct World {
   // Prop placements by 64-unit cell of their origin, for matching engine draws.
   std::unordered_map<uint64_t, std::vector<uint32_t>> propCells;
   std::map<std::array<int32_t, 6>, Group> groups;
+  bool lightStylesAvailable = false;
+  bool hasPlayerStart = false;
+  float playerOrigin[3] = {}, playerAngles[3] = {};
   bool skyCamera = false;
   float skyOrigin[3] = {};
   float skyScale = 16;
@@ -791,6 +799,7 @@ struct World {
   uint32_t propModelsFailed = 0, propParts = 0, skyProps = 0;
   std::vector<std::string> failedModels;
   std::vector<Light> lights;
+  std::vector<std::array<float, 3>> reflectionSeeds;
   Occluders occluders;
   bool occludersBuilt = false;
   // Bumped whenever the instances submit() draws change (meshes built,
@@ -801,8 +810,13 @@ struct World {
   // The same instances as the runtime's scene instances (remix_native_ext.h):
   // added once per version and drawn by one call a frame.
   std::vector<uint64_t> sceneInstances;
+  std::vector<uint64_t> bakeInstances; // world-space transport; excludes sky-camera polygons
+  std::vector<remixapi_BakeSurfaceChartEXT> bakeCharts;
   uint64_t sceneVersion = ~0ull;
   bool sceneValid = false;
+  uint64_t bakeVersion = ~0ull, bakeLights = 0;
+  int bakeStatus = -1; // -1 waiting/unsupported runtime; otherwise native API result
+  const char *bakeReason = "waiting for retained map inputs";
   uint64_t replayedFrames = 0;
   uint32_t recordings = 0;
   uint32_t styledLights = 0, skyboxLights = 0, otherLights = 0, surfaceLights = 0;
@@ -866,7 +880,7 @@ int leafAt(const Bsp &bsp, const float p[3]) {
   return index < 0 ? -1 - index : -1;
 }
 
-void parseSkyCamera(const Bsp &bsp) {
+void parseMapCameras(const Bsp &bsp) {
   const auto [text, length] = bsp.lump<char>(kEntities);
   if (!text)
     return;
@@ -876,8 +890,16 @@ void parseSkyCamera(const Bsp &bsp) {
     if (close == std::string::npos)
       break;
     KeyValues kv;
-    if (!parseKeyValues("entity " + entities.substr(open, close - open + 1), kv) ||
-        lower(kv.values["classname"]) != "sky_camera")
+    if (!parseKeyValues("entity " + entities.substr(open, close - open + 1), kv))
+      continue;
+    const auto classname = lower(kv.values["classname"]);
+    if (!g_world.hasPlayerStart && (classname == "info_player_start" || classname == "info_player_deathmatch")) {
+      g_world.hasPlayerStart = std::sscanf(kv.values["origin"].c_str(), "%f %f %f", &g_world.playerOrigin[0],
+                                         &g_world.playerOrigin[1], &g_world.playerOrigin[2]) == 3;
+      std::sscanf(kv.values["angles"].c_str(), "%f %f %f", &g_world.playerAngles[0],
+                  &g_world.playerAngles[1], &g_world.playerAngles[2]);
+    }
+    if (classname != "sky_camera" || g_world.skyCamera)
       continue;
     if (std::sscanf(kv.values["origin"].c_str(), "%f %f %f", &g_world.skyOrigin[0], &g_world.skyOrigin[1],
                     &g_world.skyOrigin[2]) == 3) {
@@ -887,7 +909,6 @@ void parseSkyCamera(const Bsp &bsp) {
       if (!(g_world.skyScale > 0))
         g_world.skyScale = 16;
     }
-    return;
   }
 }
 
@@ -999,12 +1020,14 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
         continue;
       }
       int material = -1;
+      std::string sourceMaterial;
       bool found = false;
       for (const auto &cd : cdPaths) {
         std::string name = cd + lower(textures[texture]);
         uint64_t bytes;
         if (fs::size("materials/" + name + ".vmt", bytes)) {
           material = materialByName(name);
+          sourceMaterial = name;
           found = true;
           break;
         }
@@ -1016,6 +1039,7 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
       // Translucent (blended, so still drawn by the engine) or ignored.
       if (material < 0) {
         out.engineParts = true;
+        out.engineMaterials.push_back(sourceMaterial);
         continue;
       }
       // Without a texture hash (format the proxy does not upload) the part
@@ -1421,9 +1445,15 @@ int materialByName(const std::string &name, bool brush) {
       const float luminance = std::clamp(0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z, 1e-4f, 0.95f);
       translucent.transmittanceMeasurementDistance = std::max(fogEnd, 1.0f) * std::log(luminance) / std::log(0.05f);
     }
+    // Baking captures the mean optical interface; animated ripple normals
+    // remain on the live material and never become frozen texture inputs.
+    remixapi_MaterialBakeBoundaryEXT boundary = {};
+    boundary.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_BAKE_BOUNDARY_EXT;
+    boundary.pNext = &translucent;
+    boundary.smoothBoundary = 1;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
-    info.pNext = translucentWater ? static_cast<void *>(&translucent) : &opaque;
+    info.pNext = translucentWater ? static_cast<void *>(&boundary) : &opaque;
     if (normal)
       info.normalTexture = normalPath;
     info.hash = XXH3_64bits(key.data(), key.size()) | 1;
@@ -1448,19 +1478,31 @@ int materialByName(const std::string &name, bool brush) {
   }
   if (!kv.shader.empty()) {
     auto flag = [&](const char *k) { return std::atoi(kv.values[k].c_str()) != 0; };
-    if (flag("$translucent") || flag("$additive")) {
+    m.alphaTest = flag("$alphatest");
+    // Source's EvaluateBlendRequirements excludes texture alpha when alpha
+    // testing is enabled. Stock rooftop01a sets both flags and is a cutout,
+    // not a blended prop. Independent alpha sources still require blending.
+    const float opacity = kv.values.count("$alpha") ? float(std::atof(kv.values["$alpha"].c_str())) : 1.f;
+    const int detailMode = std::atoi(kv.values["$detailblendmode"].c_str());
+    const bool detailAlpha = kv.values.count("$detail") &&
+                             (detailMode == 3 || detailMode == 8 || detailMode == 9);
+    m.blended = opacity < 1 || (flag("$translucent") && !m.alphaTest);
+    m.opacity = std::clamp(opacity, 0.f, 1.f);
+    if (flag("$additive") || flag("$vertexalpha") || !std::isfinite(opacity) ||
+        detailAlpha || (brush && m.blended)) {
       ++g_world.skippedTranslucent;
       return slot;
     }
-    m.alphaTest = flag("$alphatest");
     m.noCull = flag("$nocull");
     if (kv.values.count("$alphatestreference")) {
       const float r = float(std::atof(kv.values["$alphatestreference"].c_str()));
       if (r > 0)
         m.alphaRef = uint8_t(std::clamp(r, 0.0f, 1.0f) * 255 + 0.5f);
     }
-    if (kv.values.count("$basetexture"))
-      m.candidates = textureHashes(kv.values["$basetexture"]);
+    if (kv.values.count("$basetexture")) {
+      m.baseTexture = lower(kv.values["$basetexture"]);
+      m.candidates = textureHashes(m.baseTexture);
+    }
     if (emissiveEnabled())
       m.shading = materialShading(kv, m.maskCandidates);
     if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active)
@@ -1518,7 +1560,8 @@ SecondLayer secondLayer(int base, bool use) {
   stats.fourWay += kv.shader.rfind("lightmapped_4wayblend", 0) == 0;
   Material m;
   m.name = name + " ($basetexture2 " + lower(kv.values["$basetexture2"]) + ")";
-  m.candidates = textureHashes(kv.values["$basetexture2"]);
+  m.baseTexture = lower(kv.values["$basetexture2"]);
+  m.candidates = textureHashes(m.baseTexture);
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
   m.categories &= ~uint32_t(REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE | REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN);
@@ -1567,12 +1610,36 @@ template <typename Fn> Fn sceneFunction(const char *name) {
   return runtime ? reinterpret_cast<Fn>(GetProcAddress(runtime, name)) : nullptr;
 }
 
+void invalidateBakeScene() {
+  if (auto publish = sceneFunction<PFN_remixapi_SetBakeSceneEXT>("remixapi_SetBakeSceneEXT")) {
+    if (g_world.map.empty()) {
+      publish(nullptr);
+    } else {
+      remixapi_BakeSceneInfoEXT info = {};
+      info.structSize = sizeof(info);
+      info.version = REMIXAPI_BAKE_SCENE_VERSION_EXT;
+      info.sceneId = XXH3_64bits(g_world.map.data(), g_world.map.size()) | 1;
+      info.revision = g_world.submitVersion + 1;
+      info.sceneScale = .0254f;
+      info.state = REMIXAPI_BAKE_SCENE_LOADING_EXT;
+      publish(&info);
+    }
+  }
+  g_world.bakeVersion = ~0ull;
+  g_world.bakeStatus = -1;
+  g_world.bakeReason = "waiting for retained map inputs";
+}
+
 // Removes the map's scene instances; before their meshes go.
 void dropSceneInstances() {
+  if (g_world.bakeVersion != ~0ull)
+    invalidateBakeScene();
   static const auto remove = sceneFunction<PFN_remixapi_RemoveSceneInstancesEXT>("remixapi_RemoveSceneInstancesEXT");
   if (remove && !g_world.sceneInstances.empty())
     remove(g_world.sceneInstances.data(), uint32_t(g_world.sceneInstances.size()));
   g_world.sceneInstances.clear();
+  g_world.bakeInstances.clear();
+  g_world.bakeCharts.clear();
   g_world.sceneValid = false;
 }
 
@@ -1894,7 +1961,8 @@ int overlayMaterial(const std::string &name, bool &modulate) {
     return slot;
   m.modulate = kv.shader == "decalmodulate";
   m.noCull = std::atoi(kv.values["$nocull"].c_str()) != 0;
-  m.candidates = textureHashes(kv.values["$basetexture"]);
+  m.baseTexture = lower(kv.values["$basetexture"]);
+  m.candidates = textureHashes(m.baseTexture);
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
   if (m.categories & (REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE | REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN))
@@ -2110,7 +2178,7 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     // The sun keeps its light (GMod's light_environment often has a style,
     // e.g. 33 on gm_construct, for day/night control).
     const bool styled = w.style != 0 && w.type != kEmitSky;
-    if (styled && !engine_lights::stylesActive()) {
+    if (styled && !g_world.lightStylesAvailable) {
       ++g_world.styledLights;
       continue;
     }
@@ -2185,7 +2253,7 @@ bool build(const Bsp &bsp) {
   // bits). Faces referenced by leaves of the sky camera's area, and points
   // inside them, belong to it. (The PVS of the camera's cluster is not
   // enough: skybox geometry spans clusters that cluster does not list.)
-  parseSkyCamera(bsp);
+  parseMapCameras(bsp);
   int skyArea = -1;
   if (g_world.skyCamera && leafs) {
     const int leaf = leafAt(bsp, g_world.skyOrigin);
@@ -2385,6 +2453,10 @@ bool build(const Bsp &bsp) {
     if (m < 0)
       continue;
     const TexData &td = texDatas[ti.texData];
+    lightmaps::Mapping lightmapMapping;
+    std::memcpy(lightmapMapping.vectors, ti.lightmapVecs, sizeof(ti.lightmapVecs));
+    std::copy_n(face.lightmapMins, 2, lightmapMapping.minimum);
+    std::copy_n(face.lightmapSize, 2, lightmapMapping.size);
     // The face looks along its plane's normal: dface_t::planenum is the face's
     // own plane and dface_t::side only that plane's parity (vbsp numbers the
     // two planes of a pair 2n and 2n + 1; the node the face lies on holds the
@@ -2518,6 +2590,7 @@ bool build(const Bsp &bsp) {
       // The grid, then its triangles (indices into it).
       std::vector<remixapi_HardcodedVertex> grid;
       std::vector<float> alpha; // DISP_VERTS alpha, 0..255
+      std::vector<std::array<float, 2>> lightmapCoordinates;
       grid.reserve(size_t(size) * size);
       alpha.reserve(size_t(size) * size);
       for (int v = 0; v < size; ++v) {
@@ -2540,6 +2613,7 @@ bool build(const Bsp &bsp) {
           std::memcpy(out.position, pos, 12);
           std::memset(out.normal, 0, 12);
           grid.push_back(out);
+          lightmapCoordinates.push_back(lightmapMapping.project(flat));
           alpha.push_back(std::isfinite(dv.alpha) ? std::clamp(dv.alpha, 0.0f, 255.0f) : 0.0f);
         }
       }
@@ -2599,6 +2673,9 @@ bool build(const Bsp &bsp) {
           }
         for (uint32_t i : indices)
           g.indices.push_back(base + i);
+        if (!sheet && !skyboxFace)
+          if (auto chart = lightmaps::capture(lightmapMapping, uint32_t(firstIndex), g.indices, base, lightmapCoordinates))
+            g.lightmaps.push_back(std::move(*chart));
         toWorld(g, base, firstIndex, !sheet);
       };
       // A two-layer material ($basetexture2): the displacement's alpha blends
@@ -2704,6 +2781,13 @@ bool build(const Bsp &bsp) {
         const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
         g_world.cull.slivers += winding != 0 && dot(n, normal) * winding < 0;
       }
+      if (!skyboxFace) {
+        std::vector<std::array<float, 2>> coordinates;
+        for (const auto &corner : corners)
+          coordinates.push_back(lightmapMapping.project(corner.data()));
+        if (auto chart = lightmaps::capture(lightmapMapping, uint32_t(firstIndex), g.indices, base, coordinates))
+          g.lightmaps.push_back(std::move(*chart));
+      }
       toWorld(g, base, firstIndex);
       g_world.triangles += uint32_t(corners.size() - 2);
       ++g_world.faces;
@@ -2788,7 +2872,10 @@ void sendPartition(const Bsp *bsp) {
 }
 
 std::wstring gameRoot() {
-  wchar_t exe[MAX_PATH] = {};
+  wchar_t exe[32768] = {};
+  const DWORD count = GetEnvironmentVariableW(L"OPENREMIX_PROXY_CONTENT_ROOT", exe, 32768);
+  if (count && count < 32768)
+    return exe;
   GetModuleFileNameW(nullptr, exe, MAX_PATH);
   std::wstring root = exe;
   return root.substr(0, root.find_last_of(L"\\/"));
@@ -2809,6 +2896,40 @@ std::vector<uint64_t> textureCandidates(const std::string &name) {
   return textureHashes(name);
 }
 
+bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,
+                  std::vector<uint8_t> &rgba, std::string &error) {
+  ensureFileSystem();
+  std::vector<std::vector<uint8_t>> frames;
+  if (const char *failure = vtfFrames(name, width, height, frames)) {
+    error = failure;
+    return false;
+  }
+  if (frames.size() != 1) {
+    error = "animated texture requires engine playback";
+    return false;
+  }
+  rgba = std::move(frames.front());
+  error.clear();
+  return true;
+}
+
+bool materialSource(uint64_t textureHash, std::string &baseTexture) {
+  for (const auto &material : g_world.materials)
+    if (std::find(material.candidates.begin(), material.candidates.end(), textureHash) != material.candidates.end()) {
+      baseTexture = material.baseTexture;
+      return !baseTexture.empty();
+    }
+  return false;
+}
+
+bool playerStart(float origin[3], float angles[3]) {
+  if (!g_active || !g_world.hasPlayerStart)
+    return false;
+  std::copy_n(g_world.playerOrigin, 3, origin);
+  std::copy_n(g_world.playerAngles, 3, angles);
+  return true;
+}
+
 float textureLuminance(const std::string &name) {
   static std::mutex lock;
   static std::unordered_map<std::string, float> known;
@@ -2827,7 +2948,7 @@ float textureLuminance(const std::string &name) {
   return value;
 }
 
-bool load(const remixapi_Interface &api, const std::string &requestedMap) {
+bool load(const remixapi_Interface &api, const std::string &requestedMap, bool lightStylesAvailable) {
   std::string mapName = lower(requestedMap);
   if (mapName.rfind("maps/", 0) == 0)
     mapName.erase(0, 5);
@@ -2843,7 +2964,10 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   destroyMeshes();
   g_world = World{};
   g_world.api = &api;
+  g_world.lightStylesAvailable = lightStylesAvailable;
   g_active = false;
+  // Old inputs must not survive a map unload, missing BSP, or disabled world.
+  invalidateBakeScene();
   if (mapName.empty()) {
     sendPartition(nullptr);
     return false;
@@ -2864,7 +2988,24 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   const auto [pak, pakBytes] = bsp.lump<uint8_t>(kPakfile);
   fs::setPakfile(pak ? std::vector<uint8_t>(pak, pak + pakBytes) : std::vector<uint8_t>());
   g_world.map = lower(mapName);
+  invalidateBakeScene();
   g_active = build(bsp);
+  char reflectionHints[8] = {};
+  const bool useReflectionHints = !(GetEnvironmentVariableA("OPENREMIX_PROXY_REFLECTION_HINTS", reflectionHints,
+                                                            sizeof(reflectionHints)) && reflectionHints[0] == '0');
+  if (g_active && useReflectionHints && bsp.lumpVersion(kCubemaps) == 0) {
+    // dcubemapsample_t is 16 bytes: three integer coordinates, size, padding.
+    // Its authored positions seed fitting; they never supply room boundaries.
+    const auto [samples, count] = bsp.lump<std::array<int32_t, 4>>(kCubemaps);
+    for (size_t i = 0; samples && i < count && g_world.reflectionSeeds.size() < 4096; ++i) {
+      const std::array<float, 3> position{float(samples[i][0]), float(samples[i][1]), float(samples[i][2])};
+      bool inside = insidePlayable(bsp, position.data());
+      for (uint32_t c = 0; c < 3; ++c)
+        inside &= position[c] >= g_world.playableMins[c] && position[c] <= g_world.playableMaxs[c];
+      if (inside)
+        g_world.reflectionSeeds.push_back(position);
+    }
+  }
   if (g_active && !g_world.props.empty()) {
     auto index = std::make_shared<PropIndex>();
     index->cells = g_world.propCells;
@@ -2886,6 +3027,80 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
 bool active() { return g_active; }
 
 bool overlaysActive() { return g_active && !g_world.overlayGroups.empty(); }
+
+void publishBakeScene(const std::vector<remixapi_LightHandle> &lights) {
+  static const auto publish = sceneFunction<PFN_remixapi_SetBakeSceneEXT>("remixapi_SetBakeSceneEXT");
+  if (!publish) {
+    g_world.bakeReason = "native bake-scene API unavailable";
+    return;
+  }
+  if (!g_active || !g_world.sceneValid)
+    return;
+  // Never label missing brush groups or failed/partially decoded props a
+  // complete map. Keep direct Forward+ lighting while static inputs load.
+  if (g_world.propModelsFailed || std::any_of(g_world.propModels.begin(), g_world.propModels.end(),
+                                             [](const auto &entry) { return entry.second.engineParts; })) {
+    g_world.bakeReason = "static prop geometry is incomplete";
+    return;
+  }
+  for (const auto &[key, group] : g_world.groups)
+    if (!group.mesh && std::any_of(group.surfaces.begin(), group.surfaces.end(),
+                                   [](const auto &entry) { return !entry.second.indices.empty(); })) {
+      g_world.bakeReason = "brush geometry is still loading";
+      return;
+    }
+  if (std::any_of(g_world.materials.begin(), g_world.materials.end(),
+                  [](const auto &material) { return !material.resolved; })) {
+    g_world.bakeReason = "static materials are still loading";
+    return;
+  }
+  const auto signature = XXH3_64bits(lights.data(), lights.size() * sizeof(lights[0]));
+  // Successful requests compare dependency revisions: the native runtime
+  // captures again only when a material/mod/light changed. Retry
+  // refused inputs twice a second while late assets finish resolving.
+  if (g_world.bakeStatus != int(REMIXAPI_ERROR_CODE_SUCCESS) &&
+      g_world.bakeVersion == g_world.submitVersion && g_world.bakeLights == signature && g_world.frames % 30)
+    return;
+  remixapi_BakeSceneReflectionsInfoEXT reflections = {};
+  auto &surfaces = reflections.surfaces;
+  auto &bounds = surfaces.bounds;
+  auto &info = bounds.scene;
+  info.structSize = sizeof(reflections);
+  info.version = REMIXAPI_BAKE_SCENE_REFLECTIONS_VERSION_EXT;
+  reflections.reflectionRevision = 1;
+  reflections.positionCount = uint32_t(g_world.reflectionSeeds.size());
+  reflections.positions = g_world.reflectionSeeds.empty() ? nullptr : g_world.reflectionSeeds.front().data();
+  surfaces.chartRevision = g_world.submitVersion + 1;
+  surfaces.chartCount = uint32_t(g_world.bakeCharts.size());
+  surfaces.charts = g_world.bakeCharts.data();
+  std::copy_n(g_world.playableMins, 3, bounds.minimum);
+  std::copy_n(g_world.playableMaxs, 3, bounds.maximum);
+  info.sceneId = XXH3_64bits(g_world.map.data(), g_world.map.size()) | 1;
+  info.revision = g_world.submitVersion + 1;
+  info.sceneScale = .0254f;
+  info.state = REMIXAPI_BAKE_SCENE_READY_EXT;
+  info.instances = g_world.bakeInstances.data();
+  info.instanceCount = uint32_t(g_world.bakeInstances.size());
+  info.lights = lights.data();
+  info.lightCount = uint32_t(lights.size());
+  g_world.bakeStatus = int(publish(&info));
+  g_world.bakeReason = g_world.bakeStatus == int(REMIXAPI_ERROR_CODE_SUCCESS)
+                           ? "static inputs captured for GPU baking"
+                           : "native capture refused unresolved or time-dependent inputs";
+  if (g_world.bakeStatus != int(REMIXAPI_ERROR_CODE_SUCCESS)) {
+    info.state = REMIXAPI_BAKE_SCENE_LOADING_EXT;
+    info.instanceCount = info.lightCount = 0;
+    info.instances = nullptr;
+    info.lights = nullptr;
+    surfaces.chartCount = 0;
+    surfaces.charts = nullptr;
+    reflections.positionCount = 0;
+    reflections.positions = nullptr;
+    publish(&info);
+  }
+  g_world.bakeVersion = g_world.submitVersion;
+  g_world.bakeLights = signature;
+}
 
 float skyTracedReach() { return g_active && g_world.skyTraced ? g_world.skyReach : 0; }
 
@@ -3025,10 +3240,13 @@ void submit(MaterialLookup lookup) {
     uint64_t instance = 0;
     if (!keep)
       api.DrawInstance(&info);
-    else if (addScene(&info, 1, &instance) == REMIXAPI_ERROR_CODE_SUCCESS)
+    else if (addScene(&info, 1, &instance) == REMIXAPI_ERROR_CODE_SUCCESS) {
       g_world.sceneInstances.push_back(instance);
-    else
+      if (!(info.categoryFlags & REMIXAPI_INSTANCE_CATEGORY_BIT_SKY))
+        g_world.bakeInstances.push_back(instance);
+    } else
       kept = false;
+    return instance;
   };
   // What the camera does not see of the map, as in Source: back faces (except
   // $nocull materials) and what lies in clusters outside the camera cluster's
@@ -3085,7 +3303,13 @@ void submit(MaterialLookup lookup) {
     blend.textureAlphaArg1Source = 2;
     remixapi_InstanceInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    info.pNext = &blend;
+    remixapi_InstanceIdentityEXT identity = {};
+    identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
+    identity.pNext = &blend;
+    identity.instanceId = group.id;
+    identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
+    identity.rasterVisible = 1;
+    info.pNext = &identity;
     info.mesh = group.mesh;
     info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
     info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
@@ -3111,7 +3335,13 @@ void submit(MaterialLookup lookup) {
     blend.writeMask = 15;
     remixapi_InstanceInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    info.pNext = &blend;
+    remixapi_InstanceIdentityEXT identity = {};
+    identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
+    identity.pNext = &blend;
+    identity.instanceId = group.id;
+    identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
+    identity.rasterVisible = 1;
+    info.pNext = &identity;
     info.mesh = group.mesh;
     info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
     info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
@@ -3146,7 +3376,19 @@ void submit(MaterialLookup lookup) {
     info.doubleSided = 1;
     remixapi_InstanceInfoCameraCullingEXT culling;
     cameraCulling(info, culling, group.noCull, group.skybox);
-    draw(info);
+    const auto retained = draw(info);
+    if (retained && !group.sky) {
+      uint32_t surfaceIndex = 0;
+      for (const auto &[material, geometry] : group.surfaces) {
+        if (geometry.indices.empty() || geometry.vertices.empty())
+          continue;
+        for (const auto &chart : geometry.lightmaps)
+          g_world.bakeCharts.push_back({retained, surfaceIndex, 0, chart.firstIndex,
+                                       uint32_t(chart.texcoords.size() / 2), chart.width, chart.height,
+                                       chart.texcoords.data()});
+        ++surfaceIndex;
+      }
+    }
   }
   for (const auto &prop : g_world.props) {
     if (prop.skybox)
@@ -3162,6 +3404,16 @@ void submit(MaterialLookup lookup) {
       blend.alphaTestEnabled = m.alphaTest;
       blend.alphaTestReferenceValue = m.alphaRef;
       blend.alphaTestCompareOp = m.alphaTest ? 6 : 7;
+      if (m.blended) {
+        blend.alphaBlendEnabled = 1;
+        blend.srcColorBlendFactor = blend.srcAlphaBlendFactor = 6;
+        blend.dstColorBlendFactor = blend.dstAlphaBlendFactor = 7;
+        blend.writeMask = 15;
+        blend.tFactor = 0x00ffffffu | (uint32_t(m.opacity * 255 + .5f) << 24);
+        blend.textureAlphaOperation = 3; // modulate texture alpha by constant opacity
+        blend.textureAlphaArg1Source = 1;
+        blend.textureAlphaArg2Source = 3;
+      }
       remixapi_InstanceInfoReplacementHashEXT replacement = {};
       replacement.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_REPLACEMENT_HASH_EXT;
       replacement.pNext = &blend;
@@ -3178,7 +3430,7 @@ void submit(MaterialLookup lookup) {
       info.mesh = part.mesh;
       info.categoryFlags = m.categories;
       std::memcpy(info.transform.matrix, prop.transform, sizeof(info.transform.matrix));
-      info.doubleSided = 1;
+      info.doubleSided = m.blended ? m.noCull : 1;
       // (A prop is hidden per point like the map, not per leaf list as Source
       // draws it: see the runtime's VISIBILITY flag.)
       remixapi_InstanceInfoCameraCullingEXT culling;
@@ -3552,9 +3804,16 @@ void dumpStatistics(FILE *out) {
   }
   fprintf(out, "   BSP world batch: %u recordings, valid %d (scene instances %zu), replayed frames %llu of %llu\n",
           g_world.recordings, int(g_world.batchValid || g_world.sceneValid), g_world.sceneInstances.size(), (unsigned long long)g_world.replayedFrames, (unsigned long long)g_world.frames);
+  fprintf(out, "   BSP bake inputs: %s; status %d, %zu authored instances, %zu surface charts\n",
+          g_world.bakeReason, g_world.bakeStatus, g_world.bakeInstances.size(), g_world.bakeCharts.size());
   fprintf(out, "   BSP lights: %zu static, %u of them styled, %u surface (texture) lights (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
           g_world.lights.size(), g_world.styleDrivenLights, g_world.surfaceLights, g_world.styledLights,
           g_world.skyboxLights, g_world.otherLights);
+  fprintf(out, "   BSP authored reflection seeds: %zu (validated playable env_cubemap positions)\n",
+          g_world.reflectionSeeds.size());
+  for (const auto &[key, model] : g_world.propModels)
+    for (const auto &material : model.engineMaterials)
+      fprintf(out, "     prop material left to the engine: %s (%s)\n", material.c_str(), key.first.c_str());
   for (auto &path : g_world.failedModels)
     fprintf(out, "     prop model left to the engine: %s\n", path.c_str());
   for (auto &m : g_world.materials)

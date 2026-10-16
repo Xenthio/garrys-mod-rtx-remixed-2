@@ -10,6 +10,8 @@
 #include "vertex_program.h"
 #include "dxvk_hash.h"
 #include "host_passes.h"
+#include "shader_bytecode.h"
+#include "d3d_method.h"
 
 #include <algorithm>
 #include <psapi.h>
@@ -142,9 +144,9 @@ std::unordered_map<const void *, Shadow> g_shadows;
 using ReleaseFn = ULONG(STDMETHODCALLTYPE *)(IUnknown *);
 using LockFn = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, UINT, void **, DWORD);
 using UnlockFn = HRESULT(STDMETHODCALLTYPE *)(void *);
-ReleaseFn g_vbRelease = nullptr, g_ibRelease = nullptr;
-LockFn g_vbLock = nullptr, g_ibLock = nullptr;
-UnlockFn g_vbUnlock = nullptr, g_ibUnlock = nullptr;
+ResourceMethod<ReleaseFn> g_vbRelease, g_ibRelease;
+ResourceMethod<LockFn> g_vbLock, g_ibLock;
+ResourceMethod<UnlockFn> g_vbUnlock, g_ibUnlock;
 
 void forget(const void *buffer) {
   std::lock_guard<std::mutex> lock(g_shadowLock);
@@ -199,20 +201,20 @@ void noteUnlock(void *buffer) {
 }
 
 ULONG STDMETHODCALLTYPE vbRelease(IUnknown *self) {
-  const ULONG refs = g_vbRelease(self);
+  const ULONG refs = g_vbRelease.original(self)(self);
   if (refs == 0)
     forget(self);
   return refs;
 }
 ULONG STDMETHODCALLTYPE ibRelease(IUnknown *self) {
-  const ULONG refs = g_ibRelease(self);
+  const ULONG refs = g_ibRelease.original(self)(self);
   if (refs == 0)
     forget(self);
   return refs;
 }
 HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
   const uint64_t t0 = nowUs();
-  const HRESULT hr = g_vbLock(self, offset, size, data, flags);
+  const HRESULT hr = g_vbLock.original(self)(self, offset, size, data, flags);
   g_stats.usLock += nowUs() - t0;
   if (SUCCEEDED(hr) && data)
     *data = noteLock(self, offset, size, *data, flags);
@@ -220,7 +222,7 @@ HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data
 }
 HRESULT STDMETHODCALLTYPE ibLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
   const uint64_t t0 = nowUs();
-  const HRESULT hr = g_ibLock(self, offset, size, data, flags);
+  const HRESULT hr = g_ibLock.original(self)(self, offset, size, data, flags);
   g_stats.usLock += nowUs() - t0;
   if (SUCCEEDED(hr) && data)
     *data = noteLock(self, offset, size, *data, flags);
@@ -228,11 +230,11 @@ HRESULT STDMETHODCALLTYPE ibLock(void *self, UINT offset, UINT size, void **data
 }
 HRESULT STDMETHODCALLTYPE vbUnlock(void *self) {
   noteUnlock(self);
-  return g_vbUnlock(self);
+  return g_vbUnlock.original(self)(self);
 }
 HRESULT STDMETHODCALLTYPE ibUnlock(void *self) {
   noteUnlock(self);
-  return g_ibUnlock(self);
+  return g_ibUnlock.original(self)(self);
 }
 
 // --- Textures --------------------------------------------------------------
@@ -253,9 +255,9 @@ const void *levelKey(const void *texture, UINT level) { return static_cast<const
 using TextureLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, D3DLOCKED_RECT *, const RECT *,
                                                        DWORD);
 using TextureUnlockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT);
-ReleaseFn g_textureRelease = nullptr;
-TextureLockRectFn g_textureLockRect = nullptr;
-TextureUnlockRectFn g_textureUnlockRect = nullptr;
+ResourceMethod<ReleaseFn> g_textureRelease;
+ResourceMethod<TextureLockRectFn> g_textureLockRect;
+ResourceMethod<TextureUnlockRectFn> g_textureUnlockRect;
 
 // Render-target textures (CreateTexture with D3DUSAGE_RENDERTARGET) and the
 // one render target 0 currently belongs to.
@@ -326,7 +328,7 @@ void present();
 } // namespace targetread
 
 ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
-  const ULONG refs = g_textureRelease(self);
+  const ULONG refs = g_textureRelease.original(self)(self);
   if (refs == 0) {
     if (auto live = targetread::g_live.find(self); live != targetread::g_live.end()) {
       targetread::drop(live->second);
@@ -343,7 +345,7 @@ ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
 
 HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
                                           const RECT *rect, DWORD flags) {
-  const HRESULT hr = g_textureLockRect(self, level, locked, rect, flags);
+  const HRESULT hr = g_textureLockRect.original(self)(self, level, locked, rect, flags);
   if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
     g_lockedTextures[levelKey(self, level)] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch),
@@ -385,7 +387,7 @@ HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level)
       }
     }
   }
-  return g_textureUnlockRect(self, level);
+  return g_textureUnlockRect.original(self)(self, level);
 }
 
 // Uploads through level surfaces (GetSurfaceLevel + IDirect3DSurface9::LockRect,
@@ -393,9 +395,9 @@ HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level)
 using SurfaceLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DSurface9 *, D3DLOCKED_RECT *, const RECT *, DWORD);
 using SurfaceUnlockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DSurface9 *);
 using GetSurfaceLevelFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, IDirect3DSurface9 **);
-SurfaceLockRectFn g_surfaceLockRect = nullptr;
-SurfaceUnlockRectFn g_surfaceUnlockRect = nullptr;
-GetSurfaceLevelFn g_getSurfaceLevel = nullptr;
+ResourceMethod<SurfaceLockRectFn> g_surfaceLockRect;
+ResourceMethod<SurfaceUnlockRectFn> g_surfaceUnlockRect;
+ResourceMethod<GetSurfaceLevelFn> g_getSurfaceLevel;
 
 // Returns the 2D texture whose level 0 is `surface` (not AddRef'd), or nullptr.
 IDirect3DTexture9 *levelZeroTexture(IDirect3DSurface9 *surface) {
@@ -412,7 +414,7 @@ IDirect3DTexture9 *levelZeroTexture(IDirect3DSurface9 *surface) {
 
 HRESULT STDMETHODCALLTYPE surfaceLockRect(IDirect3DSurface9 *self, D3DLOCKED_RECT *locked, const RECT *rect,
                                           DWORD flags) {
-  const HRESULT hr = g_surfaceLockRect(self, locked, rect, flags);
+  const HRESULT hr = g_surfaceLockRect.original(self)(self, locked, rect, flags);
   if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
     g_lockedTextures[self] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch), rect != nullptr,
@@ -461,15 +463,15 @@ HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self) {
       }
     }
   }
-  return g_surfaceUnlockRect(self);
+  return g_surfaceUnlockRect.original(self)(self);
 }
 
 HRESULT STDMETHODCALLTYPE textureGetSurfaceLevel(IDirect3DTexture9 *self, UINT level, IDirect3DSurface9 **out) {
-  const HRESULT hr = g_getSurfaceLevel(self, level, out);
-  if (SUCCEEDED(hr) && out && *out && !g_surfaceLockRect) {
+  const HRESULT hr = g_getSurfaceLevel.original(self)(self, level, out);
+  if (SUCCEEDED(hr) && out && *out) {
     void **vt = vtableOf(*out);
-    hookSlot(vt, kSurfaceLockRect, &surfaceLockRect, g_surfaceLockRect);
-    hookSlot(vt, kSurfaceUnlockRect, &surfaceUnlockRect, g_surfaceUnlockRect);
+    g_surfaceLockRect.install(vt, kSurfaceLockRect, &surfaceLockRect);
+    g_surfaceUnlockRect.install(vt, kSurfaceUnlockRect, &surfaceUnlockRect);
   }
   return hr;
 }
@@ -525,27 +527,14 @@ const std::wstring &moduleDir() {
   }();
   return dir;
 }
-// The bytecode's length in DWORDs: the version token, instructions (their
-// operand counts in bits 24..27 from shader model 2) and comment blocks
-// (their length in bits 16..30) up to the END token.
-size_t shaderWords(const DWORD *function) {
-  size_t i = 1;
-  for (; i < (1u << 20); ++i) {
-    const uint32_t token = function[i];
-    if (token == 0x0000ffffu)
-      return i + 1;
-    if ((token & 0xffffu) == 0xfffeu)
-      i += (token >> 16) & 0x7fffu;
-    else if (!(token & 0x80000000u))
-      i += (token >> 24) & 0xfu;
-  }
-  return 0;
-}
-void keepShaderCode(const void *shader, const DWORD *function, const char *kind) {
-  const size_t words = function ? shaderWords(function) : 0;
-  if (!words)
+void keepShaderCode(const void *shader, std::shared_ptr<const std::vector<uint32_t>> code,
+                    const char *kind) {
+  if (!code) {
+    std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+    g_shaderCode.erase(shader);
     return;
-  auto code = std::make_shared<std::vector<uint32_t>>(function, function + words);
+  }
+  const size_t words = code->size();
   static const bool dump = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_SHADERS", v, sizeof(v)) && v[0] == '1';
@@ -747,12 +736,10 @@ HRESULT STDMETHODCALLTYPE createVertexBuffer(IDirect3DDevice9 *dev, UINT length,
                                              IDirect3DVertexBuffer9 **out, HANDLE *shared) {
   const HRESULT hr = g_createVertexBuffer(dev, length, usage, fvf, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out) {
-    if (!g_vbLock) {
-      void **vt = vtableOf(*out);
-      hookSlot(vt, kRelease, &vbRelease, g_vbRelease);
-      hookSlot(vt, kBufferLock, &vbLock, g_vbLock);
-      hookSlot(vt, kBufferUnlock, &vbUnlock, g_vbUnlock);
-    }
+    void **vt = vtableOf(*out);
+    g_vbRelease.install(vt, kRelease, &vbRelease);
+    g_vbLock.install(vt, kBufferLock, &vbLock);
+    g_vbUnlock.install(vt, kBufferUnlock, &vbUnlock);
     trackBuffer(*out, length, usage, false, pool);
   }
   return hr;
@@ -762,12 +749,10 @@ HRESULT STDMETHODCALLTYPE createIndexBuffer(IDirect3DDevice9 *dev, UINT length, 
                                             D3DPOOL pool, IDirect3DIndexBuffer9 **out, HANDLE *shared) {
   const HRESULT hr = g_createIndexBuffer(dev, length, usage, format, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out) {
-    if (!g_ibLock) {
-      void **vt = vtableOf(*out);
-      hookSlot(vt, kRelease, &ibRelease, g_ibRelease);
-      hookSlot(vt, kBufferLock, &ibLock, g_ibLock);
-      hookSlot(vt, kBufferUnlock, &ibUnlock, g_ibUnlock);
-    }
+    void **vt = vtableOf(*out);
+    g_ibRelease.install(vt, kRelease, &ibRelease);
+    g_ibLock.install(vt, kBufferLock, &ibLock);
+    g_ibUnlock.install(vt, kBufferUnlock, &ibUnlock);
     trackBuffer(*out, length, usage, format == D3DFMT_INDEX32, pool);
   }
   return hr;
@@ -778,12 +763,12 @@ HRESULT STDMETHODCALLTYPE createTexture(IDirect3DDevice9 *dev, UINT width, UINT 
   const HRESULT hr = g_createTexture(dev, width, height, levels, usage, format, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out && (usage & D3DUSAGE_RENDERTARGET))
     g_targetTextures[*out] = {width, height, format};
-  if (SUCCEEDED(hr) && out && *out && !g_textureLockRect) {
+  if (SUCCEEDED(hr) && out && *out) {
     void **vt = vtableOf(*out);
-    hookSlot(vt, kRelease, &textureRelease, g_textureRelease);
-    hookSlot(vt, kTextureGetSurfaceLevel, &textureGetSurfaceLevel, g_getSurfaceLevel);
-    hookSlot(vt, kTextureLockRect, &textureLockRect, g_textureLockRect);
-    hookSlot(vt, kTextureUnlockRect, &textureUnlockRect, g_textureUnlockRect);
+    g_textureRelease.install(vt, kRelease, &textureRelease);
+    g_getSurfaceLevel.install(vt, kTextureGetSurfaceLevel, &textureGetSurfaceLevel);
+    g_textureLockRect.install(vt, kTextureLockRect, &textureLockRect);
+    g_textureUnlockRect.install(vt, kTextureUnlockRect, &textureUnlockRect);
   }
   return hr;
 }
@@ -857,23 +842,22 @@ HRESULT STDMETHODCALLTYPE setVertexDeclaration(IDirect3DDevice9 *dev, IDirect3DV
 HRESULT STDMETHODCALLTYPE createVertexShader(IDirect3DDevice9 *dev, const DWORD *function,
                                              IDirect3DVertexShader9 **out) {
   const HRESULT hr = g_createVertexShader(dev, function, out);
-  if (SUCCEEDED(hr) && out && *out && function) {
-    static_assert(sizeof(DWORD) == sizeof(uint32_t));
-    auto program = vsprog::compile(reinterpret_cast<const uint32_t *>(function));
+  if (SUCCEEDED(hr) && out && *out) {
+    const auto code = readShaderBytecode(*out);
+    auto program = code ? vsprog::compile(code->data(), code->size()) : nullptr;
+    keepShaderCode(*out, code, "vs");
     std::lock_guard<std::mutex> lock(g_vertexProgramLock);
     g_stats.vertexPrograms += program != nullptr;
     g_vertexPrograms[*out] = std::move(program);
     ++g_vertexProgramsCreated;
   }
-  if (SUCCEEDED(hr) && out && *out)
-    keepShaderCode(*out, function, "vs");
   return hr;
 }
 
 HRESULT STDMETHODCALLTYPE createPixelShader(IDirect3DDevice9 *dev, const DWORD *function, IDirect3DPixelShader9 **out) {
   const HRESULT hr = g_createPixelShader(dev, function, out);
   if (SUCCEEDED(hr) && out && *out)
-    keepShaderCode(*out, function, "ps");
+    keepShaderCode(*out, readShaderBytecode(*out), "ps");
   return hr;
 }
 
@@ -1002,7 +986,7 @@ void releaseOccluders() {
 
 // The current map's occluder buffers on this device (created on first use).
 bool occludersReady(IDirect3DDevice9 *dev) {
-  if (!occludersEnabled() || !bsp::active() || !g_vbLock || !g_ibLock)
+  if (!occludersEnabled() || !bsp::active())
     return false;
   const auto &o = bsp::occluders();
   if (o.indices.empty())
@@ -1014,22 +998,27 @@ bool occludersReady(IDirect3DDevice9 *dev) {
   g_occluders.version = o.version;
   g_occluders.failed = true;
   const UINT vbBytes = UINT(o.positions.size() * sizeof(float)), ibBytes = UINT(o.indices.size() * 4);
-  // MANAGED: survives device resets. Created and filled through the real
-  // entry points, so the proxy's buffer tracking never sees them.
+  // MANAGED: survives device resets. Bypass creation tracking, then dispatch
+  // Lock/Unlock through each object's own vtable. Native D3D9 can use different
+  // implementations for managed and default-pool buffers; an entry point saved
+  // from a game buffer is not valid for these objects.
   if (FAILED(g_createVertexBuffer(dev, vbBytes, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_MANAGED, &g_occluders.vb,
                                   nullptr)) ||
       FAILED(g_createIndexBuffer(dev, ibBytes, D3DUSAGE_WRITEONLY, D3DFMT_INDEX32, D3DPOOL_MANAGED, &g_occluders.ib,
                                  nullptr)))
     return false;
   void *data = nullptr;
-  if (FAILED(g_vbLock(g_occluders.vb, 0, 0, &data, 0)))
+  if (FAILED(g_occluders.vb->Lock(0, vbBytes, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.positions.data(), vbBytes);
-  g_vbUnlock(g_occluders.vb);
-  if (FAILED(g_ibLock(g_occluders.ib, 0, 0, &data, 0)))
+  if (FAILED(g_occluders.vb->Unlock()))
+    return false;
+  data = nullptr;
+  if (FAILED(g_occluders.ib->Lock(0, ibBytes, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.indices.data(), ibBytes);
-  g_ibUnlock(g_occluders.ib);
+  if (FAILED(g_occluders.ib->Unlock()))
+    return false;
   g_occluders.vertices = UINT(o.positions.size() / 3);
   g_occluders.triangles = UINT(o.indices.size() / 3);
   g_occluders.failed = false;

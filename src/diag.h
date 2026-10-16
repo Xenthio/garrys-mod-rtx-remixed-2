@@ -12,6 +12,8 @@ namespace proxy::diag {
 void install(HMODULE self);
 // The unhandled-exception filter again: the engine installs its own after ours.
 void reinstall();
+// Opt-in startup diagnostics: log engine Error() messages before forwarding them.
+void captureEngineErrors();
 // One line, with the time since install and the calling thread.
 void stage(const char *fmt, ...);
 

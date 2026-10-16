@@ -120,6 +120,7 @@ bool loadOriginal() {
   g_dir.resize(g_dir.find_last_of(L"\\/"));
   g_log = _wfopen((g_dir + L"\\shaderapi_proxy.log").c_str(), L"w");
   proxy::diag::reinstall();
+  proxy::diag::captureEngineErrors();
   proxy::diag::stage("first CreateInterface: loading shaderapidx9_orig.dll");
   forceNoD3D9Ex();
   g_orig = LoadLibraryW((g_dir + L"\\shaderapidx9_orig.dll").c_str());

@@ -40,8 +40,16 @@ bool waterAt(const float eye[3], float color[3], float &distance);
 float textureLuminance(const std::string &name);
 
 // Loads `maps/<mapName>.bsp` from the search paths; an empty name unloads.
-// Returns whether the map's world is now provided from the BSP.
-bool load(const remixapi_Interface &api, const std::string &mapName);
+// Returns whether the map's world is now provided from the BSP. The host
+// enables styled lights only when it can supply current engine lightstyles.
+bool load(const remixapi_Interface &api, const std::string &mapName, bool lightStylesAvailable = false);
+
+// Offline replay uses the same Source search paths and VTF decoder as the game.
+// Animated images are refused: freezing their first frame would misrepresent bake inputs.
+bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,
+                  std::vector<uint8_t> &rgba, std::string &error);
+bool materialSource(uint64_t textureHash, std::string &baseTexture);
+bool playerStart(float origin[3], float angles[3]);
 
 // The BSP world is loaded: world draws are dropped.
 bool active();
@@ -51,6 +59,11 @@ bool overlaysActive();
 
 // Resolves materials, builds pending meshes and draws this frame's instances.
 void submit(MaterialLookup lookup);
+
+// Publish the complete retained BSP scene for load-time baking. Only unstyled
+// map lights (and the captured sky) belong here; engine dlights/flashlights do
+// not. The native runtime captures inputs once per map/material revision.
+void publishBakeScene(const std::vector<remixapi_LightHandle> &lights);
 
 // Whether a draw's model-to-world rows (3x4, as in vertex shader c58) place
 // one of the map's static props, which the BSP world draws itself. eye: the

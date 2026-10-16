@@ -5,6 +5,7 @@
 #include "remix_ui.h"
 #include "sky_faces.h"
 #include "bsp_world.h"
+#include "bake_sky.h"
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
@@ -20,6 +21,7 @@
 #define REMIX_ALLOW_X86
 #include <remix/remix_c.h>
 #include <remix/remix_native_ext.h>
+#include <remix/remix_bake_ext.h>
 #include <remix/remix_usd_ext.h>
 
 #include <algorithm>
@@ -2087,7 +2089,7 @@ bool startRemix() {
   }
   diag::stage("OpenRemix: Startup succeeded");
   remix_ui::install(g_gameWindow, &g_api, gameProc);
-  // OPENREMIX_PROXY_BACKEND=pathtrace|raster (runtime default: raster).
+  // OPENREMIX_PROXY_BACKEND=pathtrace|raster|forwardplus (runtime default: raster).
   char backend[32] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_BACKEND", backend, sizeof(backend)))
     g_api.SetConfigVariable("rtx.native.backend", backend);
@@ -2147,6 +2149,7 @@ bool startRemix() {
   // Source units are inches: the runtime converts its meter-based defaults
   // (denoiser hit distances, visibility-guiding cells) with the scene scale.
   setDefault("rtx.native.pathtrace.sceneScale", "0.0254");
+  setDefault("rtx.native.forward.sceneScale", "0.0254");
   // Hundreds of mod lights, mostly behind walls: reservoir reuse (ReSTIR DI)
   // keeps the visible samples instead of re-drawing from the light tree.
   setDefault("rtx.native.pathtrace.restir", "1");
@@ -2203,6 +2206,7 @@ bool isSkyDraw(const Draw &d) {
 // seam is a meridian; with the identity they lay on the horizon at +-y. The
 // swap is its own inverse: either reading of the transform gives the same map.
 remixapi_LightHandle g_skyDome = nullptr;
+BakeSky g_bakeSky;
 remixapi_TextureHandle g_skyTexture = nullptr;
 uint64_t g_skyTextureHash = 0;
 uint32_t g_skyEpoch = 0;
@@ -2230,6 +2234,7 @@ uint32_t skyEpoch() { return g_skyEpoch; }
 // A new map: the dome of the previous one must not outlive it (a map whose
 // 2D sky is not drawn, or not yet, falls back to the sky light estimate).
 static void resetSky() {
+  g_bakeSky.reset(g_api);
   if (g_skyDome)
     g_api.DestroyLight(g_skyDome);
   if (g_skyTexture)
@@ -2239,6 +2244,17 @@ static void resetSky() {
   g_skyTextureHash = 0;
   g_skyBlocks.clear();
   ++g_skyEpoch;
+}
+
+// Both the ordered engine marker and external hosts announce map lifecycle
+// events here. Keep the live and baked environment lifetime identical on both
+// entry points, including unloads and failed map loads.
+bool loadMap(const char *name) {
+  if (!g_ready)
+    return false;
+  resetSky();
+  diag::stage("Map lifecycle: %s", name && *name ? name : "unload");
+  return bsp::load(g_api, name ? name : "", engine_lights::stylesActive());
 }
 
 void setSkyFaces(const uint8_t *const faces[6]) {
@@ -2389,6 +2405,8 @@ void applySkyDome() {
   g_skyBlocks = g_skyJob.blocks;
   g_skyDomeTick = GetTickCount64();
   g_skyChanged = true;
+  if (!g_bakeSky.capture(g_api, info, domeScale))
+    diag::stage("Map-load bake sky capture failed; a later changed sky capture will retry");
 }
 
 void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp) {
@@ -4385,7 +4403,7 @@ void logRendererState(uint32_t presents, size_t instances) {
   lastRendered = denoising.renderedFrames;
   char text[900];
   std::snprintf(text, sizeof(text),
-                "backend active %u, requested %u, supported mask %u (1 raster, 2 path tracing)%s%s | tracer frames "
+                "backend active %u, requested %u, supported mask %u (1 raster, 2 path tracing, 4 Forward+)%s%s | tracer frames "
                 "advancing %d, scene changing %d, accumulation %u | denoiser active %u of requested %u, frames "
                 "advancing %d%s%s | map world loaded %d, instances this frame %s, world cameras %s",
                 backend.activeBackend, backend.requestedBackend, backend.supportedBackends,
@@ -4399,6 +4417,19 @@ void logRendererState(uint32_t presents, size_t instances) {
     diag::stage("frame %u: renderer: %s (instances %zu, tracer sequence %llu)", presents, text, instances,
                 static_cast<unsigned long long>(tracing.sampleSequence));
     last = text;
+  }
+  static auto getBake = reinterpret_cast<PFN_remixapi_GetBakeStatisticsEXT>(stat("remixapi_GetBakeStatisticsEXT"));
+  remixapi_BakeStatisticsEXT bake = {};
+  bake.structSize = sizeof(bake);
+  if (getBake && getBake(&bake) == REMIXAPI_ERROR_CODE_SUCCESS) {
+    std::snprintf(text, sizeof(text), "state %u, active %u, input %llu, progress %u/%u; %s", bake.state,
+                  bake.active, static_cast<unsigned long long>(bake.requestedHash), bake.completed,
+                  bake.probes, bake.status);
+    static std::string lastBake;
+    if (text != lastBake) {
+      diag::stage("frame %u: bake: %s", presents, text);
+      lastBake = text;
+    }
   }
 }
 
@@ -5068,6 +5099,23 @@ void onPresent() {
     }
     if (g_skyDome)
       g_api.DrawLightInstance(g_skyDome); // the captured 2D skybox (setSkyFaces)
+    // Baking takes only authored, time-independent map lights. The retained
+    // BSP snapshot supplies emissive materials independently of this list.
+    std::vector<remixapi_LightHandle> bakeLights;
+    bool bakeLightsReady = true;
+    for (const auto &light : bsp::lights()) {
+      if (light.style)
+        continue;
+      const auto found = g_lights.find(light.hash);
+      if (found == g_lights.end() || !found->second.handle)
+        bakeLightsReady = false;
+      else
+        bakeLights.push_back(found->second.handle);
+    }
+    if (g_bakeSky.light())
+      bakeLights.push_back(g_bakeSky.light());
+    if (bakeLightsReady)
+      bsp::publishBakeScene(bakeLights);
     g_lastLights.swap(g_frameLights);
     g_frameLights.clear();
     for (auto it = g_lights.begin(); it != g_lights.end();) {
@@ -6365,10 +6413,7 @@ bool onMarker(const char *text) {
   else if (const char *v = argument("lights"))
     engine_lights::activate(uint32_t(std::strtoul(v, nullptr, 10)));
   else if (const char *v = argument("map")) {
-    if (g_ready) {
-      resetSky(); // the previous map's dome; this map's sky draws follow
-      proxy::bsp::load(g_api, v);
-    }
+    loadMap(v);
   } else
     return false;
   return true;
@@ -6379,9 +6424,7 @@ bool onMarker(const char *text) {
 // 1 if its world is taken from the BSP, so the engine's world draws are dropped.
 extern "C" __declspec(dllexport) int __cdecl openremix_proxy_load_map(const char *mapName) {
   using namespace proxy::remix;
-  if (!g_ready)
-    return 0;
-  return proxy::bsp::load(g_api, mapName ? mapName : "") ? 1 : 0;
+  return loadMap(mapName) ? 1 : 0;
 }
 
 // l4d2-rtx: whether the BSP world draws the static prop at this placement

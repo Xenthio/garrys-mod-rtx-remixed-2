@@ -1,4 +1,5 @@
 #include "diag.h"
+#include "d3d_hooks.h"
 
 #include <dbghelp.h>
 #include <psapi.h>
@@ -10,6 +11,18 @@
 
 namespace proxy::diag {
 namespace {
+
+using EngineError = void (*)(const char *, ...);
+EngineError g_engineError = nullptr;
+void engineError(const char *format, ...) {
+  char message[4096];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+  stage("Engine error: %s", message);
+  g_engineError("%s", message);
+}
 
 HANDLE g_file = INVALID_HANDLE_VALUE;
 wchar_t g_dir[MAX_PATH] = {};
@@ -278,6 +291,16 @@ void reinstall() {
   const auto previous = SetUnhandledExceptionFilter(&unhandled);
   if (previous != &unhandled)
     g_previousFilter = previous;
+}
+
+void captureEngineErrors() {
+  char enabled[8] = {};
+  if (g_engineError || !GetEnvironmentVariableA("OPENREMIX_PROXY_LOG_ENGINE_ERRORS", enabled, sizeof(enabled)) ||
+      enabled[0] != '1')
+    return;
+  if (const auto engine = GetModuleHandleW(L"engine.dll"))
+    g_engineError = reinterpret_cast<EngineError>(d3d::patchModuleImport(
+        engine, "tier0.dll", "Error", reinterpret_cast<void *>(&engineError)));
 }
 
 void stage(const char *fmt, ...) {
