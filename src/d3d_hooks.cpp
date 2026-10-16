@@ -525,24 +525,19 @@ const std::wstring &moduleDir() {
   }();
   return dir;
 }
-// The bytecode's length in DWORDs: the version token, instructions (their
-// operand counts in bits 24..27 from shader model 2) and comment blocks
-// (their length in bits 16..30) up to the END token.
-size_t shaderWords(const DWORD *function) {
-  size_t i = 1;
-  for (; i < (1u << 20); ++i) {
-    const uint32_t token = function[i];
-    if (token == 0x0000ffffu)
-      return i + 1;
-    if ((token & 0xffffu) == 0xfffeu)
-      i += (token >> 16) & 0x7fffu;
-    else if (!(token & 0x80000000u))
-      i += (token >> 24) & 0xfu;
-  }
-  return 0;
+// The bytecode's length in DWORDs, as the created shader reports it
+// (GetFunction). Not found by walking the tokens to the END token: shader
+// model 1 gives no instruction lengths, and a def's float constants read as
+// instructions then, so a walk could miss the END and run off the end of the
+// game's buffer (it did, into unmapped stack, on Windows).
+template <typename Shader> size_t shaderWords(Shader *shader) {
+  UINT bytes = 0;
+  if (!shader || FAILED(shader->GetFunction(nullptr, &bytes)) || bytes < 8 || bytes % 4)
+    return 0;
+  return bytes / 4;
 }
-void keepShaderCode(const void *shader, const DWORD *function, const char *kind) {
-  const size_t words = function ? shaderWords(function) : 0;
+template <typename Shader> void keepShaderCode(Shader *shader, const DWORD *function, const char *kind) {
+  const size_t words = function ? shaderWords(shader) : 0;
   if (!words)
     return;
   auto code = std::make_shared<std::vector<uint32_t>>(function, function + words);
