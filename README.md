@@ -3,7 +3,7 @@
 # Garry's Mod RTX Remixed 2
 This is currently a proxy `shaderapidx9.dll` for Garry's Mod that wraps the
 Source shader API (and later D3D9) to submit the game's rendering to
-OpenRemix through the Remix C API. 
+[OpenRemix](https://github.com/OpenRenderCollective/OpenRemix) through the Remix C API. 
 
 This removes the need to force the engine to run in the fixed function pipeline, so all shader-based systems are supported and are translated when applicable. OpenRemix has its own rasterization pass for sprites and other effects that would not work well in path-tracing and can be integrated seamlessly.
 
