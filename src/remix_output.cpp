@@ -1828,6 +1828,17 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       // (12800 units) put the vertex 0.4 units out, apart from its neighbour
       // in a draw placed exactly (cracks along faces, whose flexed parts the
       // engine skins on the CPU and draws rigid).
+      // Slots naming one bone are one weight (summed first, so 1.0, -0.00003
+      // and +0.00003 on one bone are exactly 1): a vertex on a single bone is
+      // then exactly that bone's matrix times its position, as in a draw
+      // whose vertex names the bone once.
+      for (uint32_t k = 1; bi && k < bonesPerVertex; ++k)
+        for (uint32_t j = 0; j < k; ++j)
+          if (bi[j] == bi[k]) {
+            w[j] += w[k];
+            w[k] = 0;
+            break;
+          }
       float sum = 0;
       for (uint32_t k = 0; k < bonesPerVertex; ++k) {
         w[k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
@@ -3752,11 +3763,60 @@ void onDraw(const Draw &d) {
   // on a flexed face and flexed draws from dynamic buffers stay per frame,
   // named by their deltas.
   const bool dynamicBuffers = ps.dynamic || d.indices.dynamic;
-  const uint64_t flexHash = hash ^ 0xf1e8f1e8f1e8f1e8ull;
-  const bool flexTracked = !dynamicBuffers && !lifted && (flex != 0 || g_flexMeshes.count(flexHash) != 0);
+  // Models without delta flexes (older ones: Breen, the fisherman, gman.mdl)
+  // are flexed, and some skinned, on the CPU: studiorender rewrites their
+  // vertices into the dynamic vertex buffer every frame and draws them with
+  // the model's own static index buffer (R_StudioDrawDynamicMesh). Built and
+  // dropped every frame, such a face was a new object to the runtime each
+  // time, with no motion vectors: smeared while the head turned. Named by
+  // its index range instead (and its place among this frame's draws of the
+  // same range, for several characters of one model), it is one mesh,
+  // refreshed in place like a delta-flexed face.
+  const bool cpuDeformed =
+      ps.dynamic && !d.indices.dynamic && skinnedDraw && !lifted && particle == kNotParticle;
+  uint64_t cpuHash = 0;
+  if (cpuDeformed) {
+    const struct {
+      const void *indices, *declaration;
+      uint32_t indicesVersion, startIndex, primCount, numVertices, type, bonesPerVertex;
+    } range = {d.indices.buffer, d.declaration, d.indices.version, d.startIndex, d.primCount, d.numVertices,
+               uint32_t(d.type), bonesPerVertex};
+    static_assert(sizeof(range) == 2 * sizeof(void *) + 6 * sizeof(uint32_t), "hashed as bytes: no padding");
+    // This frame's vertices: where the engine wrote them.
+    const struct {
+      const void *buffer;
+      uint32_t version, offset;
+      int baseVertex;
+    } written = {ps.buffer, ps.version, ps.offset, d.baseVertex};
+    flexContent = fnv(&written, sizeof(written)) | 1;
+    // Characters of one model are told apart by the order of their vertex
+    // writes this frame, not of their draws: the engine draws one write more
+    // than once (a pass per material pass), and a copy per draw laid a second
+    // face exactly over the first (rays leaving one met the other: black
+    // speckles, z-fighting at the edges). Draws of one write share a mesh and
+    // are dropped as duplicates, as before.
+    static uint64_t ordinalFrame = ~0ull;
+    static std::unordered_map<uint64_t, std::vector<uint64_t>> writes; // per range, this frame's writes in order
+    if (ordinalFrame != g_frame) {
+      ordinalFrame = g_frame;
+      writes.clear();
+    }
+    const uint64_t rangeHash = fnv(&range, sizeof(range)) ^ 0xc9f1e8c9f1e8c9f1ull;
+    auto &seen = writes[rangeHash];
+    auto found = std::find(seen.begin(), seen.end(), flexContent);
+    if (found == seen.end())
+      found = seen.insert(seen.end(), flexContent);
+    const uint32_t ordinal = uint32_t(found - seen.begin());
+    cpuHash = fnv(&ordinal, sizeof(ordinal), rangeHash);
+  }
+  // From buffers rewritten every frame and not tracked as above: per frame.
+  const bool rewritten = dynamicBuffers && !cpuDeformed;
+  const uint64_t flexHash = cpuDeformed ? cpuHash : hash ^ 0xf1e8f1e8f1e8f1e8ull;
+  const bool flexTracked =
+      !rewritten && !lifted && (cpuDeformed || flex != 0 || g_flexMeshes.count(flexHash) != 0);
   if (flex != 0 && !flexTracked)
     hash = fnv(&flexContent, sizeof(flexContent), hash);
-  const bool transientDraw = dynamicBuffers || (flex != 0 && !flexTracked);
+  const bool transientDraw = rewritten || (flex != 0 && !flexTracked);
 
   remixapi_MeshHandle mesh = nullptr;
   uint32_t boneCount = 0;
@@ -4026,12 +4086,12 @@ void onDraw(const Draw &d) {
     uint32_t eyeBones = 0;
     g_liftVertexStep = 0;
     const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1);
-    const uint64_t eyeHash = (dynamicBuffers ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
+    const uint64_t eyeHash = (rewritten ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
     remixapi_MeshHandle eyeMesh =
         eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
-                                d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers, 0.5f)
+                                d.vsConstants + kRegEyeIrisU * 4, !rewritten, 0.5f)
                     : nullptr;
-    if (dynamicBuffers) {
+    if (rewritten) {
       if (eyeMesh)
         g_transient.push_back(eyeMesh);
     } else if (eyeMaterial) {
@@ -4047,7 +4107,7 @@ void onDraw(const Draw &d) {
       inst.mesh = eyeMesh;
       inst.material = eyeMaterial;
       inst.texture0 = d.texture1;
-      inst.persistent = !dynamicBuffers;
+      inst.persistent = !rewritten;
       inst.replacementHash = 0;
       ++g_stats.eyeRefracts;
     }
@@ -4086,12 +4146,12 @@ void onDraw(const Draw &d) {
     g_liftVertexStep = 0;
     const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1);
     // From buffers the engine rewrites (not seen for eyes) it stays per frame.
-    const uint64_t irisHash = (dynamicBuffers ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
+    const uint64_t irisHash = (rewritten ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
     remixapi_MeshHandle irisMesh =
         irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false, 1, nullptr, flex,
-                                 d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers)
+                                 d.vsConstants + kRegEyeIrisU * 4, !rewritten)
                      : nullptr;
-    if (dynamicBuffers) {
+    if (rewritten) {
       if (irisMesh)
         g_transient.push_back(irisMesh);
     } else if (irisMaterial) {
@@ -4116,7 +4176,7 @@ void onDraw(const Draw &d) {
       over.separateAlpha = over.alphaTest = false;
       iris.blend = blendState(over);
       iris.categories = categories | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
-      iris.persistent = !dynamicBuffers;
+      iris.persistent = !rewritten;
       iris.replacementHash = 0;
       g_instances.push_back(iris);
       ++g_stats.eyeIrises;
