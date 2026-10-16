@@ -1821,10 +1821,23 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         w[1] = stored[1];
         w[2] = 1 - stored[0] - stored[1];
       }
+      // A stored weight can round slightly below zero (1.0 and -0.00003, the
+      // implied one then +0.00003); the runtime rejects negatives. Clamped,
+      // the weights are scaled back to a sum of one: a sum of 1.00003 scales
+      // the bone matrices' translation too, which far from the map's origin
+      // (12800 units) put the vertex 0.4 units out, apart from its neighbour
+      // in a draw placed exactly (cracks along faces, whose flexed parts the
+      // engine skins on the CPU and draws rigid).
+      float sum = 0;
+      for (uint32_t k = 0; k < bonesPerVertex; ++k) {
+        w[k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
+        sum += w[k];
+      }
+      for (uint32_t k = 0; k < bonesPerVertex; ++k)
+        w[k] = sum > 0 ? w[k] / sum : (k == 0 ? 1.0f : 0.0f);
       for (uint32_t k = 0; k < bonesPerVertex; ++k) {
         const uint32_t bone = bi ? bi[k] : 0;
-        // The implied weight can round slightly below zero; the runtime rejects negatives.
-        weights[size_t(v) * bonesPerVertex + k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
+        weights[size_t(v) * bonesPerVertex + k] = w[k];
         bones[size_t(v) * bonesPerVertex + k] = bone;
         maxBone = std::max(maxBone, bone);
         if (weights[size_t(v) * bonesPerVertex + k] > 0)
