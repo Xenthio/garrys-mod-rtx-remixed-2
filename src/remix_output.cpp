@@ -2155,6 +2155,9 @@ bool startRemix() {
   setDefault("rtx.native.pathtrace.combinedTlas", "1");
   // Flexed faces are refreshed in place (g_flexMeshes).
   setDefault("rtx.native.meshes.refreshInPlace", "1");
+  // The view model is path-traced in front of the scene (see the cameras in
+  // onPresent).
+  setDefault("rtx.native.pathtrace.viewModel", "1");
   // OPENREMIX_PROXY_CONFIG="key=value;key=value": runtime settings at startup.
   char config[2048] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_CONFIG", config, sizeof(config))) {
@@ -4613,12 +4616,16 @@ void onPresent() {
       std::memcpy(camera.projection, v.projection, sizeof(camera.projection));
       g_api.SetupCamera(&camera);
     };
-    // The view model is path-traced as world geometry: scaled in view space so
-    // the main camera projects it like Source's view-model camera, and the
-    // world camera's near plane moves in to keep it (a few units from the eye)
-    // unclipped. OPENREMIX_PROXY_RASTER_VIEWMODEL=1 keeps the separate
-    // rasterized view-model camera instead.
-    static const bool rasterViewModel = envScale("OPENREMIX_PROXY_RASTER_VIEWMODEL", 0) > 0;
+    // The view model goes to the runtime as itself: VIEW_MODEL instances and
+    // camera, which it path-traces in the world camera's view, in front of the
+    // scene, without shadows on it or blocking the flashlight
+    // (rtx.native.pathtrace.viewModel, on by default; off, the runtime
+    // rasterizes it with its camera). OPENREMIX_PROXY_WORLD_VIEWMODEL=1 places
+    // it in the world as world geometry instead, as before: scaled in view
+    // space so the main camera projects it like Source's view-model camera, the
+    // world camera's near plane moved in to keep it unclipped.
+    static const bool worldViewModel = envScale("OPENREMIX_PROXY_WORLD_VIEWMODEL", 0) > 0;
+    const bool rasterViewModel = !worldViewModel; // sent with its own camera
     View world = *main;
     float viewModelTransform[3][4] = {};
     if (viewModel && !rasterViewModel) {
