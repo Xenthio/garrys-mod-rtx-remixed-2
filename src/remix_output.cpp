@@ -415,10 +415,23 @@ bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
 
 // The uploaded texture a mask name stands for (its dxvk hash), or 0.
 // Render thread. Candidate hashes come from the VTF file (as the BSP world's).
+// The one returned is the record's own, the runtime texture's: a candidate may
+// be an X8R8G8B8 upload's opaque alias (BGR888 files, such as most props'
+// normal maps), which no runtime texture is named by.
 struct NamedTexture {
   std::vector<uint64_t> candidates;
   uint64_t resolved = 0;
 };
+// The runtime texture's hash of the live upload known by `hash` (its own or
+// its opaque alias), or 0. Caller holds g_textureLock.
+uint64_t uploadedTextureHash(uint64_t hash) {
+  auto found = g_texturesByHash.find(hash);
+  if (found == g_texturesByHash.end())
+    return 0;
+  const auto texture = found->second.lock();
+  return texture ? texture->hash : 0;
+}
+
 NamedTexture &namedTexture(const std::string &name) {
   static std::unordered_map<std::string, NamedTexture> masks;
   if (masks.size() > 4096)
@@ -436,21 +449,17 @@ uint64_t maskTextureHash(const std::string &name, bool count = true) {
     return 0;
   }
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
-  auto live = [](uint64_t hash) {
-    auto found = g_texturesByHash.find(hash);
-    return found != g_texturesByHash.end() && !found->second.expired();
-  };
-  if (mask.resolved && live(mask.resolved))
-    return mask.resolved;
+  if (mask.resolved)
+    if (const uint64_t hash = uploadedTextureHash(mask.resolved))
+      return hash;
   mask.resolved = 0;
-  for (uint64_t hash : mask.candidates)
-    if (live(hash)) {
-      mask.resolved = hash;
-      break;
+  for (uint64_t candidate : mask.candidates)
+    if (const uint64_t hash = uploadedTextureHash(candidate)) {
+      mask.resolved = candidate;
+      return hash;
     }
-  if (!mask.resolved)
-    g_stats.emissiveMaskNotUploaded += count;
-  return mask.resolved;
+  g_stats.emissiveMaskNotUploaded += count;
+  return 0;
 }
 
 // The texture's material sampled clamp-to-edge: an iris is projected onto the
@@ -547,6 +556,16 @@ engine_materials::Shading shadingFor(const void *texture, const engine_materials
   return bound;
 }
 
+// Statistics: the materials whose conversion was dropped because the draw's
+// texture is not their base texture's file (under g_transientSampleLock).
+struct PbrNotBase {
+  std::string material;
+  uint64_t texture = 0;
+  size_t candidates = 0;
+  uint32_t draws = 0;
+};
+std::map<std::string, PbrNotBase> g_pbrNotBase; // by base texture name
+
 // A PBR conversion's maps as uploaded textures (0: none).
 struct PbrMaps {
   bool use = false; // the conversion applies
@@ -568,6 +587,14 @@ PbrMaps pbrMapsFor(const RemixTexture &t, const engine_materials::Shading &s, bo
     if (s.base.empty() || (maskTextureHash(s.base, false) != t.hash &&
                            std::find(candidates.begin(), candidates.end(), t.hash) == candidates.end())) {
       ++g_stats.pbrNotBase;
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      if (g_pbrNotBase.size() < 32 || g_pbrNotBase.count(s.base)) {
+        PbrNotBase &n = g_pbrNotBase[s.base];
+        n.material = engine_materials::currentName();
+        n.texture = t.hash;
+        n.candidates = candidates.size();
+        ++n.draws;
+      }
       return maps;
     }
   }
@@ -838,13 +865,9 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   }
   uint64_t maskHash = 0;
   if (emission->mode == Shading::SelfIllumMask || emission->mode == Shading::SelfIllumMaskAlpha) {
-    for (uint64_t candidate : maskCandidates ? *maskCandidates : std::vector<uint64_t>()) {
-      auto found = g_texturesByHash.find(candidate);
-      if (found != g_texturesByHash.end() && !found->second.expired()) {
-        maskHash = candidate;
+    for (uint64_t candidate : maskCandidates ? *maskCandidates : std::vector<uint64_t>())
+      if ((maskHash = uploadedTextureHash(candidate)))
         break;
-      }
-    }
     if (!maskHash)
       return {};
   }
@@ -1957,6 +1980,60 @@ remixapi_ErrorCode g_modsResult = REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE;
 // first pixel shader registers (effect parameters).
 int g_dumpFlatFrames = 0;   // render thread
 FILE *g_dumpFlat = nullptr; // render thread
+// Dev aid: bin/shaderapi_proxy_material.request names a texture ("hunter/
+// myplastic"); the next draws of it are described in bin/material_probe.txt:
+// the material bound, the shading taken and its PBR conversion.
+struct MaterialProbe {
+  std::vector<uint64_t> hashes;
+  std::string name;
+  uint32_t left = 0;
+} g_materialProbe; // render thread
+void serviceMaterialProbeRequest() {
+  if (g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_material.request";
+  FILE *f = _wfopen(request.c_str(), L"r");
+  if (!f)
+    return;
+  char line[256] = {};
+  if (!fgets(line, sizeof(line), f))
+    line[0] = 0;
+  fclose(f);
+  DeleteFileW(request.c_str());
+  std::string name = line;
+  while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+    name.pop_back();
+  g_materialProbe.name = name;
+  g_materialProbe.hashes = bsp::textureCandidates(name);
+  g_materialProbe.left = 64;
+  if (FILE *out = _wfopen((g_moduleDir + L"\\material_probe.txt").c_str(), L"w")) {
+    fprintf(out, "== %s: %zu candidate hashes, from frame %llu\n", name.c_str(), g_materialProbe.hashes.size(),
+            static_cast<unsigned long long>(g_frame));
+    fclose(out);
+  }
+}
+void probeMaterialDraw(const void *texture, const engine_materials::Shading &bound, const engine_materials::Shading &taken,
+                       bool additive, bool multiply) {
+  if (!g_materialProbe.left || !texture)
+    return;
+  const uint64_t hash = textureHash(texture);
+  const auto &h = g_materialProbe.hashes;
+  if (std::find(h.begin(), h.end(), hash) == h.end())
+    return;
+  --g_materialProbe.left;
+  FILE *out = _wfopen((g_moduleDir + L"\\material_probe.txt").c_str(), L"a");
+  if (!out)
+    return;
+  const auto &b = engine_materials::bound();
+  fprintf(out, "f%llu texture %016llX | bound %s (%s, flags %08X) base %s pbr %d | taken mode %d base %s pbr %d normal %s rough %s ch %u bias %g scale %g, roughness %g%s%s\n",
+          static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(hash), engine_materials::currentName(),
+          b.known ? b.shader : "?", unsigned(b.flags), bound.base.c_str(), int(bound.pbr.active), int(taken.mode),
+          taken.base.c_str(), int(taken.pbr.active), taken.pbr.normal.c_str(), taken.pbr.maps[0].texture.c_str(),
+          taken.pbr.maps[0].channel, taken.pbr.maps[0].bias, taken.pbr.maps[0].scale, taken.pbr.roughness,
+          additive ? " additive" : "", multiply ? " multiply" : "");
+  fclose(out);
+}
+
 void serviceFlatDumpRequest() {
   if (g_dumpFlatFrames) {
     if (--g_dumpFlatFrames == 0 && g_dumpFlat) {
@@ -3652,6 +3729,7 @@ void onDraw(const Draw &d) {
   engine_materials::Shading shading;
   if (!additiveDraw && !multiply)
     shading = shadingFor(d.texture0, engine_materials::current());
+  probeMaterialDraw(d.texture0, engine_materials::current(), shading, additiveDraw, multiply);
   // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
   // panels, sprites). Other COLOR0 streams (baked prop lighting) do not.
   const bool hasColors = findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr;
@@ -5119,6 +5197,7 @@ void onPresent() {
   logFrameSpike();
   serviceScreenshotRequest();
   serviceFlatDumpRequest();
+  serviceMaterialProbeRequest();
   // The first frames, for the diagnostics log: a crash while rendering shows
   // how far the game got.
   static uint32_t presents = 0;
@@ -6084,6 +6163,17 @@ void dumpStatistics(FILE *out) {
             pbr::enabled() ? 1 : 0, g_stats.pbrDraws.exchange(0) / f, g_stats.pbrNormalDraws.exchange(0) / f,
             g_stats.pbrMapDraws.exchange(0) / f, g_stats.pbrMetalDraws.exchange(0) / f, g_stats.pbrNotBase.exchange(0) / f,
             g_stats.pbrMapsMissing.exchange(0) / f, g_stats.pbrCreated.exchange(0));
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      for (const auto &[base, n] : g_pbrNotBase) {
+        const std::string drawn = bsp::materialName(n.texture);
+        fprintf(out, "     not its base texture: %s (material %s): %.2f draws per frame, last texture %016llX%s%s, %zu "
+                     "candidate hashes from its file\n",
+                base.empty() ? "(no base texture)" : base.c_str(), n.material.c_str(), n.draws / f,
+                static_cast<unsigned long long>(n.texture), drawn.empty() ? "" : " = ", drawn.c_str(), n.candidates);
+      }
+      g_pbrNotBase.clear();
+    }
     {
       float m[4];
       {
