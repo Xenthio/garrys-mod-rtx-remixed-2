@@ -697,6 +697,8 @@ struct PropPart {
 struct PropModel {
   std::vector<PropPart> parts;
   bool engineParts = false; // translucent or ignored meshes the engine still draws
+  bool missingBakeOccluders = false;
+  uint32_t additiveEngineParts = 0; // camera-only layers do not hide the destination
   std::vector<std::string> engineMaterials;
 };
 struct Prop {
@@ -1065,6 +1067,15 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
       if (material < 0) {
         out.engineParts = true;
         out.engineMaterials.push_back(sourceMaterial);
+        KeyValues deferred;
+        const bool additive = loadMaterial(sourceMaterial, deferred) &&
+                              std::atoi(deferred.values["$additive"].c_str()) != 0;
+        // Source additive draws remain in the live compatibility pass. Their
+        // destination factor is one, so they do not remove visibility behind
+        // them and need no frozen occluder. Unknown/ignored opaque parts still
+        // block readiness: camera ownership alone says nothing about transport.
+        out.additiveEngineParts += additive;
+        out.missingBakeOccluders |= !additive;
         continue;
       }
       // Without a texture hash (format the proxy does not upload) the part
@@ -1160,8 +1171,10 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
           PropPart part;
           part.material = material;
           part.replacementHash = geometry ^ textureHash;
-          if (g_world.api->CreateMesh(&info, &part.mesh) != REMIXAPI_ERROR_CODE_SUCCESS)
+          if (g_world.api->CreateMesh(&info, &part.mesh) != REMIXAPI_ERROR_CODE_SUCCESS) {
+            complete = false;
             continue;
+          }
           for (const auto &v : partVertices)
             part.positions.insert(part.positions.end(), {v.position[0], v.position[1], v.position[2]});
           part.indices = std::move(partIndices);
@@ -3102,7 +3115,7 @@ void publishBakeScene(const std::vector<remixapi_LightHandle> &lights) {
   // Never label missing brush groups or failed/partially decoded props a
   // complete map. Keep direct Forward+ lighting while static inputs load.
   if (g_world.propModelsFailed || std::any_of(g_world.propModels.begin(), g_world.propModels.end(),
-                                             [](const auto &entry) { return entry.second.engineParts; })) {
+                                             [](const auto &entry) { return entry.second.missingBakeOccluders; })) {
     g_world.bakeReason = "static prop geometry is incomplete";
     return;
   }
@@ -3880,6 +3893,10 @@ void dumpStatistics(FILE *out) {
           g_world.skyboxLights, g_world.otherLights);
   fprintf(out, "   BSP authored reflection seeds: %zu (validated playable env_cubemap positions)\n",
           g_world.reflectionSeeds.size());
+  for (const auto &[key, model] : g_world.propModels)
+    if (model.engineParts)
+      fprintf(out, "     deferred prop transport: %s; %u additive camera-only parts; missing occluders %u\n",
+              key.first.c_str(), model.additiveEngineParts, unsigned(model.missingBakeOccluders));
   for (const auto &[key, model] : g_world.propModels)
     for (const auto &material : model.engineMaterials)
       fprintf(out, "     prop material left to the engine: %s (%s)\n", material.c_str(), key.first.c_str());
