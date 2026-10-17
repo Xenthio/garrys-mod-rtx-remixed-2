@@ -310,6 +310,7 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
     remixapi_MaterialInfoOpaqueEXT opaque = {};
     opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.roughnessConstant = 1; // A plain Source surface has no authored glossy lobe.
     // The runtime multiplies texture gamma values by the tint (then linearizes),
     // so a linear brightness B is B^(1/2.2).
     const float tint = sky ? std::pow(skyBrightness, 1.0f / 2.2f) : 1.0f;
@@ -320,8 +321,11 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
     remixapi_MaterialInfoReplacementHashEXT replacement = {};
     replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
     replacement.materialHash = t.legacyHash;
+    remixapi_MaterialInfoPbrEXT diffuse = {};
+    diffuse.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
+    opaque.pNext = &diffuse; // Preserve the path tracer's diffuse-only fallback.
     if (t.legacyHash && !sky)
-      opaque.pNext = &replacement;
+      diffuse.pNext = &replacement;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
@@ -479,10 +483,14 @@ remixapi_MaterialHandle clampedMaterialFor(const void *texture) {
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
     remixapi_MaterialInfoOpaqueEXT opaque = {};
     opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.roughnessConstant = 1;
     opaque.albedoConstant = {1, 1, 1};
     opaque.opacityConstant = 1;
     opaque.alphaTestType = 7;
     opaque.useDrawCallAlphaState = 1;
+    remixapi_MaterialInfoPbrEXT diffuse = {};
+    diffuse.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
+    opaque.pNext = &diffuse;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
@@ -712,6 +720,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   void *chain = emits ? static_cast<void *>(&self) : t.legacyHash ? &replacement : nullptr;
   remixapi_MaterialInfoOpaqueEXT opaque = {};
   opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.roughnessConstant = 1; // PBR conversion below overrides this diffuse fallback.
   if (pbr.use) {
     remap.pNext = chain;
     enable.pNext = &remap;
@@ -726,6 +735,10 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
       opaque.roughnessTexture = mapPaths[0];
     if (pbr.maps[1])
       opaque.metallicTexture = mapPaths[1];
+  } else {
+    enable.enabled = 0; // The rough Forward+ fallback must not opt path tracing into GGX.
+    enable.pNext = chain;
+    chain = &enable;
   }
   opaque.pNext = chain;
   opaque.albedoConstant = {1, 1, 1};

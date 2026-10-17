@@ -13,6 +13,12 @@ Multiplayer works out of the box since everything lives in the wrapper.
 
 Other source game support is planned
 
+Source normal maps, Phong parameters and reflection masks are converted to PBR
+when available. Materials without that information explicitly use roughness 1
+in Forward+ and keep diffuse-only shading in path tracing. Authored PBR values,
+water and shared USD replacements retain their own roughness and metalness.
+The conversion reuses existing textures; it does not generate missing surface detail.
+
 ## Build
 This is primarily built on Linux, Windows support is largely untested.
 

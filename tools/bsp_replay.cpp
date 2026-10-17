@@ -87,6 +87,7 @@ public:
     }
     remixapi_MaterialInfoOpaqueEXT opaque = {};
     opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.roughnessConstant = 1; // Match live plain-material exports.
     opaque.albedoConstant = {1, 1, 1};
     opaque.opacityConstant = 1;
     opaque.alphaTestType = 7;
@@ -155,6 +156,11 @@ public:
           opaque.pNext = &encoding;
         }
       }
+    }
+    if (!shading || !shading->pbr.active) {
+      pbr.enabled = 0;
+      pbr.pNext = opaque.pNext;
+      opaque.pNext = &pbr;
     }
     remixapi_MaterialHandle handle = nullptr;
     check(api.CreateMaterial(&info, &handle), "CreateMaterial");
