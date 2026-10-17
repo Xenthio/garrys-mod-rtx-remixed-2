@@ -46,6 +46,13 @@ bake_charts_test = executable('bsp-bake-charts-test', 'tests/bake_charts.cpp',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
 test('BSP surface lightmap chart mapping', bake_charts_test)
 
+source_fs_test = executable('source-fs-test', 'tests/source_fs.cpp', 'src/source_fs.cpp',
+  'src/lzma_source.cpp', 'deps/lzma/LzmaDec.c',
+  include_directories: include_directories('src'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Source loose and VPK relative model paths', source_fs_test,
+  args: [meson.current_build_dir() / 'source-fs-readback'])
+
 # A diagnostic map host: reads installed content without injecting into the game.
 executable('bsp-replay', 'tools/bsp_replay.cpp', 'tools/replay_settings.cpp', 'tools/replay_timing.cpp',
   'src/bsp_world.cpp', 'src/source_fs.cpp', 'src/lzma_source.cpp',

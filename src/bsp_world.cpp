@@ -1525,6 +1525,35 @@ int materialByName(const std::string &name, bool brush) {
       m.shading = materialShading(kv, m.maskCandidates);
     if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active)
       m.shading.base = lower(kv.values["$basetexture"]);
+    // A texture is optional for a constant UnlitGeneric material. Lost Coast's
+    // waterfog is only $color; waiting for a texture upload can never resolve it
+    // and used to hold the entire map's bake in the loading state forever.
+    if (kv.shader == "unlitgeneric" && kv.values["$basetexture"].empty() &&
+        kv.blocks["proxies"].empty() && !m.blended && !m.alphaTest && !detailAlpha) {
+      std::vector<uint64_t> unused;
+      const auto shading = materialShading(kv, unused);
+      remixapi_MaterialInfoSelfIlluminationEXT self = {};
+      self.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_SELF_ILLUMINATION_EXT;
+      self.maskScale = 1;
+      remixapi_MaterialInfoEmissionEXT emission = {};
+      emission.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_EMISSION_EXT;
+      emission.pNext = &self;
+      emission.suppressLightGeneration = !shading.luminous;
+      remixapi_MaterialInfoOpaqueEXT opaque = {};
+      opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+      opaque.pNext = &emission;
+      opaque.albedoConstant = {1, 1, 1};
+      opaque.opacityConstant = 1;
+      opaque.alphaTestType = 7;
+      remixapi_MaterialInfo info = {};
+      info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+      info.pNext = &opaque;
+      info.hash = XXH3_64bits(cacheKey.data(), cacheKey.size()) | 1;
+      info.emissiveIntensity = 1;
+      info.emissiveColorConstant = {shading.tint[0], shading.tint[1], shading.tint[2]};
+      if (g_world.api && g_world.api->CreateMaterial(&info, &m.ref.handle) == REMIXAPI_ERROR_CODE_SUCCESS)
+        m.resolved = m.owned = true;
+    }
   }
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);

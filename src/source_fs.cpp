@@ -19,6 +19,10 @@ std::string normalize(std::string path) {
     c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
   while (!path.empty() && path[0] == '/')
     path.erase(0, 1);
+  // Older BSP prop dictionaries (Lost Coast, for example) prefix model paths
+  // with "./". Loose Windows files tolerate it, VPK entry names do not.
+  while (path.rfind("./", 0) == 0)
+    path.erase(0, 2);
   return path;
 }
 
