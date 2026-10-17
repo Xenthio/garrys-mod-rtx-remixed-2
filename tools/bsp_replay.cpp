@@ -1,3 +1,4 @@
+#include "source_lights.h"
 // Standalone diagnostic host for the production BSP loader. It never injects
 // into Source or writes installed content. Static VMTs only; no material proxies.
 #include "bsp_world.h"
@@ -222,39 +223,17 @@ proxy::bsp::MaterialRef lookup(uint64_t hash, const Shading *shading, const std:
 }
 
 remixapi_LightHandle light(remixapi_Interface &api, const proxy::bsp::Light &source) {
-  constexpr float pi = 3.14159265f, radius = 2, reference = 100;
-  remixapi_LightInfo info = {};
-  info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-  info.hash = source.hash;
-  remixapi_LightInfoSphereEXT sphere = {};
-  sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-  sphere.position = {source.position[0], source.position[1], source.position[2]};
-  sphere.radius = radius;
-  remixapi_LightInfoDistantEXT distant = {};
-  distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
-  distant.direction = {source.direction[0], source.direction[1], source.direction[2]};
-  distant.angularDiameterDegrees = .5f;
-  float scale = pi;
-  if (source.type != 2) {
-    const auto &a = source.attenuation;
-    const float denominator = a[0] + a[1] * reference + a[2] * reference * reference;
-    if (!(denominator > 0))
-      return nullptr;
-    scale = reference * reference / denominator / (pi * radius * radius);
-    if (source.type == 3 && source.phiDot > -1 && source.phiDot < 1) {
-      const float outer = std::acos(source.phiDot);
-      const float inner = std::acos(std::clamp(source.thetaDot, -1.f, 1.f));
-      sphere.shaping_hasvalue = 1;
-      sphere.shaping_value.direction = distant.direction;
-      sphere.shaping_value.coneAngleDegrees = outer * 180 / pi;
-      sphere.shaping_value.coneSoftness = outer > 0 ? std::clamp((outer - inner) / outer, 0.f, 1.f) : 0;
-    }
-  }
-  info.radiance = {source.color[0] * scale, source.color[1] * scale, source.color[2] * scale};
-  info.pNext = source.type == 2 ? static_cast<void *>(&distant) : &sphere;
-  remixapi_LightHandle handle = nullptr;
-  check(api.CreateLight(&info, &handle), "CreateLight");
-  return handle;
+  proxy::lighting::SourceLight light = {};
+  light.type = source.type;
+  std::copy_n(source.position, 3, light.position);
+  std::copy_n(source.color, 3, light.color);
+  std::copy_n(source.direction, 3, light.direction);
+  light.attenuation0 = source.attenuation[0];
+  light.attenuation1 = source.attenuation[1];
+  light.attenuation2 = source.attenuation[2];
+  light.thetaDot = source.thetaDot;
+  light.phiDot = source.phiDot;
+  return proxy::lighting::createLight(api, light, source.hash);
 }
 
 void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *map, const char *output,

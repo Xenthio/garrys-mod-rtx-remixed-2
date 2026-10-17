@@ -75,7 +75,7 @@ void publishBakeScene(const std::vector<remixapi_LightHandle> &lights);
 bool isStaticProp(const float *modelRows, const float eye[3]);
 
 // A static light of the map, in the engine's LightDesc_t terms (type 1 point,
-// 2 directional, 3 spot; color in Source's linear intensity units).
+// 2 directional, 3 spot, internal 4 surface; color in Source intensity units).
 struct Light {
   int type = 0;
   float color[3] = {}, position[3] = {}, direction[3] = {};

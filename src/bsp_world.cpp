@@ -1,3 +1,4 @@
+#include "source_lights.h"
 #include "bsp_world.h"
 #include "bake_charts.h"
 
@@ -2248,10 +2249,9 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     }
     // As the engine passes it to models (WorldLightToMaterialLight).
     Light l;
-    // Surface lights (texture lights: lights.rad, a store's ceiling panels)
-    // reach models as point lights with inverse-square falloff. Left to the
-    // engine they existed only while it lit a model near them.
-    l.type = w.type == kEmitPoint || w.type == kEmitSurface ? 1 : w.type == kEmitSpot ? 3 : 2;
+    // Retain texture-light sidedness instead of the isotropic point-light
+    // approximation that Source passes to model lighting.
+    l.type = w.type == kEmitSurface ? lighting::kSurface : w.type == kEmitPoint ? 1 : w.type == kEmitSpot ? 3 : 2;
     std::memcpy(l.color, w.intensity, 12);
     std::memcpy(l.position, w.origin, 12);
     std::memcpy(l.direction, w.normal, 12);

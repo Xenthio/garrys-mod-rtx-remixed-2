@@ -1,3 +1,4 @@
+#include "source_lights.h"
 #include "diag.h"
 #include <map>
 #include "remix_output.h"
@@ -924,11 +925,7 @@ uint32_t g_markerCategories = 0;
 
 // --- Lights ------------------------------------------------------------------
 // LightDesc_t (public/mathlib/lightdesc.h), 88 bytes.
-struct SourceLight {
-  int32_t type; // 1 point, 2 directional, 3 spot
-  float color[3], position[3], direction[3];
-  float range, falloff, attenuation0, attenuation1, attenuation2, theta, phi, thetaDot, phiDot;
-};
+using SourceLight = lighting::SourceLight;
 constexpr size_t kLightDescSize = 88;
 std::mutex g_lightLock;
 std::unordered_map<uint64_t, SourceLight> g_frameLights, g_lastLights;
@@ -949,63 +946,10 @@ float envScale(const char *name, float fallback) {
   return value > 0 ? value : fallback;
 }
 
-// Source colors are linear intensities with 1/(a0 + a1 d + a2 d^2) falloff in
-// game units. A point light becomes a small sphere of the same radiant
-// intensity (matched at a reference distance when the falloff is not purely
-// quadratic). The runtime shades the distant light as brdf * cos * radiance
-// with a Lambert brdf of albedo / pi, where Source lights a surface with
-// albedo * cos * color: the sun's radiance is Source's color times pi (passed
-// as it was, light_environment suns came out at a third of their brightness).
-remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
+remixapi_LightHandle createLight(const SourceLight &light, uint64_t hash) {
   static const float lightScale = envScale("OPENREMIX_PROXY_LIGHT_SCALE", 1.0f);
   static const float sunScale = envScale("OPENREMIX_PROXY_SUN_SCALE", 1.0f);
-  remixapi_LightInfo info = {};
-  info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-  info.hash = hash;
-  remixapi_LightInfoSphereEXT sphere = {};
-  remixapi_LightInfoDistantEXT distant = {};
-  if (l.type == 2) {
-    constexpr float kSunDiameterDegrees = 0.5f;
-    const float s = sunScale * 3.14159265f;
-    info.radiance = {l.color[0] * s, l.color[1] * s, l.color[2] * s};
-    const float len = std::sqrt(l.direction[0] * l.direction[0] + l.direction[1] * l.direction[1] +
-                                l.direction[2] * l.direction[2]);
-    if (len < 1e-6f)
-      return nullptr;
-    distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
-    distant.direction = {l.direction[0] / len, l.direction[1] / len, l.direction[2] / len};
-    distant.angularDiameterDegrees = kSunDiameterDegrees;
-    info.pNext = &distant;
-  } else {
-    constexpr float kRadius = 2.0f, kReference = 100.0f;
-    const float falloff = l.attenuation0 + l.attenuation1 * kReference + l.attenuation2 * kReference * kReference;
-    if (falloff <= 0)
-      return nullptr;
-    const float intensity = kReference * kReference / falloff; // radiant intensity per unit color
-    const float s = lightScale * intensity / (3.14159265f * kRadius * kRadius);
-    info.radiance = {l.color[0] * s, l.color[1] * s, l.color[2] * s};
-    sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-    sphere.position = {l.position[0], l.position[1], l.position[2]};
-    sphere.radius = kRadius;
-    if (l.type == 3) {
-      const float len = std::sqrt(l.direction[0] * l.direction[0] + l.direction[1] * l.direction[1] +
-                                  l.direction[2] * l.direction[2]);
-      if (len > 1e-6f && l.phiDot > -1 && l.phiDot < 1) {
-        sphere.shaping_hasvalue = 1;
-        sphere.shaping_value.direction = {l.direction[0] / len, l.direction[1] / len, l.direction[2] / len};
-        const float outer = std::acos(l.phiDot), inner = std::acos(std::clamp(l.thetaDot, -1.0f, 1.0f));
-        sphere.shaping_value.coneAngleDegrees = outer * 57.2957795f;
-        sphere.shaping_value.coneSoftness = outer > 0 ? std::clamp((outer - inner) / outer, 0.0f, 1.0f) : 0;
-        sphere.shaping_value.focusExponent = 0;
-      }
-    }
-    info.pNext = &sphere;
-  }
-  for (float c : {info.radiance.x, info.radiance.y, info.radiance.z})
-    if (!std::isfinite(c) || c < 0)
-      return nullptr;
-  remixapi_LightHandle handle = nullptr;
-  return g_api.CreateLight(&info, &handle) == REMIXAPI_ERROR_CODE_SUCCESS ? handle : nullptr;
+  return lighting::createLight(g_api, light, hash, lightScale, sunScale);
 }
 
 } // namespace

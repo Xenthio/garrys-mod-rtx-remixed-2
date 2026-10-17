@@ -33,7 +33,7 @@ shared_library('shaderapidx9',
   'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp', 'src/engine_shadows.cpp',
   'src/engine_materials.cpp', 'src/material_shading.cpp', 'src/engine_nocull.cpp', 'src/pbr_rules.cpp',
   'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/bake_sky.cpp',
-  'src/bake_sky_cache.cpp', 'deps/lzma/LzmaDec.c', host_shaders,
+  'src/bake_sky_cache.cpp', 'src/source_lights.cpp', 'deps/lzma/LzmaDec.c', host_shaders,
   include_directories: include_directories(remix_inc, sdl_inc, 'deps/xxhash'),
   dependencies: [dxso_dep],
   name_prefix: '',
@@ -57,7 +57,7 @@ test('Source loose and VPK relative model paths', source_fs_test,
 executable('bsp-replay', 'tools/bsp_replay.cpp', 'tools/replay_settings.cpp', 'tools/replay_timing.cpp',
   'src/bsp_world.cpp', 'src/source_fs.cpp', 'src/lzma_source.cpp',
   'src/texture_formats.cpp', 'src/texture_categories.cpp', 'src/pbr_rules.cpp',
-  'src/material_shading.cpp', 'deps/lzma/LzmaDec.c',
+  'src/material_shading.cpp', 'src/source_lights.cpp', 'deps/lzma/LzmaDec.c',
   include_directories: include_directories('src', remix_inc, 'deps/xxhash'),
   dependencies: meson.get_compiler('cpp').find_library('user32'),
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
@@ -94,3 +94,8 @@ device_window_test = executable('device-window-test', 'tests/device_window.cpp',
   include_directories: include_directories('src'),
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
 test('Game window ownership across redirected device creation', device_window_test)
+
+source_lights_test = executable('source-lights-test', 'tests/source_lights.cpp', 'src/source_lights.cpp',
+  include_directories: include_directories('src', remix_inc),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Source emitter intensity, angular falloff and ABI', source_lights_test)
