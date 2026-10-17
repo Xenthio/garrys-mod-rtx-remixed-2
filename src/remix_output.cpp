@@ -6,6 +6,7 @@
 #include "sky_faces.h"
 #include "bsp_world.h"
 #include "bake_sky.h"
+#include "device_window.h"
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
@@ -2303,8 +2304,8 @@ uint32_t skyEpoch() { return g_skyEpoch; }
 
 // A new map: the dome of the previous one must not outlive it (a map whose
 // 2D sky is not drawn, or not yet, falls back to the sky light estimate).
-static void resetSky() {
-  g_bakeSky.reset(g_api);
+static void resetSky(const char *mapName) {
+  g_bakeSky.reset(g_api, mapName && *mapName ? XXH3_64bits(mapName, std::strlen(mapName)) | 1 : 0);
   if (g_skyDome)
     g_api.DestroyLight(g_skyDome);
   if (g_skyTexture)
@@ -2322,7 +2323,7 @@ static void resetSky() {
 bool loadMap(const char *name) {
   if (!g_ready)
     return false;
-  resetSky();
+  resetSky(name);
   diag::stage("Map lifecycle: %s", name && *name ? name : "unload");
   return bsp::load(g_api, name ? name : "", engine_lights::stylesActive());
 }
@@ -2482,8 +2483,9 @@ void applySkyDome() {
 void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp) {
   if (!enabled() || !pp)
     return;
-  if (gameWindow || !g_gameWindow)
-    g_gameWindow = pp->hDeviceWindow ? pp->hDeviceWindow : gameWindow;
+  g_gameWindow = gameWindowForDevice(g_gameWindow, g_hiddenWindow, gameWindow, pp->hDeviceWindow);
+  diag::stage("D3D host window: focus %p, requested %p, game %p, hidden %p", gameWindow,
+              pp->hDeviceWindow, g_gameWindow, g_hiddenWindow);
   g_displayWidth = pp->BackBufferWidth;
   g_displayHeight = pp->BackBufferHeight;
   // D3D9 keeps rendering (to a hidden window) so the shader API is unaffected;

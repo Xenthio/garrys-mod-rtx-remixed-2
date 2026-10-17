@@ -1,4 +1,6 @@
 #include "bake_sky.h"
+#include "bake_sky_cache.h"
+#include <cstdio>
 #include <cwchar>
 
 namespace proxy::remix {
@@ -6,6 +8,13 @@ bool BakeSky::capture(const remixapi_Interface &api, const remixapi_TextureInfo 
   if (m_light)
     return true;
   auto texture = source;
+  const auto stable = canonicalBakeSky(source, scale, bakeSkyCachePath(m_mapId));
+  if (stable.hash)
+    texture.hash = stable.hash;
+  if (stable.reused) {
+    texture.data = stable.pixels.data();
+    std::puts("Map-load bake sky: reused bounded capture-noise reference");
+  }
   // Own a separate texture so replacing the live dome cannot release this one.
   texture.hash ^= 0x62616b65736b7901ull;
   if (!texture.hash)
@@ -34,12 +43,13 @@ bool BakeSky::capture(const remixapi_Interface &api, const remixapi_TextureInfo 
   return true;
 }
 
-void BakeSky::reset(const remixapi_Interface &api) {
+void BakeSky::reset(const remixapi_Interface &api, uint64_t mapId) {
   if (m_light)
     api.DestroyLight(m_light);
   if (m_texture)
     api.DestroyTexture(m_texture);
   m_light = nullptr;
   m_texture = nullptr;
+  m_mapId = mapId;
 }
 } // namespace proxy::remix

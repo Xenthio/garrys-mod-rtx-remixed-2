@@ -8,10 +8,11 @@ namespace proxy::remix {
 class BakeSky {
 public:
   bool capture(const remixapi_Interface &api, const remixapi_TextureInfo &texture, float scale);
-  void reset(const remixapi_Interface &api);
+  void reset(const remixapi_Interface &api, uint64_t mapId = 0);
   remixapi_LightHandle light() const { return m_light; }
 
 private:
+  uint64_t m_mapId = 0;
   remixapi_TextureHandle m_texture = nullptr;
   remixapi_LightHandle m_light = nullptr;
 };

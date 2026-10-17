@@ -43,6 +43,17 @@ additional runtime dependencies need those DLLs supplied separately. It uses the
 installed engine and loose scripts, so it does not establish a pristine Steam
 baseline. Addons, native Lua modules, Workshop content and user configuration
 directories are excluded from copying.
+
+The first captured sky remains the static map-load lighting environment. Its
+RGBA8 readback can differ by sparse one-level capture noise between launches.
+The wrapper stores a reference under the bake cache's `sky/` directory and reuses
+its actual pixels only when every RGB difference is at most one level, alpha is
+unchanged, and the mean RGB difference is at most 1/64 of a level. Larger changes,
+dimensions or lighting-scale changes invalidate the reference. The runtime still
+hashes the exact image used for transport. The live sky remains animated.
+`OPENREMIX_PROXY_BAKE_SKY_CACHE=0` disables reference reuse. Cache files include
+dimensions, format, scale and a payload checksum; malformed files fall back to
+the current capture. `REMIX_BAKE_CACHE_DIR` controls the shared cache location.
 The stage chooses the stock Kleiner player/hands on spawn, so account preferences
 for unavailable Workshop models cannot add missing-model geometry to the capture.
 This fixture does not change the account's model preference.

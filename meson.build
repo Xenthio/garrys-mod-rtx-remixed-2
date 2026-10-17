@@ -33,7 +33,7 @@ shared_library('shaderapidx9',
   'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp', 'src/engine_shadows.cpp',
   'src/engine_materials.cpp', 'src/material_shading.cpp', 'src/engine_nocull.cpp', 'src/pbr_rules.cpp',
   'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/bake_sky.cpp',
-  'deps/lzma/LzmaDec.c', host_shaders,
+  'src/bake_sky_cache.cpp', 'deps/lzma/LzmaDec.c', host_shaders,
   include_directories: include_directories(remix_inc, sdl_inc, 'deps/xxhash'),
   dependencies: [dxso_dep],
   name_prefix: '',
@@ -74,7 +74,16 @@ d3d_method_test = executable('d3d-method-test', 'tests/d3d_method.cpp',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
 test('D3D9 resource methods across distinct vtables', d3d_method_test)
 
-bake_sky_test = executable('bake-sky-test', 'tests/bake_sky.cpp', 'src/bake_sky.cpp',
-  include_directories: include_directories('src', remix_inc),
+bake_sky_test = executable('bake-sky-test', 'tests/bake_sky.cpp', 'src/bake_sky.cpp', 'src/bake_sky_cache.cpp',
+  include_directories: include_directories('src', remix_inc, 'deps/xxhash'),
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
 test('Map-load bake sky ownership and animation isolation', bake_sky_test)
+bake_sky_cache_test = executable('bake-sky-cache-test', 'tests/bake_sky_cache.cpp', 'src/bake_sky_cache.cpp',
+  include_directories: include_directories('src', remix_inc, 'deps/xxhash'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Bake sky capture-noise reuse and cache invalidation', bake_sky_cache_test,
+  args: [meson.current_build_dir() / 'bake-sky-cache-fixtures'])
+device_window_test = executable('device-window-test', 'tests/device_window.cpp',
+  include_directories: include_directories('src'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Game window ownership across redirected device creation', device_window_test)
