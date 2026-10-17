@@ -27,12 +27,14 @@ analytics client game_shader_generic_garrysmod lua_shared menusystem resources s
 """.split()
 
 
-def prepare(source, destination, proxy, runtime, sdl):
+def prepare(source, destination, proxy, runtime, sdl, *, launcher_only=False):
     source = source.resolve(strict=True)
     destination = destination.resolve()
     if destination == source or source in destination.parents:
         raise ValueError("Stage must be outside the installed game")
-    if destination.exists():
+    if destination.exists() and not (launcher_only and all(
+            entry.is_file() and entry.name.startswith("RTXLauncher.Avalonia.exe")
+            for entry in destination.iterdir())):
         raise ValueError("Stage must be a new directory; existing files are never replaced")
     engine = source / "bin/win64"
     client = source / "garrysmod/bin/win64"
@@ -75,7 +77,7 @@ def prepare(source, destination, proxy, runtime, sdl):
         if not original.is_file():
             raise FileNotFoundError(original)
 
-    destination.mkdir(parents=True)
+    destination.mkdir(parents=True, exist_ok=launcher_only)
     for original, relative in copies:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)

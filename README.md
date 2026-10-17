@@ -77,6 +77,47 @@ The proxy diagnostics report backend selection and bake progress. Optional
 `OPENREMIX_PROXY_LOG_ENGINE_ERRORS=1` also records engine startup error messages
 before forwarding them to the engine's normal error handler.
 
+### Persistent testing installation
+
+`tools/deploy_testing.py` installs a complete Windows runtime package into an
+isolated host and updates it without resetting game settings, mods or bake caches.
+Create a local `_work/testing-install.json` with absolute paths, for example:
+
+```json
+{
+  "source": "E:/SteamLibrary/steamapps/common/GarrysMod",
+  "target": "E:/SteamLibrary/steamapps/common/GarrysModWithRTX2",
+  "proxy": "D:/garrys-mod-rtx-remixed-2/_work/build/forwardplus/shaderapidx9.dll",
+  "package": "D:/OpenRemix/_work/packages/your-verified-runtime",
+  "native_repo": "D:/OpenRemix",
+  "mods": "D:/your-generated-mods"
+}
+```
+
+The optional `mods` directory seeds a private copy on the first deployment only.
+Build the package with OpenRemix's `scripts/windows/package-runtime.py`; its
+manifest and every dependency hash are checked before deployment. Run:
+
+```powershell
+python tools/deploy_testing.py --settings _work/testing-install.json
+python tools/deploy_testing.py --settings _work/testing-install.json --verify
+```
+
+The initial target must be absent or contain only `RTXLauncher.Avalonia.exe`
+bootstrap files. The base host includes Construct and Flatgrass; copy additional
+maps/content into its own `garrysmod` directory. The generated `Play OpenRemix.cmd`
+launches Forward+ with local configuration, cache, USD replacements and packaged
+dependencies. It accepts game arguments, for example `+map gm_construct`.
+`Update OpenRemix.cmd` reruns the deployment using the local settings file.
+It deploys built files; it does not compile source. Updates refuse a running test
+host, back up replaced files under `openremix-backups`, and record installed hashes
+and source revisions in `openremix-install.json`. Unrelated files are preserved.
+
+For continued renderer development on this workstation, use `GarrysModWithRTX2`
+as the persistent testing target. After validating a new runtime, select its
+package in `_work/testing-install.json` and redeploy when this host is closed.
+The launcher does not install forced cameras, moving test props or quit timers.
+
 
 ## Standalone BSP diagnostics (Windows)
 
