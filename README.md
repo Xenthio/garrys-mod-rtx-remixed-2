@@ -129,6 +129,12 @@ The native transport samples source-over sheets as thin coverage, including
 vertex-alpha terrain layers. BSP water opts into smooth optical bake boundaries:
 constant refraction/absorption is captured while normal-map ripples stay live.
 This does not add primary water rendering or refractive caustics to Forward+.
+Water replacements automatically match the water material's normal-map upload
+hashes, with the older `dev/dev_monitor` compatibility keys as fallbacks. Both
+legacy and current hashes of the supported mip variants are included. SDK
+material IDs remain distinct, so bodies that share a normal map can keep their
+own source fog properties. `OPENREMIX_PROXY_WATER_KEY=<hex>` explicitly selects
+one key; `0` disables those automatic water replacement keys.
 For load-time bake experiments, a replay settings file can raise
 `rtx.native.forward.bakeBatch` to `1024`; retain isolated configuration so this
 experiment does not become a game preference.

@@ -430,6 +430,30 @@ std::vector<uint64_t> textureHashes(const std::string &name) {
   return hashes;
 }
 
+// Source water has no stable base texture. Generated packs key it by its
+// normal map; older fixed-function packs used dev/dev_monitor for every body.
+// Preserve both identities without tying SDK resource IDs to replacement IDs.
+std::vector<uint64_t> waterReplacementKeys(const KeyValues &material) {
+  char override[32] = {};
+  if (GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_KEY", override, sizeof(override))) {
+    const auto key = uint64_t(std::strtoull(override, nullptr, 16));
+    return key ? std::vector<uint64_t>{key} : std::vector<uint64_t>{};
+  }
+  std::vector<uint64_t> keys;
+  auto append = [&](const std::string &name) {
+    const auto path = "materials/" + lower(name) + ".vtf";
+    for (const bool engine : {false, true})
+      for (const bool legacy : {true, false})
+        for (const auto key : textureHashes(path, engine, legacy))
+          if (key && keys.size() < 32 && std::find(keys.begin(), keys.end(), key) == keys.end())
+            keys.push_back(key);
+  };
+  if (const auto normal = material.values.find("$normalmap"); normal != material.values.end())
+    append(normal->second);
+  append("dev/dev_monitor");
+  return keys;
+}
+
 // Whether a texture has an alpha channel as the engine sees it
 // (ITexture::IsTranslucent: TEXTUREFLAGS_ONEBITALPHA | EIGHTBITALPHA).
 bool textureHasAlpha(const std::string &name) {
@@ -1366,23 +1390,16 @@ int materialByName(const std::string &name, bool brush) {
     opaque.opacityConstant = std::clamp(0.35f + 40.0f / std::max(fogEnd, 1.0f), 0.35f, 0.9f);
     opaque.roughnessConstant = 0.05f;
     opaque.alphaTestType = 7;
-    // Mods made for the fixed-function compatibility mod replace water by
-    // the texture its addon drew every water surface with ("rtx/water":
-    // dev/dev_monitor), since Source's own water has no base texture. Water
-    // here answers to that key (OPENREMIX_PROXY_WATER_KEY: another hash in
-    // hex, 0 for none), so such a mod's water material takes its place; with
-    // no mod the fog-coloured surface above stays.
-    static const uint64_t waterKey = [] {
-      char value[32] = {};
-      if (GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_KEY", value, sizeof(value)))
-        return uint64_t(std::strtoull(value, nullptr, 16));
-      const auto hashes = textureHashes("dev/dev_monitor");
-      return hashes.empty() ? uint64_t(0) : hashes[0];
-    }();
+    const auto waterKeys = waterReplacementKeys(kv);
     remixapi_MaterialInfoReplacementHashEXT replacement = {};
     replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
-    replacement.materialHash = waterKey;
-    opaque.pNext = waterKey ? &replacement : nullptr;
+    replacement.materialHash = waterKeys.empty() ? 0 : waterKeys.front();
+    remixapi_MaterialReplacementKeysEXT alternates{};
+    alternates.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_REPLACEMENT_KEYS_EXT;
+    alternates.pNext = &replacement;
+    alternates.count = uint32_t(waterKeys.size());
+    alternates.keys = waterKeys.data();
+    opaque.pNext = waterKeys.empty() ? nullptr : &alternates;
     // Its $normalmap, sampled as the Water shader samples it: animated by an
     // AnimatedTexture proxy, moved by a TextureScroll proxy on $bumptransform,
     // and with $scroll1 set ("multi-texture") averaged with two more scrolling
