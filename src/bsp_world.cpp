@@ -2692,7 +2692,7 @@ bool build(const Bsp &bsp) {
           }
         for (uint32_t i : indices)
           g.indices.push_back(base + i);
-        if (!sheet && !skyboxFace)
+        if (!skyboxFace)
           if (auto chart = lightmaps::capture(lightmapMapping, uint32_t(firstIndex), g.indices, base, lightmapCoordinates))
             g.lightmaps.push_back(std::move(*chart));
         toWorld(g, base, firstIndex, !sheet);
@@ -3282,6 +3282,21 @@ void submit(MaterialLookup lookup) {
       kept = false;
     return instance;
   };
+  const auto captureCharts = [&](uint64_t retained, const auto &group, bool resolvedOnly = false) {
+    if (!retained || group.sky)
+      return;
+    uint32_t surfaceIndex = 0;
+    for (const auto &[material, geometry] : group.surfaces) {
+      if (geometry.indices.empty() || geometry.vertices.empty() ||
+          (resolvedOnly && !g_world.materials[material].resolved))
+        continue;
+      for (const auto &chart : geometry.lightmaps)
+        g_world.bakeCharts.push_back({retained, surfaceIndex, 0, chart.firstIndex,
+                                     uint32_t(chart.texcoords.size() / 2), chart.width, chart.height,
+                                     chart.texcoords.data()});
+      ++surfaceIndex;
+    }
+  };
   // What the camera does not see of the map, as in Source: back faces (except
   // $nocull materials) and what lies in clusters outside the camera cluster's
   // potentially visible set (the runtime locates the camera and each surface
@@ -3345,13 +3360,15 @@ void submit(MaterialLookup lookup) {
     identity.rasterVisible = 1;
     info.pNext = &identity;
     info.mesh = group.mesh;
-    info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
+    info.categoryFlags = REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC |
+                         REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN |
+                         (group.sky ? REMIXAPI_INSTANCE_CATEGORY_BIT_SKY : 0);
     info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
     info.doubleSided = 1;
     // Paint is seen from its face's front only, and where its face is.
     remixapi_InstanceInfoCameraCullingEXT culling;
     cameraCulling(info, culling, group.noCull, group.skybox);
-    draw(info);
+    captureCharts(draw(info), group, true);
   }
   // Overlays: static decals, blended over the surface below.
   for (auto &[key, group] : g_world.overlayGroups) {
@@ -3411,18 +3428,7 @@ void submit(MaterialLookup lookup) {
     remixapi_InstanceInfoCameraCullingEXT culling;
     cameraCulling(info, culling, group.noCull, group.skybox);
     const auto retained = draw(info);
-    if (retained && !group.sky) {
-      uint32_t surfaceIndex = 0;
-      for (const auto &[material, geometry] : group.surfaces) {
-        if (geometry.indices.empty() || geometry.vertices.empty())
-          continue;
-        for (const auto &chart : geometry.lightmaps)
-          g_world.bakeCharts.push_back({retained, surfaceIndex, 0, chart.firstIndex,
-                                       uint32_t(chart.texcoords.size() / 2), chart.width, chart.height,
-                                       chart.texcoords.data()});
-        ++surfaceIndex;
-      }
-    }
+    captureCharts(retained, group);
   }
   for (const auto &prop : g_world.props) {
     if (prop.skybox)
