@@ -192,7 +192,8 @@ def main():
     handles, labels = ax.get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(.5, .06), ncol=3, fontsize=8)
     fig.text(.02, .02, "Capture origins and receiver are projected onto the slice. Props, moving brushes and displacements are omitted.", fontsize=8)
-    fig.tight_layout(rect=(0, .15, 1, 1))
+    legend_space = .24 if len(probes) >= 10 else .15
+    fig.tight_layout(rect=(0, legend_space, 1, 1))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=160)
     plt.close(fig)

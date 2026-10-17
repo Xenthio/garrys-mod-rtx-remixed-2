@@ -330,6 +330,8 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
     stats.structSize = sizeof(stats);
     if (statistics) {
       check(statistics(&stats), "GetBakeStatistics");
+      if (measurement.enabled() && settings.waitForBake && stats.state == REMIXAPI_BAKE_FAILED_EXT)
+        throw std::runtime_error(std::string("Map bake failed: ") + stats.status);
       if (stats.active && profile && !requestedProbes) {
         std::ofstream(diagnostics / "probes.request");
         requestedProbes = true;
@@ -383,8 +385,17 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
       }
     }
     const unsigned drain = std::getenv("REMIX_DEBUG_BAKE_CAPTURE_PREFIX") ? 8 : 3;
-    if (measurementEnd != ~0u && frame >= measurementEnd + drain)
-      break; // drain the screenshot without measuring its readback
+    if (measurementEnd != ~0u && frame >= measurementEnd + drain) {
+      // Runtime file requests are serviced every 30 presents. A short timing
+      // window can finish before that poll; drain the requested probe report
+      // as well as the screenshot, without including either in measurements.
+      const bool pendingProbes = profile && requestedProbes &&
+                                 lastWrite(diagnostics / "probes.json") == previousProbeReport;
+      if (!pendingProbes)
+        break;
+      if (frame - measurementEnd >= 60)
+        throw std::runtime_error("Published reflection probe report did not arrive within 60 presents");
+    }
     if (!measurement.enabled())
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }

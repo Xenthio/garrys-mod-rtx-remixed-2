@@ -2280,8 +2280,9 @@ bool build(const Bsp &bsp) {
   }
   g_world.skyArea = skyArea;
   g_world.skyTraced = skyArea >= 0 && skyTraceEnabled() && g_world.skyScale > 0;
-  if (g_world.skyTraced) {
-    // Empty leaves outside the skybox: the volume the player can see from.
+  {
+    // Bake bounds are needed on every map, including maps without a 3D skybox
+    // and runs with sky tracing disabled. Keep the separate sky area excluded.
     bool any = false;
     for (size_t l = 1; l < leafCount; ++l) {
       const Leaf &leaf = leafs[l];
@@ -2293,7 +2294,7 @@ bool build(const Bsp &bsp) {
       }
       any = true;
     }
-    g_world.skyTraced = any;
+    g_world.skyTraced &= any;
   }
   {
     const auto [nodes, nodeCount] = bsp.lump<Node>(kNodes);
