@@ -45,9 +45,10 @@ float textureLuminance(const std::string &name);
 bool load(const remixapi_Interface &api, const std::string &mapName, bool lightStylesAvailable = false);
 
 // Offline replay uses the same Source search paths and VTF decoder as the game.
-// Animated images are refused: freezing their first frame would misrepresent bake inputs.
+// Animated images are refused unless the diagnostic host explicitly requests
+// a frozen frame-zero snapshot. This is not engine animation playback.
 bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,
-                  std::vector<uint8_t> &rgba, std::string &error);
+                  std::vector<uint8_t> &rgba, std::string &error, bool freezeAnimation = false);
 bool materialSource(uint64_t textureHash, std::string &baseTexture);
 // Legacy XXH64 replacement key for the same upload bytes/mip as a current
 // texture candidate. Offline hosts need this because decoded DDSs have new IDs.

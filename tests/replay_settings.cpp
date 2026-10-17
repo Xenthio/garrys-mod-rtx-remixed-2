@@ -60,6 +60,12 @@ int main() {
   refuse("replay.position=nan 0 0");
   refuse("replay.fov=179");
   refuse("replay.unknown=1");
+  require(!proxy::replay::Settings{}.freezeAnimation &&
+              parse("replay.freezeAnimation=1\n").freezeAnimation &&
+              !parse("replay.freezeAnimation=0\n").freezeAnimation,
+          "Frozen animation snapshots require an explicit diagnostic setting");
+  refuse("replay.freezeAnimation=2");
+  refuse("replay.freezeAnimation=nan");
   const auto mods = parse("replay.mods=materials with spaces\n");
   require(mods.mods == "materials with spaces", "Replay mod paths preserve spaces without reaching runtime settings");
   refuse("replay.mods=\n");

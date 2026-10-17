@@ -69,10 +69,10 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
         else
           settings.height = dimension;
       } else if (key == "replay.measureFrames" || key == "replay.warmupFrames" ||
-                 key == "replay.waitForBake") {
+                 key == "replay.waitForBake" || key == "replay.freezeAnimation") {
         uint32_t number = 0;
         const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
-        const uint32_t maximum = key == "replay.waitForBake" ? 1 : 10000;
+        const uint32_t maximum = key == "replay.waitForBake" || key == "replay.freezeAnimation" ? 1 : 10000;
         if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || number > maximum ||
             (key == "replay.warmupFrames" && number < 16))
           throw std::runtime_error("Invalid measurement setting: " + key);
@@ -80,8 +80,10 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
           settings.measureFrames = number;
         else if (key == "replay.warmupFrames")
           settings.warmupFrames = number;
-        else
+        else if (key == "replay.waitForBake")
           settings.waitForBake = number != 0;
+        else
+          settings.freezeAnimation = number != 0;
       } else if (key.rfind("replay.", 0) == 0)
         throw std::runtime_error("Unknown replay setting: " + key);
       else if (api.SetConfigVariable(key.c_str(), value.c_str()) != REMIXAPI_ERROR_CODE_SUCCESS)

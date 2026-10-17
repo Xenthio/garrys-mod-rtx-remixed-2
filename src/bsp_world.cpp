@@ -2973,17 +2973,23 @@ uint64_t textureReplacementHash(const std::string &name, uint64_t sourceHash) {
 }
 
 bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,
-                  std::vector<uint8_t> &rgba, std::string &error) {
+                  std::vector<uint8_t> &rgba, std::string &error, bool freezeAnimation) {
   ensureFileSystem();
   std::vector<std::vector<uint8_t>> frames;
   if (const char *failure = vtfFrames(name, width, height, frames)) {
     error = failure;
     return false;
   }
-  if (frames.size() != 1) {
+  if (frames.empty()) {
+    error = "texture has no decoded frames";
+    return false;
+  }
+  if (frames.size() != 1 && !freezeAnimation) {
     error = "animated texture requires engine playback";
     return false;
   }
+  if (frames.size() > 1)
+    std::fprintf(stderr, "Diagnostic texture snapshot: %s frozen at frame 0 of %zu\n", name.c_str(), frames.size());
   rgba = std::move(frames.front());
   error.clear();
   return true;

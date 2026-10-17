@@ -39,7 +39,8 @@ std::filesystem::file_time_type lastWrite(const std::filesystem::path &path) {
 // unresolved and are reported once, rather than silently replaced for a bake.
 class Materials {
 public:
-  explicit Materials(remixapi_Interface &api, bool reportHashes) : api(api), reportHashes(reportHashes) {}
+  explicit Materials(remixapi_Interface &api, bool reportHashes, bool freezeAnimation)
+      : api(api), reportHashes(reportHashes), freezeAnimation(freezeAnimation) {}
   ~Materials() {
     for (auto &[key, material] : materials)
       api.DestroyMaterial(material);
@@ -176,6 +177,7 @@ private:
   };
   remixapi_Interface &api;
   bool reportHashes;
+  bool freezeAnimation;
   uint64_t nextHash = 0x7265706c00000001ull;
   std::map<std::string, Texture> textures;
   std::map<std::string, remixapi_MaterialHandle> materials;
@@ -193,7 +195,7 @@ private:
     uint32_t width = 0, height = 0;
     std::vector<uint8_t> rgba;
     std::string error;
-    if (!proxy::bsp::textureImage(name, width, height, rgba, error)) {
+    if (!proxy::bsp::textureImage(name, width, height, rgba, error, freezeAnimation)) {
       fail(name, error);
       return {};
     }
@@ -238,7 +240,9 @@ remixapi_LightHandle light(remixapi_Interface &api, const proxy::bsp::Light &sou
 
 void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *map, const char *output,
             unsigned frames, const proxy::replay::Settings &settings) {
-  Materials materials(api, !settings.mods.empty());
+  Materials materials(api, !settings.mods.empty(), settings.freezeAnimation);
+  if (settings.freezeAnimation)
+    std::fprintf(stderr, "Diagnostic scope: animated textures frozen at frame zero; no engine playback/proxies\n");
   currentMaterials = &materials;
   struct SceneLifetime {
     remixapi_Interface &api;
