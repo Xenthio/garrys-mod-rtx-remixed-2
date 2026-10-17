@@ -178,6 +178,19 @@ boxes and influence boxes. The runtime's `probes.request` diagnostic generates
 this file without GPU readback. Reports and screenshots must be newly written;
 existing output files cannot establish a successful replay.
 
+Use `tools/probe_bounds.py` to inspect those published boxes against horizontal
+or vertical sections of the map's world brushes (requires Python and matplotlib):
+
+```sh
+python tools/probe_bounds.py map.bsp output.probes.json section.png --axis z --slice 64
+```
+
+Add `--probe 0` to select a capture or `--receiver x y z` to mark a surface point.
+Coordinates are Source units. The image's companion JSON records input hashes and
+the selected captures. Use a fresh output path for each inspection. Props, moving
+brush models and displaced terrain are omitted; these sections help inspect box
+placement but do not establish reflection quality or visibility through doors.
+
 The BSP's playable `env_cubemap` sample positions seed geometry-constrained
 reflection fitting through the optional version-4 bake descriptor. Solid origins
 are refused, duplicate fits are merged, and remaining capacity uses automatic

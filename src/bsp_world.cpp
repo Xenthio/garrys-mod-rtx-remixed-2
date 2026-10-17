@@ -917,7 +917,8 @@ void parseMapCameras(const Bsp &bsp) {
     if (!parseKeyValues("entity " + entities.substr(open, close - open + 1), kv))
       continue;
     const auto classname = lower(kv.values["classname"]);
-    if (!g_world.hasPlayerStart && (classname == "info_player_start" || classname == "info_player_deathmatch")) {
+    if (!g_world.hasPlayerStart && (classname == "info_player_start" || classname == "info_player_deathmatch" ||
+                                    classname == "gmod_player_start")) {
       g_world.hasPlayerStart = std::sscanf(kv.values["origin"].c_str(), "%f %f %f", &g_world.playerOrigin[0],
                                          &g_world.playerOrigin[1], &g_world.playerOrigin[2]) == 3;
       std::sscanf(kv.values["angles"].c_str(), "%f %f %f", &g_world.playerAngles[0],

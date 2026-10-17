@@ -309,6 +309,7 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   bool requestedProbes = false;
   unsigned measurementEnd = ~0u;
   uint32_t lastState = ~0u;
+  bool reportedPendingInputs = false;
   const auto start = Clock::now();
   for (unsigned frame = 0; frame < frames; ++frame) {
     MSG message;
@@ -362,6 +363,12 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
       if (!ready && frame % 120 == 0)
         std::printf("Measurement waiting: backend %u requested %u; %s\n", backend.activeBackend,
                     backend.requestedBackend, backend.unavailableReason);
+      if (!ready && !reportedPendingInputs &&
+          std::chrono::duration<double>(Clock::now() - start).count() > 5) {
+        proxy::bsp::dumpStatistics(stdout);
+        std::fflush(stdout);
+        reportedPendingInputs = true;
+      }
       measurement.observe(ready, backend.activeBackend, backend.activeBackend == 2 ? stats.activeHash : 0,
                           timing);
       if (measurement.complete()) {
