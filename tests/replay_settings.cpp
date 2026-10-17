@@ -60,6 +60,9 @@ int main() {
   refuse("replay.position=nan 0 0");
   refuse("replay.fov=179");
   refuse("replay.unknown=1");
+  const auto mods = parse("replay.mods=materials with spaces\n");
+  require(mods.mods == "materials with spaces", "Replay mod paths preserve spaces without reaching runtime settings");
+  refuse("replay.mods=\n");
   refuse("bad=1");
   refuse("missing equal");
   const auto measurement = parse("replay.measureFrames=240\nreplay.warmupFrames=64\nreplay.waitForBake=0\n");

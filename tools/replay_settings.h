@@ -12,6 +12,7 @@ struct Settings {
   uint32_t measureFrames = 0, warmupFrames = 120;
   float warmupSeconds = 3;
   bool waitForBake = true;
+  std::string mods; // optional USD mod directory; relative to the settings file
 };
 // Applies runtime keys through the SDK and parses the replay-only settings.
 Settings configure(remixapi_Interface &api, const std::string &path);

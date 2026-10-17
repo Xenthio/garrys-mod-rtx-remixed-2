@@ -5,6 +5,7 @@
 #include "replay_timing.h"
 #include <remix/remix_bake_ext.h>
 #include <remix/remix_native_ext.h>
+#include <remix/remix_usd_ext.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -37,7 +38,7 @@ std::filesystem::file_time_type lastWrite(const std::filesystem::path &path) {
 // unresolved and are reported once, rather than silently replaced for a bake.
 class Materials {
 public:
-  explicit Materials(remixapi_Interface &api) : api(api) {}
+  explicit Materials(remixapi_Interface &api, bool reportHashes) : api(api), reportHashes(reportHashes) {}
   ~Materials() {
     for (auto &[key, material] : materials)
       api.DestroyMaterial(material);
@@ -55,7 +56,7 @@ public:
     // Include every static shading field: two VMTs may share their albedo.
     std::ostringstream key;
     key.precision(9);
-    key << base;
+    key << base << ':' << sourceHash;
     if (shading) {
       const auto &s = *shading;
       key << ':' << int(s.mode) << ':' << s.mask << ':' << s.maskScale << ':' << s.luminous;
@@ -90,8 +91,19 @@ public:
     opaque.opacityConstant = 1;
     opaque.alphaTestType = 7;
     opaque.useDrawCallAlphaState = 1;
+    // The decoded replay image has a temporary SDK texture ID. Material packs
+    // still identify the original Source upload by its dxvk texture hash.
+    remixapi_MaterialInfoReplacementHashEXT replacement{};
+    replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
+    replacement.materialHash = proxy::bsp::textureReplacementHash(base, sourceHash);
+    if (reportHashes)
+      std::fprintf(stderr, "Material source %016llX, replacement %016llX: %s\n",
+                   static_cast<unsigned long long>(sourceHash),
+                   static_cast<unsigned long long>(replacement.materialHash), base.c_str());
+    opaque.pNext = &replacement;
     remixapi_MaterialInfoEmissionEXT emission = {};
     emission.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_EMISSION_EXT;
+    emission.pNext = &replacement;
     remixapi_MaterialInfoSelfIlluminationEXT self = {};
     self.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_SELF_ILLUMINATION_EXT;
     self.pNext = &emission;
@@ -156,6 +168,7 @@ private:
     std::wstring path;
   };
   remixapi_Interface &api;
+  bool reportHashes;
   uint64_t nextHash = 0x7265706c00000001ull;
   std::map<std::string, Texture> textures;
   std::map<std::string, remixapi_MaterialHandle> materials;
@@ -240,7 +253,7 @@ remixapi_LightHandle light(remixapi_Interface &api, const proxy::bsp::Light &sou
 
 void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *map, const char *output,
             unsigned frames, const proxy::replay::Settings &settings) {
-  Materials materials(api);
+  Materials materials(api, !settings.mods.empty());
   currentMaterials = &materials;
   struct SceneLifetime {
     remixapi_Interface &api;
@@ -372,6 +385,15 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
     std::printf("Published reflection probe report: %s\n", report.string().c_str());
   }
   proxy::bsp::dumpStatistics(stdout);
+  if (!settings.mods.empty()) {
+    const auto diagnostic = reinterpret_cast<decltype(&remixapi_GetUSDModsDiagnosticEXT)>(
+        GetProcAddress(library, "remixapi_GetUSDModsDiagnosticEXT"));
+    char message[2048]{};
+    if (!diagnostic) throw std::runtime_error("Runtime lacks USD mod diagnostics");
+    check(diagnostic(message, sizeof(message)), "USD mod diagnostics");
+    if (message[0]) throw std::runtime_error(std::string("USD mod load: ") + message);
+    std::printf("USD mod directory: %s (no loader diagnostic)\n", settings.mods.c_str());
+  }
   std::printf("Static VMT replay only: engine material proxies, entities, particles and UI are absent.\n");
 }
 } // namespace
@@ -422,6 +444,15 @@ int main(int argc, char **argv) {
     check(api.SetConfigVariable("rtx.native.pathtrace.overrideLight", "0"), "Disable profile sun");
     check(api.SetConfigVariable("rtx.native.forward.sceneScale", "0.0254"), "Set Source scale");
     const auto settings = argc > 6 ? proxy::replay::configure(api, argv[6]) : proxy::replay::Settings{};
+    if (!settings.mods.empty()) {
+      const auto configure = reinterpret_cast<decltype(&remixapi_ConfigureUSDModsEXT)>(
+          GetProcAddress(library, "remixapi_ConfigureUSDModsEXT"));
+      if (!configure) throw std::runtime_error("Runtime lacks USD mod loading");
+      remixapi_USDModsOptionsEXT mods{};
+      mods.structSize = sizeof(mods); mods.version = 1; mods.directory = settings.mods.c_str();
+      mods.hostMetersPerUnit = .01; mods.hostUpAxis = 2; mods.watch = 0;
+      check(configure(&mods), "Configure USD mods");
+    }
     RECT bounds{0, 0, LONG(settings.width), LONG(settings.height)};
     if (!AdjustWindowRect(&bounds, WS_OVERLAPPEDWINDOW, FALSE) ||
         !SetWindowPos(window, nullptr, 0, 0, bounds.right - bounds.left, bounds.bottom - bounds.top,

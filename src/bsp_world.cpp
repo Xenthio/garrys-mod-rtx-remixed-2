@@ -334,7 +334,7 @@ bool loadMaterial(const std::string &name, KeyValues &out, int depth = 0) {
 // dxvk hashes of a texture's three largest mips as D3D would receive them
 // (packed rows; the engine may skip top mips by quality settings). Formats the
 // proxy does not upload yield none.
-std::vector<uint64_t> textureHashes(const std::string &path, bool engine) {
+std::vector<uint64_t> textureHashes(const std::string &path, bool engine, bool legacy = false) {
   const auto read = [engine](const std::string &file, std::vector<uint8_t> &out, uint64_t offset, uint64_t length) {
     return engine ? fs::engineReadFile(file, out, offset, length) : fs::read(file, out, offset, length);
   };
@@ -395,7 +395,7 @@ std::vector<uint64_t> textureHashes(const std::string &path, bool engine) {
     if (!read(path, level, end - block, bytes) || level.size() != bytes)
       break;
     if (!convert) {
-      hashes.push_back(XXH3_64bits(level.data(), level.size()));
+      hashes.push_back(legacy ? XXH64(level.data(), level.size(), 0) : XXH3_64bits(level.data(), level.size()));
     } else {
       const size_t pixels = size_t(w) * h;
       std::vector<uint8_t> bgra(pixels * 4);
@@ -409,7 +409,7 @@ std::vector<uint64_t> textureHashes(const std::string &path, bool engine) {
           d[2] = rgbOrder ? s[0] : s[2];
           d[3] = convert == 1 ? s[3] : uint8_t(fill);
         }
-        hashes.push_back(XXH3_64bits(bgra.data(), bgra.size()));
+        hashes.push_back(legacy ? XXH64(bgra.data(), bgra.size(), 0) : XXH3_64bits(bgra.data(), bgra.size()));
         if (convert == 1)
           break;
       }
@@ -2894,6 +2894,21 @@ void ensureFileSystem() {
 std::vector<uint64_t> textureCandidates(const std::string &name) {
   ensureFileSystem();
   return textureHashes(name);
+}
+
+uint64_t textureReplacementHash(const std::string &name, uint64_t sourceHash) {
+  ensureFileSystem();
+  const auto path = "materials/" + lower(name) + ".vtf";
+  for (const bool engine : {false, true}) {
+    const auto hashes = textureHashes(path, engine);
+    const auto found = std::find(hashes.begin(), hashes.end(), sourceHash);
+    if (found != hashes.end()) {
+      const auto legacy = textureHashes(path, engine, true);
+      const auto index = size_t(found - hashes.begin());
+      return index < legacy.size() ? legacy[index] : 0;
+    }
+  }
+  return 0;
 }
 
 bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,

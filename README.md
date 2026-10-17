@@ -144,6 +144,11 @@ rtx.native.forward.bakeBatch = 1024
 ```
 
 Positions override the eye directly; angles are Source pitch/yaw/roll in degrees.
+Set `replay.mods = path/to/mods` to exercise the runtime's shared USD material
+replacements, including generated PBR packs. Relative paths resolve beside the
+settings file; the runtime must be built with USD support. The replay preserves
+the original upload's legacy material key even though its decoded textures have
+temporary SDK IDs. The loader's normal mod ordering and lazy texture loading apply.
 If `REMIX_CONFIG_DIR` is set, a completed bake also produces an adjacent
 `output.probes.json` containing the actual published capture origins, projection
 boxes and influence boxes. The runtime's `probes.request` diagnostic generates

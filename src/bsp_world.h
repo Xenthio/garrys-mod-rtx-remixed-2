@@ -49,6 +49,9 @@ bool load(const remixapi_Interface &api, const std::string &mapName, bool lightS
 bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,
                   std::vector<uint8_t> &rgba, std::string &error);
 bool materialSource(uint64_t textureHash, std::string &baseTexture);
+// Legacy XXH64 replacement key for the same upload bytes/mip as a current
+// texture candidate. Offline hosts need this because decoded DDSs have new IDs.
+uint64_t textureReplacementHash(const std::string &name, uint64_t sourceHash);
 bool playerStart(float origin[3], float angles[3]);
 
 // The BSP world is loaded: world draws are dropped.

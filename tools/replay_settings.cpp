@@ -1,6 +1,7 @@
 #include "replay_settings.h"
 #include <charconv>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -40,7 +41,12 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
       throw std::runtime_error("Missing '=' in replay settings line " + std::to_string(number));
     const auto key = trim(line.substr(0, equal)), value = trim(line.substr(equal + 1));
     try {
-      if (key == "replay.position")
+      if (key == "replay.mods") {
+        if (value.empty()) throw std::runtime_error("USD mod directory must not be empty");
+        auto directory = std::filesystem::u8path(value);
+        if (directory.is_relative()) directory = std::filesystem::u8path(path).parent_path() / directory;
+        settings.mods = directory.lexically_normal().u8string();
+      } else if (key == "replay.position")
         settings.position = numbers<3>(value);
       else if (key == "replay.angles")
         settings.angles = numbers<3>(value);
