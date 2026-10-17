@@ -198,13 +198,13 @@ placement from empty BSP leaves, with hardware checks against the complete
 static geometry. This keeps room placement independent of a coarsened irradiance
 grid and avoids capturing from inside props.
 Hints retain authored order; `rtx.native.forward.reflectionProbes` remains the
-capture budget (maximum 16), so a low budget cannot cover every room.
+capture budget (maximum 32), so a low budget cannot cover every room.
 
 
 For an automatic-placement experiment, launch the replay with
 `OPENREMIX_PROXY_REFLECTION_HINTS=0`. The BSP loader then supplies no authored
 cubemap sites; the native fitter derives candidates from empty leaves, validates
 them with hardware rays, and uses the same boundary/detail constraints. The
-published report identifies the resulting captures. Four probes remain the default
-budget; maps with many rooms may need `rtx.native.forward.reflectionProbes = 16`.
+published report identifies the resulting captures. Sixteen probes are the native default;
+maps with many rooms may need `rtx.native.forward.reflectionProbes = 32`.
 This toggle is a diagnostic option and does not edit the map or installed game.
