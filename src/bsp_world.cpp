@@ -2674,7 +2674,7 @@ bool build(const Bsp &bsp) {
           std::memcpy(out.position, pos, 12);
           std::memset(out.normal, 0, 12);
           grid.push_back(out);
-          lightmapCoordinates.push_back(lightmapMapping.project(flat));
+          lightmapCoordinates.push_back(lightmapMapping.displacement(s, t));
           alpha.push_back(std::isfinite(dv.alpha) ? std::clamp(dv.alpha, 0.0f, 255.0f) : 0.0f);
         }
       }

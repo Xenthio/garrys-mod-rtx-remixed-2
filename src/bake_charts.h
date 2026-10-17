@@ -21,6 +21,11 @@ struct Mapping {
               float(minimum[c]);
     return uv;
   }
+  // Displacement lightmaps cover the normalized quad, starting at DispInfo's
+  // start corner. Their dimensions need not match TexInfo's brush projection.
+  std::array<float, 2> displacement(float s, float t) const {
+    return {s * float(size[0]), t * float(size[1])};
+  }
 };
 // Input coordinates belong to the original flat face/grid. Displacement
 // offsets and material UVs must never change the chart mapping.

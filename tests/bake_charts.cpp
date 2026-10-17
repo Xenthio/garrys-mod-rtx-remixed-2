@@ -47,6 +47,28 @@ int main() {
           "Rounded folded fans stay on probes instead of invalidating a real map bake");
   require(lm::capture(rounded, 0, {0, 2, 3}, 0, fan).has_value(),
           "The adjoining nondegenerate face still has a valid chart");
+  // Construct displacement face 9255 has a 13x10 luxel rectangle, while its
+  // TexInfo projection reaches y=12.9375. Brush projection rejects the grid.
+  lm::Mapping displaced{{}, {}, {13, 10}};
+  const std::vector<std::array<float, 2>> brushUv{{0, 12.9375f}, {0, 0}, {9, 0}, {9, 12.9375f}};
+  require(!lm::capture(displaced, 0, {0, 1, 2, 0, 2, 3}, 0, brushUv),
+          "Displacement dimensions cannot be interpreted as brush projection bounds");
+  std::vector<std::array<float, 2>> gridUv;
+  for (uint32_t y = 0; y < 5; ++y)
+    for (uint32_t x = 0; x < 5; ++x)
+      gridUv.push_back(displaced.displacement(float(x) / 4, float(y) / 4));
+  std::vector<uint32_t> gridIndices;
+  for (uint32_t y = 0; y < 4; ++y)
+    for (uint32_t x = 0; x < 4; ++x) {
+      const uint32_t i = y * 5 + x;
+      gridIndices.insert(gridIndices.end(), {i, i + 5, i + 6, i, i + 6, i + 1});
+    }
+  const auto displacement = lm::capture(displaced, 0, gridIndices, 0, gridUv);
+  require(displacement && displacement->width == 14 && displacement->height == 11 &&
+              displacement->texcoords.size() == gridIndices.size() * 2 &&
+              gridUv.front() == std::array<float, 2>{0, 0} &&
+              gridUv.back() == std::array<float, 2>{13, 10},
+          "The complete displacement grid has bounded nonfolded UVs independent of brush projection");
   mapping.size[0] = 0;
   require(!lm::capture(mapping, 3, indices, 7, uv), "Degenerate charts keep probe fallback");
   mapping.size[0] = 4096;
