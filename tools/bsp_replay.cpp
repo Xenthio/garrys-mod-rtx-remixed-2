@@ -263,6 +263,20 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   auto params = proxy::replay::camera(settings, origin, angles);
   std::printf("Camera %.3f %.3f %.3f; FOV %.3f\n", params.position.x, params.position.y, params.position.z,
               params.fovYInDegrees);
+  // Match the live wrapper's camera medium; otherwise an underwater replay
+  // incorrectly evaluates the water boundary as if the eye were in air.
+  remixapi_CameraMediumEXT medium = {};
+  medium.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_EXT;
+  const float eye[] = {params.position.x, params.position.y, params.position.z};
+  float waterColor[3], waterDistance = 0;
+  if (proxy::bsp::waterAt(eye, waterColor, waterDistance)) {
+    medium.inside = 1;
+    medium.transmittanceColor = {waterColor[0], waterColor[1], waterColor[2]};
+    medium.transmittanceMeasurementDistance = waterDistance;
+  }
+  params.pNext = &medium;
+  std::printf("Camera medium: %s; measurement distance %.3f\n", medium.inside ? "water" : "air",
+              medium.transmittanceMeasurementDistance);
   remixapi_CameraInfo camera = {};
   camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
   camera.pNext = &params;
