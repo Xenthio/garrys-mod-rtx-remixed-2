@@ -1,4 +1,5 @@
 #include "source_lights.h"
+#include "styled_lights.h"
 // Standalone diagnostic host for the production BSP loader. It never injects
 // into Source or writes installed content. Static VMTs only; no material proxies.
 #include "bsp_world.h"
@@ -224,7 +225,7 @@ proxy::bsp::MaterialRef lookup(uint64_t hash, const Shading *shading, const std:
   return currentMaterials->lookup(hash, shading);
 }
 
-remixapi_LightHandle light(remixapi_Interface &api, const proxy::bsp::Light &source) {
+proxy::lighting::SourceLight sourceLight(const proxy::bsp::Light &source) {
   proxy::lighting::SourceLight light = {};
   light.type = source.type;
   std::copy_n(source.position, 3, light.position);
@@ -235,7 +236,7 @@ remixapi_LightHandle light(remixapi_Interface &api, const proxy::bsp::Light &sou
   light.attenuation2 = source.attenuation[2];
   light.thetaDot = source.thetaDot;
   light.phiDot = source.phiDot;
-  return proxy::lighting::createLight(api, light, source.hash);
+  return light;
 }
 
 void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *map, const char *output,
@@ -247,14 +248,16 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   struct SceneLifetime {
     remixapi_Interface &api;
     std::vector<remixapi_LightHandle> lights;
+    proxy::lighting::StyledLights styled;
     ~SceneLifetime() {
       proxy::bsp::load(api, "");
+      styled.reset(api);
       for (auto handle : lights)
         api.DestroyLight(handle);
       currentMaterials = nullptr;
     }
-  } scene{api, {}};
-  if (!proxy::bsp::load(api, map))
+  } scene{api, {}, {}};
+  if (!proxy::bsp::load(api, map, settings.styledLights))
     throw std::runtime_error("BSP load failed");
   std::array<float, 3> origin{}, angles{};
   if (!proxy::bsp::playerStart(origin.data(), angles.data()) && !settings.position)
@@ -281,9 +284,25 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
   camera.pNext = &params;
   auto &lights = scene.lights;
-  for (const auto &source : proxy::bsp::lights())
-    if (auto handle = light(api, source))
-      lights.push_back(handle);
+  std::vector<remixapi_LightHandle> bakeLights;
+  std::vector<remixapi_BakeStyledLightEXT> styledLights;
+  for (const auto &source : proxy::bsp::lights()) {
+    const auto authored = sourceLight(source);
+    auto current = authored;
+    if (source.style)
+      for (auto &value : current.color) value *= settings.lightStyleValue;
+    const auto handle = proxy::lighting::createLight(api, current, source.hash);
+    if (!handle) throw std::runtime_error("Map light creation failed");
+    lights.push_back(handle);
+    if (source.style) {
+      const auto captured = scene.styled.capture(api, authored, source.hash, source.style, 1, 1, settings.lightStyleValue);
+      if (!captured.authoredLight) throw std::runtime_error("Styled bake light creation failed");
+      styledLights.push_back(captured);
+    } else bakeLights.push_back(handle);
+  }
+  if (settings.styledLights)
+    std::printf("Diagnostic styled lights: %zu at multiplier %.3f; immutable full-on bake definitions\n",
+                styledLights.size(), settings.lightStyleValue);
   const auto statistics = reinterpret_cast<PFN_remixapi_GetBakeStatisticsEXT>(
       GetProcAddress(library, "remixapi_GetBakeStatisticsEXT"));
   const auto backendStatistics = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(
@@ -321,7 +340,7 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
     // The production publisher owns readiness checks. Calling it while assets
     // resolve also reports the actual reason, rather than hiding it behind this
     // diagnostic host's generic "waiting for retained map inputs" state.
-    proxy::bsp::publishBakeScene(lights);
+    proxy::bsp::publishBakeScene(bakeLights, styledLights);
     if (frame == frames - 3 || (measurementEnd != ~0u && frame == measurementEnd + 1))
       check(api.RequestPresentedScreenshot(output), "RequestPresentedScreenshot");
     check(api.Present(nullptr), "Present");

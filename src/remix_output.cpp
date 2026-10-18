@@ -1,4 +1,5 @@
 #include "source_lights.h"
+#include "styled_lights.h"
 #include "diag.h"
 #include <map>
 #include "remix_output.h"
@@ -2235,6 +2236,7 @@ bool isSkyDraw(const Draw &d) {
 // swap is its own inverse: either reading of the transform gives the same map.
 remixapi_LightHandle g_skyDome = nullptr;
 BakeSky g_bakeSky;
+lighting::StyledLights g_styledBakeLights;
 remixapi_TextureHandle g_skyTexture = nullptr;
 uint64_t g_skyTextureHash = 0;
 uint32_t g_skyEpoch = 0;
@@ -2262,6 +2264,7 @@ uint32_t skyEpoch() { return g_skyEpoch; }
 // A new map: the dome of the previous one must not outlive it (a map whose
 // 2D sky is not drawn, or not yet, falls back to the sky light estimate).
 static void resetSky(const char *mapName) {
+  g_styledBakeLights.reset(g_api);
   g_bakeSky.reset(g_api, mapName && *mapName ? XXH3_64bits(mapName, std::strlen(mapName)) | 1 : 0);
   if (g_skyDome)
     g_api.DestroyLight(g_skyDome);
@@ -5129,13 +5132,33 @@ void onPresent() {
     }
     if (g_skyDome)
       g_api.DrawLightInstance(g_skyDome); // the captured 2D skybox (setSkyFaces)
-    // Baking takes only authored, time-independent map lights. The retained
+    // Styled lights capture a separate immutable fully-on definition. The retained
     // BSP snapshot supplies emissive materials independently of this list.
     std::vector<remixapi_LightHandle> bakeLights;
+    std::vector<remixapi_BakeStyledLightEXT> styledLights;
+    static const float bakeLightScale = envScale("OPENREMIX_PROXY_LIGHT_SCALE", 1.f);
+    static const float bakeSunScale = envScale("OPENREMIX_PROXY_SUN_SCALE", 1.f);
     bool bakeLightsReady = true;
     for (const auto &light : bsp::lights()) {
-      if (light.style)
+      if (light.style) {
+        SourceLight authored = {};
+        authored.type = light.type;
+        std::memcpy(authored.color, light.color, 12);
+        std::memcpy(authored.position, light.position, 12);
+        std::memcpy(authored.direction, light.direction, 12);
+        authored.attenuation0 = light.attenuation[0];
+        authored.attenuation1 = light.attenuation[1];
+        authored.attenuation2 = light.attenuation[2];
+        authored.thetaDot = light.thetaDot;
+        authored.phiDot = light.phiDot;
+        const float currentStyle = engineLights && engineLights->styles && light.style < 128
+                                       ? engineLights->style[light.style] : 1.f;
+        const auto captured = g_styledBakeLights.capture(g_api, authored, light.hash, light.style,
+                                                        bakeLightScale, bakeSunScale, currentStyle);
+        if (!captured.authoredLight) bakeLightsReady = false;
+        else styledLights.push_back(captured);
         continue;
+      }
       const auto found = g_lights.find(light.hash);
       if (found == g_lights.end() || !found->second.handle)
         bakeLightsReady = false;
@@ -5145,7 +5168,7 @@ void onPresent() {
     if (g_bakeSky.light())
       bakeLights.push_back(g_bakeSky.light());
     if (bakeLightsReady)
-      bsp::publishBakeScene(bakeLights);
+      bsp::publishBakeScene(bakeLights, styledLights);
     g_lastLights.swap(g_frameLights);
     g_frameLights.clear();
     for (auto it = g_lights.begin(); it != g_lights.end();) {

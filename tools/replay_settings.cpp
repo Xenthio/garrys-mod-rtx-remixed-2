@@ -54,6 +54,10 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
         settings.fov = numbers<1>(value)[0];
         if (settings.fov < 1 || settings.fov >= 179)
           throw std::runtime_error("Camera FOV must be in [1,179)");
+      } else if (key == "replay.lightStyleValue") {
+        settings.lightStyleValue = numbers<1>(value)[0];
+        if (settings.lightStyleValue < 0 || settings.lightStyleValue > 4)
+          throw std::runtime_error("Diagnostic style value must be in [0,4]");
       } else if (key == "replay.warmupSeconds") {
         settings.warmupSeconds = numbers<1>(value)[0];
         if (settings.warmupSeconds < 0 || settings.warmupSeconds > 60)
@@ -69,10 +73,10 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
         else
           settings.height = dimension;
       } else if (key == "replay.measureFrames" || key == "replay.warmupFrames" ||
-                 key == "replay.waitForBake" || key == "replay.freezeAnimation") {
+                 key == "replay.waitForBake" || key == "replay.freezeAnimation" || key == "replay.styledLights") {
         uint32_t number = 0;
         const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
-        const uint32_t maximum = key == "replay.waitForBake" || key == "replay.freezeAnimation" ? 1 : 10000;
+        const uint32_t maximum = key == "replay.waitForBake" || key == "replay.freezeAnimation" || key == "replay.styledLights" ? 1 : 10000;
         if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || number > maximum ||
             (key == "replay.warmupFrames" && number < 16))
           throw std::runtime_error("Invalid measurement setting: " + key);
@@ -82,6 +86,8 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
           settings.warmupFrames = number;
         else if (key == "replay.waitForBake")
           settings.waitForBake = number != 0;
+        else if (key == "replay.styledLights")
+          settings.styledLights = number != 0;
         else
           settings.freezeAnimation = number != 0;
       } else if (key.rfind("replay.", 0) == 0)

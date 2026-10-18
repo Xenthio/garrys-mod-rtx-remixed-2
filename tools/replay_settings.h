@@ -12,6 +12,8 @@ struct Settings {
   uint32_t measureFrames = 0, warmupFrames = 120;
   float warmupSeconds = 3;
   bool waitForBake = true;
+  bool styledLights = false; // explicit diagnostic authored-style playback
+  float lightStyleValue = 1; // multiplier for all styled lights in the diagnostic snapshot
   bool freezeAnimation = false; // explicit frame-zero material snapshots, not engine playback
   std::string mods; // optional USD mod directory; relative to the settings file
 };

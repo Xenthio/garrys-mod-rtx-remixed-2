@@ -7,6 +7,7 @@
 
 #define REMIX_ALLOW_X86
 #include <remix/remix_c.h>
+#include <remix/remix_bake_ext.h>
 
 #include "engine_materials.h"
 
@@ -64,10 +65,11 @@ bool overlaysActive();
 // Resolves materials, builds pending meshes and draws this frame's instances.
 void submit(MaterialLookup lookup);
 
-// Publish the complete retained BSP scene for load-time baking. Only unstyled
-// map lights (and the captured sky) belong here; engine dlights/flashlights do
-// not. The native runtime captures inputs once per map/material revision.
-void publishBakeScene(const std::vector<remixapi_LightHandle> &lights);
+// Publish the complete retained BSP scene for load-time baking. Static map
+// lights and the captured sky use ordinary handles. Stationary styled lights
+// provide separate fully-on authored handles and live identities; never dlights/flashlights. The native runtime captures inputs once per map/material revision.
+void publishBakeScene(const std::vector<remixapi_LightHandle> &lights,
+                      const std::vector<remixapi_BakeStyledLightEXT> &styled = {});
 
 // Whether a draw's model-to-world rows (3x4, as in vertex shader c58) place
 // one of the map's static props, which the BSP world draws itself. eye: the

@@ -91,6 +91,13 @@ int main() {
   refuse("replay.width=4097");
   refuse("replay.height=1080.5");
   refuse("replay.width=1920junk");
+  require(parse("replay.styledLights=1\nreplay.lightStyleValue=0").styledLights &&
+          parse("replay.lightStyleValue=0.5").lightStyleValue == .5f,
+          "Diagnostic style controls permit initially-off and partial-intensity map snapshots");
+  refuse("replay.styledLights=2");
+  refuse("replay.lightStyleValue=-1");
+  refuse("replay.lightStyleValue=nan");
+  refuse("replay.lightStyleValue=5");
   std::filesystem::remove(path);
   std::puts("Replay viewpoint parsing, Source camera basis and SDK delegation passed");
 }

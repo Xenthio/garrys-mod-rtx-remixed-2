@@ -3110,7 +3110,8 @@ bool active() { return g_active; }
 
 bool overlaysActive() { return g_active && !g_world.overlayGroups.empty(); }
 
-void publishBakeScene(const std::vector<remixapi_LightHandle> &lights) {
+void publishBakeScene(const std::vector<remixapi_LightHandle> &lights,
+                      const std::vector<remixapi_BakeStyledLightEXT> &styled) {
   static const auto publish = sceneFunction<PFN_remixapi_SetBakeSceneEXT>("remixapi_SetBakeSceneEXT");
   if (!publish) {
     g_world.bakeReason = "native bake-scene API unavailable";
@@ -3136,19 +3137,28 @@ void publishBakeScene(const std::vector<remixapi_LightHandle> &lights) {
     g_world.bakeReason = "static materials are still loading";
     return;
   }
-  const auto signature = XXH3_64bits(lights.data(), lights.size() * sizeof(lights[0]));
+  uint64_t signature = XXH3_64bits(lights.data(), lights.size() * sizeof(lights[0]));
+  for (const auto &light : styled) {
+    const uint64_t fields[] = {uint64_t(reinterpret_cast<uintptr_t>(light.authoredLight)),
+                               uint64_t(reinterpret_cast<uintptr_t>(light.runtimeLight)), light.style};
+    signature = XXH3_64bits_withSeed(fields, sizeof(fields), signature);
+  }
   // Successful requests compare dependency revisions: the native runtime
   // captures again only when a material/mod/light changed. Retry
   // refused inputs twice a second while late assets finish resolving.
   if (g_world.bakeStatus != int(REMIXAPI_ERROR_CODE_SUCCESS) &&
       g_world.bakeVersion == g_world.submitVersion && g_world.bakeLights == signature && g_world.frames % 30)
     return;
-  remixapi_BakeSceneReflectionsInfoEXT reflections = {};
+  remixapi_BakeSceneStyledLightsInfoEXT styledInfo = {};
+  auto &reflections = styledInfo.reflections;
   auto &surfaces = reflections.surfaces;
   auto &bounds = surfaces.bounds;
   auto &info = bounds.scene;
-  info.structSize = sizeof(reflections);
-  info.version = REMIXAPI_BAKE_SCENE_REFLECTIONS_VERSION_EXT;
+  info.structSize = styled.empty() ? sizeof(reflections) : sizeof(styledInfo);
+  info.version = styled.empty() ? REMIXAPI_BAKE_SCENE_REFLECTIONS_VERSION_EXT
+                               : REMIXAPI_BAKE_SCENE_STYLED_LIGHTS_VERSION_EXT;
+  styledInfo.styledLightCount = uint32_t(styled.size());
+  styledInfo.styledLights = styled.data();
   reflections.reflectionRevision = 1;
   reflections.positionCount = uint32_t(g_world.reflectionSeeds.size());
   reflections.positions = g_world.reflectionSeeds.empty() ? nullptr : g_world.reflectionSeeds.front().data();
@@ -3178,6 +3188,8 @@ void publishBakeScene(const std::vector<remixapi_LightHandle> &lights) {
     surfaces.charts = nullptr;
     reflections.positionCount = 0;
     reflections.positions = nullptr;
+    styledInfo.styledLightCount = 0;
+    styledInfo.styledLights = nullptr;
     publish(&info);
   }
   g_world.bakeVersion = g_world.submitVersion;
