@@ -36,6 +36,26 @@ struct IndexStream {
   bool dynamic = false;
 };
 
+// D3D9's fixed-function state, as the D3D hooks track it where the game
+// draws that way (game::kFixedFunction): what a draw with no vertex shader
+// is transformed, blended and textured by. Matrices are D3D's (row-major
+// D3DX, row vectors: p' = p M).
+struct FixedFunction {
+  const float (*worlds)[16] = nullptr;   // D3DTS_WORLDMATRIX(0..255); 0 is D3DTS_WORLD
+  const float *view = nullptr, *projection = nullptr; // D3DTS_VIEW, D3DTS_PROJECTION
+  const float (*textures)[16] = nullptr; // D3DTS_TEXTURE0..7
+  const DWORD (*stages)[33] = nullptr;   // [stage 0..7][D3DTEXTURESTAGESTATETYPE]
+  const DWORD *renderStates = nullptr;   // [D3DRENDERSTATETYPE], 256
+  uint32_t fvf = 0;                      // the layout came from SetFVF (0: a vertex declaration)
+  uint32_t worldsSet = 0;                // highest WORLDMATRIX index set since the device was made, + 1
+  const uint32_t *worldDraw = nullptr;   // [n]: `draw` of the draw before which WORLDMATRIX(n) was last set (probe)
+  uint32_t draw = 0;                     // this draw's number among the fixed-function draws
+  // Diagnostics (the fixed-function probe): the material and lights.
+  const D3DMATERIAL9 *material = nullptr;
+  const D3DLIGHT9 *lights = nullptr; // indices 0..31
+  uint32_t lightsEnabled = 0;        // bit n: LightEnable(n, TRUE)
+};
+
 // Everything a DrawIndexedPrimitive needs, gathered by the D3D hooks.
 struct Draw {
   D3DPRIMITIVETYPE type;
@@ -52,6 +72,7 @@ struct Draw {
   const vsprog::Program *vertexProgram = nullptr; // it, decoded (nullptr: not seen at creation)
   const void *texture0 = nullptr;              // texture bound to sampler 0 (base texture)
   const void *texture1 = nullptr;              // texture bound to sampler 1 (Eyes shader: the iris)
+  const void *stageTextures[8] = {};           // samplers 0-7 (diagnostics: the shader probe)
   bool mainTarget = false;                     // render target 0 is the back buffer
   uint32_t colorWrite = 0xf;                   // D3DRS_COLORWRITEENABLE
   bool blend = false;                          // D3DRS_ALPHABLENDENABLE
@@ -89,6 +110,12 @@ struct Draw {
   D3DVIEWPORT9 viewport = {};
   RECT scissor = {};
   bool scissorTest = false;
+  // No vertex shader is bound, in a game that draws through the
+  // fixed-function pipeline: its state (nullptr for shader draws, and in the
+  // games that have none). onDraw converts such a draw into the shader draws'
+  // terms (fixed_function.h) and sets `fixedFunctionConverted`.
+  const FixedFunction *fixedFunction = nullptr;
+  bool fixedFunctionConverted = false;
 };
 
 bool enabled();
@@ -98,6 +125,12 @@ bool enabled();
 // when `pixels` is given, the pixels themselves, decoded. False: unknown.
 bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint32_t &version, bool &bgra,
                    std::vector<uint8_t> *pixels);
+
+// The runtime's last presented frame as 8-bit BGRA (alpha 255), scaled to
+// width x height: what the back buffer would hold, for the engine's
+// screenshots. Read back once per presented frame and size. Null: the
+// runtime cannot provide it.
+const std::vector<uint8_t> *presentedImage(uint32_t width, uint32_t height);
 
 // Called from IDirect3D9::CreateDevice. May redirect presentation to a hidden
 // window; `gameWindow` receives Remix's output.
@@ -117,6 +150,14 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
                             const uint8_t *data, uint32_t pitch);
 // UpdateTexture(src, dst): dst now shows src's contents.
 void onTextureCopy(const void *source, const void *destination);
+// Pre-allocates a CPU texture record for UI drawing so subsequent sub-rectangle
+// updates (e.g. UpdateSurface) have a destination buffer ready.
+void initCpuTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format);
+// A system-memory texture over the caller's memory (D3D9Ex): its level 0 is
+// read from there when it is copied (onTextureCopy).
+void onUserMemoryTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *bits);
+// UpdateSurface sub-rectangle copy (source surface to destination surface).
+void onTextureSubCopy(const void *source, const void *destination, const RECT *srcRect, const POINT *dstPoint);
 void onTextureReleased(const void *texture);
 // IShaderAPI::Bind (engine_materials): the material now bound and its name.
 void onMaterialBound(const engine_materials::Shading &shading, const char *material);

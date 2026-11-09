@@ -6,11 +6,13 @@
 #include <string>
 #include <vector>
 
-// Forwarding wrappers for interfaces we do not have headers for (x64).
+// Forwarding wrappers for interfaces we do not have headers for (x64, and x86
+// thiscall).
 //
 // A wrapper is { vtable, real object }. Every vtable slot starts as a generated
-// thunk that swaps RCX (`this`) for the real object and jumps to the real
-// vtable's slot, so any method is forwarded without knowing its signature.
+// thunk that swaps `this` (RCX; ECX on x86) for the real object and jumps to
+// the real vtable's slot, so any method is forwarded without knowing its
+// signature.
 // Individual slots can then be replaced with typed hooks (see setHook).
 namespace proxy {
 
@@ -38,9 +40,10 @@ Kind *kindFor(const char *name, const void *const *realVtbl, uint32_t slotCount,
 void *wrap(Kind *kind, void *real);
 void *unwrapIf(void *maybeWrapper);
 
-// Replaces a slot with a typed hook: a plain function taking the wrapper as
-// its first parameter followed by the method's exact parameters (x64 member
-// functions use the ordinary calling convention with `this` in RCX).
+// Replaces a slot with a typed hook: a PROXY_THISCALL function (game.h) taking
+// the wrapper as its first parameter followed by the method's exact
+// parameters (x64 member functions use the ordinary calling convention with
+// `this` in RCX; x86 ones are thiscall, `this` in ECX, callee pops).
 void setHook(Kind *kind, uint32_t slot, void *hook);
 
 // Original method for a hook's `this`.

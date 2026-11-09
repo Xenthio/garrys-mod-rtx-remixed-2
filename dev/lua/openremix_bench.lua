@@ -15,6 +15,9 @@
 -- The client records every frame's time with the phase it fell in and writes
 --   data/openremix_bench_frames.txt   "<phase index> <milliseconds>" per frame
 --   data/openremix_bench_result.txt   per-phase and overall statistics
+--   data/openremix_bench_phases.txt   "<phase index> <start> <end> <name>" per
+--                                     phase, in wall-clock milliseconds since
+--                                     1970 (lines up with REMIX_ACCEL_PROFILE)
 -- when the session ends; data/openremix_bench_state.txt holds "running" or
 -- "done <run number>" for whoever waits for it.
 
@@ -283,6 +286,9 @@ end
 
 if CLIENT then
   local frames, phases, last, recording, runNumber = {}, {}, nil, false, 0
+  -- Wall clock: os.time() has whole seconds, so the SysTime() of the frame
+  -- where it ticks over anchors it; phase changes are kept in SysTime().
+  local clockSecond, clockSys, starts, previousPhase = nil, nil, {}, 0
 
   local function statistics(values)
     local sorted = table.Copy(values)
@@ -327,6 +333,15 @@ if CLIENT then
     table.insert(out, 1, "openremix_bench run " .. runNumber .. " on " .. game.GetMap())
     file.Write(TAG .. "_result.txt", table.concat(out, "\n") .. "\n")
     file.Write(TAG .. "_frames.txt", table.concat(raw, "\n") .. "\n")
+    local spans = {}
+    if clockSys then
+      local function wall(sys) return string.format("%.0f", clockSecond * 1000 + (sys - clockSys) * 1000) end
+      for index, phase in ipairs(PHASES) do
+        local span = starts[index]
+        if span then spans[#spans + 1] = index .. " " .. wall(span[1]) .. " " .. wall(span[2]) .. " " .. phase.name end
+      end
+    end
+    file.Write(TAG .. "_phases.txt", table.concat(spans, "\n") .. "\n")
     file.Write(TAG .. "_state.txt", "done " .. runNumber .. "\n")
   end
 
@@ -336,8 +351,15 @@ if CLIENT then
     if phase > 0 then
       if not recording then
         recording, frames, phases, last = true, {}, {}, nil
+        clockSecond, clockSys, starts, previousPhase = os.time(), nil, {}, 0
         runNumber = GetGlobalInt(TAG .. "_run", 0)
         file.Write(TAG .. "_state.txt", "running " .. runNumber .. "\n")
+      end
+      if not clockSys and os.time() ~= clockSecond then clockSecond, clockSys = os.time(), now end
+      if phase ~= previousPhase then
+        if starts[previousPhase] then starts[previousPhase][2] = now end
+        starts[phase] = { now, now }
+        previousPhase = phase
       end
       if last then
         frames[#frames + 1] = (now - last) * 1000
@@ -346,6 +368,7 @@ if CLIENT then
       last = now
     elseif recording then
       recording = false
+      if starts[previousPhase] then starts[previousPhase][2] = now end
       write()
     end
   end)

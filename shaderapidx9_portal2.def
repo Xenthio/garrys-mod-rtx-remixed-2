@@ -1,0 +1,11 @@
+LIBRARY shaderapidx9.dll
+EXPORTS
+  CreateInterface
+  openremix_shaderapi_proxy DATA
+  openremix_ui_set_callback
+  openremix_ui_append
+  openremix_set_legacy_variable
+  openremix_proxy_load_map
+  openremix_proxy_provides_prop
+  openremix_proxy_world_lists
+  openremix_proxy_overlays

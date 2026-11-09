@@ -15,6 +15,6 @@ dxso_src = files(
 dxso_vulkan_inc = include_directories(get_option('openremix_include') / '..' / '..' / 'include' / 'vulkan' / 'include')
 dxso_lib = static_library('dxso', dxso_src,
   include_directories: [dxso_inc, dxso_vulkan_inc],
-  cpp_args: ['-w'],
+  cpp_args: ['-w', '-DNOMINMAX', '-D_CRT_SECURE_NO_WARNINGS'],
 )
 dxso_dep = declare_dependency(link_with: dxso_lib, include_directories: [dxso_inc, dxso_vulkan_inc])

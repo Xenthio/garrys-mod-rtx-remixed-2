@@ -1,5 +1,6 @@
 #include "vtable_proxy.h"
 
+#include <cstddef>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -11,6 +12,7 @@ std::mutex g_lock;
 std::map<const void *, Kind *> g_kinds; // real vtable -> kind
 std::map<void *, Wrapper *> g_wrappers; // real object -> wrapper
 
+#ifdef _WIN64
 // Per slot (32 bytes, x64):
 //   48 B8 <counter64>   mov  rax, counter
 //   FF 00               inc  dword [rax]         ; statistics, not atomic
@@ -20,15 +22,28 @@ std::map<void *, Wrapper *> g_wrappers; // real object -> wrapper
 // RCX is `this`; the other argument registers, the stack and the return
 // address are untouched, so any signature forwards.
 constexpr size_t kThunkSize = 32;
+#else
+// Per slot (18 bytes, x86 thiscall):
+//   FF 05 <counter32>   inc  dword [counter]     ; statistics, not atomic
+//   8B 49 04            mov  ecx, [ecx+4]        ; Wrapper::real
+//   8B 01               mov  eax, [ecx]          ; real vtable
+//   FF A0 <disp32>      jmp  [eax + slot*4]
+//   90                  nop
+// ECX is `this`; the stack (arguments, return address) is untouched and the
+// real method pops what it pops, so any signature forwards.
+constexpr size_t kThunkSize = 18;
+#endif
+static_assert(offsetof(Wrapper, real) == sizeof(void *), "the thunks read Wrapper::real at one pointer");
 
 void *makeThunks(uint32_t count, uint32_t *counters) {
   auto *code = static_cast<uint8_t *>(
       VirtualAlloc(nullptr, count * kThunkSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
   for (uint32_t i = 0; i < count; ++i) {
     uint8_t *t = code + i * kThunkSize;
-    const uint64_t counter = reinterpret_cast<uint64_t>(&counters[i]);
-    const uint32_t disp = i * 8;
+    const uintptr_t counter = reinterpret_cast<uintptr_t>(&counters[i]);
+    const uint32_t disp = i * sizeof(void *);
     size_t n = 0;
+#ifdef _WIN64
     t[n++] = 0x48;
     t[n++] = 0xB8;
     std::memcpy(t + n, &counter, 8);
@@ -42,6 +57,17 @@ void *makeThunks(uint32_t count, uint32_t *counters) {
     t[n++] = 0x48;
     t[n++] = 0x8B;
     t[n++] = 0x01;
+#else
+    t[n++] = 0xFF;
+    t[n++] = 0x05;
+    std::memcpy(t + n, &counter, 4);
+    n += 4;
+    t[n++] = 0x8B;
+    t[n++] = 0x49;
+    t[n++] = 0x04;
+    t[n++] = 0x8B;
+    t[n++] = 0x01;
+#endif
     t[n++] = 0xFF;
     t[n++] = 0xA0;
     std::memcpy(t + n, &disp, 4);

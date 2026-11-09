@@ -14,6 +14,9 @@ uint64_t textureHash(const uint8_t *packedMip0, size_t size);
 // Garry's Mod compatibility mod's configuration set: its mods and generated
 // material files (~gmod_topbr) key by this hash.
 uint64_t legacyTextureHash(const uint8_t *packedMip0, size_t size);
+// Not a replacement key: XXH3 of `rows` rows of `rowBytes` bytes, `pitch`
+// apart, as the game wrote them (a cheap identity of an upload's contents).
+uint64_t rowsHash(const uint8_t *data, uint32_t pitch, uint32_t rowBytes, uint32_t rows);
 
 // Geometry asset hash for rtx.geometryAssetHashRuleString =
 // positions,indices,geometrydescriptor (d3d9_rtx_geometry.cpp, rtx_hashing):

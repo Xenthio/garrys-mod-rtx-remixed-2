@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <string>
 #include <vector>
 
 // Lights read where the engine keeps them, independent of what is drawn or
@@ -13,14 +14,20 @@
 // Known limit: entity-driven lights (gmod_light, lamps) stop when their
 // entity goes dormant outside the server's PVS for the player; the client
 // then stops making them, and holding the last state would be stale.
+//
+// GMod (x64) and Portal 2 (x86, the projected textures only: its
+// env_projectedtextures; engine_lights.cpp has each build's slots). Left 4
+// Dead 2 and Half-Life 2 RTX: off (gmod_only_stubs.cpp).
 namespace proxy::engine_lights {
 
 // Resolves the engine interfaces and installs the shadow manager hooks
-// (main thread, engine.dll loaded). False when unavailable.
+// (engine.dll loaded; GMod: the main thread, Portal 2: x86_engine's install
+// from Present). False when unavailable.
 bool install();
 
-// Once per main view on the main thread (the DrawWorldLists hook): samples
-// the engine's light state for the renderer.
+// Once per view on the main thread (the DrawWorldLists hook; GMod's
+// engine_hooks.cpp, Portal 2's x86_engine.cpp): samples the engine's light
+// state for the renderer.
 void sample();
 
 // A light in the engine's LightDesc_t terms, as bsp::Light (type 1 point,
@@ -32,6 +39,12 @@ struct Light {
   float color[3] = {}, position[3] = {}, direction[3] = {};
   float attenuation[3] = {}; // constant, linear, quadratic
   float thetaDot = 0, phiDot = 0;
+  // Projected textures: the cookie's texture name (as materials name theirs)
+  // and frame (animated textures), the projection's up vector and horizontal
+  // field of view in degrees.
+  float up[3] = {}, fov = 0;
+  std::string cookie;
+  int32_t cookieFrame = 0;
 };
 struct Snapshot {
   bool styles = false;  // style[] was sampled

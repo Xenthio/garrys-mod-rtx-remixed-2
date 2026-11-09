@@ -1,5 +1,6 @@
 #include "diag.h"
 #include <map>
+#include <tuple>
 #include "remix_output.h"
 #include "d3d_hooks.h"
 #include "remix_ui.h"
@@ -8,9 +9,19 @@
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
+#include "fixed_function.h"
+#include "game.h"
 #include "host_passes.h"
+#ifdef PROXY_GAME_L4D2
+#include "l4d2.h"
+#endif
+#ifdef PROXY_GAME_PORTAL2
+#include "portal2.h"
+#endif
 #include "particles.h"
+#include "shader_tables.h"
 #include "texture_categories.h"
+#include "vb_origins.h"
 #include <unordered_set>
 
 #include "texture_formats.h"
@@ -38,26 +49,36 @@
 #include <vector>
 
 namespace proxy::remix {
+#if defined(PROXY_GAME_EZ2)
+
+inline bool nameStarts(const char *name, const char *prefix) { return _strnicmp(name, prefix, std::strlen(prefix)) == 0; }
+
 namespace {
 
-// Source vertex shader registers (common_vs_fxc.h layout).
+void noteReplacementKey(uint64_t key, char kind = 'M');
+#else
+namespace {
+#endif
+
+// Source vertex shader registers (common_vs_fxc.h layout; the same in L4D2's
+// and Half-Life 2 RTX's shaders but for L4D2's cFlexScale). cFlexScale and the
+// iris projection are taken from the draw's vertex shader's constant table
+// when it names them (see ModelShader); these are the fallback.
 constexpr unsigned kRegModelViewProj = 4; // c4..c7: model * view * projection (columns)
 constexpr unsigned kRegViewProj = 8;  // c8..c11: view * projection
 constexpr unsigned kRegModel = 58;    // c58..c60: model (object to world) 3x4 rows
 constexpr unsigned kRegEyeIrisU = 50; // c50, c51: Eyes shader iris projection U, V (world position -> iris texture)
-constexpr unsigned kRegFlexScale = 3; // c3.x: 1 while a flex mesh is bound to stream 2, else 0 (cFlexScale)
+// c3.x (L4D2: c13.x): 1 while a flex mesh is bound to stream 2, else 0 (cFlexScale)
+constexpr unsigned kRegFlexScale = game::kRegFlexScale;
 constexpr unsigned kRegAmbientUp = 25; // c21..c26: ambient cube +X -X +Y -Y +Z -Z (linear)
 // MaterialMatrixMode_t
 constexpr int kMatrixView = 0;
 constexpr int kMatrixProjection = 1;
-// IShaderAPI (ShaderApi030) slot 12: void GetMatrix(MaterialMatrixMode_t, float *dst)
-constexpr unsigned kSlotGetMatrix = 12;
-// IShaderAPI slot 34: int GetCurrentNumBones() const
-constexpr unsigned kSlotGetCurrentNumBones = 34;
-// IShaderDynamicAPI: MaterialFogMode_t GetSceneFogMode(), void
-// GetSceneFogColor(unsigned char *rgb); IShaderAPI: void GetFogDistances(float
-// *start, float *end, float *fogZ). (tools/sdk_vtables64.py, like the above.)
-constexpr unsigned kSlotGetSceneFogMode = 4, kSlotGetSceneFogColor = 5, kSlotGetFogDistances = 213;
+// IShaderAPI slots GetMatrix, GetCurrentNumBones, GetSceneFogMode,
+// GetSceneFogColor, GetFogDistances: per game (game.h).
+using game::kSlotGetMatrix;
+using game::kSlotGetCurrentNumBones;
+using game::kSlotGetSceneFogMode, game::kSlotGetSceneFogColor, game::kSlotGetFogDistances;
 constexpr unsigned kMaxBones = 53; // cModel[53] starting at c58
 
 remixapi_Interface g_api = {};
@@ -71,27 +92,39 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, contentNamed{0}, contentRefreshSkipped{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, tracedEnergy{0}, energyLit{0}, energyTriangles{0}, energyMeshes{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
+  std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
+  std::atomic<uint32_t> detailSpriteDraws{0}; // detail sprites lit as surfaces (onDraw)
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, wireframeDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
   // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
-  std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0};
+  std::atomic<uint32_t> waterBottomsDropped{0};
+  std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0}, windowImpostersDropped{0};
+  std::atomic<uint32_t> glowDraws{0}, glowSources{0};
   std::atomic<uint32_t> pbrDraws{0}, pbrNormalDraws{0}, pbrMapDraws{0}, pbrMetalDraws{0}, pbrNotBase{0}, pbrMapsMissing{0}, pbrCreated{0};
-  // Flexed draws (facial animation, see flexScale): rebuilt this frame, and flex streams whose scale was 0.
-  std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0};
-  // Eye draws (the Eyes shader), and the iris overlays made for them.
-  std::atomic<uint32_t> eyes{0}, eyeIrises{0}, eyeRefracts{0};
+  // Flexed draws (facial animation, see flexScale): rebuilt this frame, flex
+  // streams whose scale was 0, and flex streams whose vertex shader's
+  // constant table did not name cFlexScale (kRegFlexScale assumed).
+  std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0}, flexAssumed{0};
+  // Eye draws (the Eyes shader), and the iris overlays made for them; of the
+  // eye draws, those told by their vertex shader (no material name: L4D2).
+  std::atomic<uint32_t> eyes{0}, eyeIrises{0}, eyeRefracts{0}, eyesByShader{0};
   // Rope draws (the Cable shader): with their base texture found by name, and without.
-  std::atomic<uint32_t> cableDraws{0}, cableNoBase{0};
+  std::atomic<uint32_t> cableDraws{0}, cableNoBase{0}, mirrorDraws{0};
   // Decals (onDraw): by kind (DecalKind order), by what marked them, and how
   // they were lifted off their receiver.
   std::atomic<uint32_t> decalKinds[5] = {};
   std::atomic<uint32_t> decalByFlag{0}, decalByShader{0}, decalByBias{0}, decalByCategory{0}, decalBiasOnly{0},
       decalMaterialOnly{0}, decalWorld{0}, decalSkinned{0}, decalVertexNormals{0}, decalFaceNormals{0},
+#if defined(PROXY_GAME_EZ2)
+      decalVertexColors{0}, decalModulateFade{0}, decalOtherBlend{0}, decalNotItsBlend{0}, decalNoMesh{0},
+      decalNoBase{0};
+#else
       decalVertexColors{0}, decalModulateFade{0}, decalOtherBlend{0}, decalNotItsBlend{0}, decalNoMesh{0};
+#endif
   // Winding of the meshes built with vertex normals under D3DCULL_CCW: their
   // first triangle's e1 x e2 along / against its vertex normals (since launch).
   std::atomic<uint32_t> windingAlong{0}, windingAgainst{0};
@@ -124,6 +157,33 @@ std::mutex g_transientSampleLock;
 std::unordered_map<const void *, uint32_t> g_transientDecls; // declaration -> transient draws
 // Microseconds per statistics interval (10 s).
 std::atomic<uint32_t> g_usDraw{0}, g_usBuild{0}, g_usSubmit{0}, g_usPresent{0}, g_usFrame{0}, g_usBsp{0};
+// buildMesh by caller (render thread sets g_buildKind before each call): a
+// model's refreshed vertices (flexed faces, CPU-deformed models), per-frame
+// transient draws, eyes (EyeRefract), irises (Eyes), first builds of cached
+// draws; microseconds, calls and vertices per statistics interval, and the
+// part spent in the runtime's CreateMesh.
+enum BuildKind { kBuildFlex, kBuildTransient, kBuildEye, kBuildIris, kBuildCached, kBuildKinds };
+BuildKind g_buildKind = kBuildCached;
+std::atomic<uint32_t> g_usBuildKind[kBuildKinds] = {}, g_buildCalls[kBuildKinds] = {}, g_buildVertices[kBuildKinds] = {};
+std::atomic<uint32_t> g_usCreateMesh{0};
+// Texture uploads the game makes (level 0, onTextureUpload; further levels,
+// onTextureLevel): calls, bytes, level-0 uploads whose contents a live texture
+// already has, microseconds; geometryHash (mesh replacement keys): calls and
+// microseconds. Per statistics interval.
+std::atomic<uint32_t> g_textureUploads{0}, g_textureUploadKnown{0}, g_usTextureUpload{0}, g_textureLevels{0},
+    g_usTextureLevel{0}, g_geometryHashes{0}, g_usGeometryHash{0};
+std::atomic<uint64_t> g_textureUploadBytes{0};
+std::atomic<uint32_t> g_textureUploadRepeats{0};
+// Each live texture's last level-0 upload (g_textureLock): a game rewriting a
+// texture with the same pixels every frame (one per NPC on screen in Garry's
+// Mod) changes nothing, so a repeat returns before packing and hashing it.
+struct LastUpload {
+  uint32_t width = 0, height = 0, format = 0;
+  uint64_t hash = 0;
+};
+std::unordered_map<const void *, LastUpload> g_lastUploads;
+// Refreshes sent as remixapi_UpdateMeshVerticesEXT (RefreshTopology), and refused by it.
+std::atomic<uint32_t> g_vertexUpdates{0}, g_vertexUpdatesRefused{0};
 LARGE_INTEGER g_lastPresent = {};
 // For logFrameSpike: the same timers without the statistics reset (draw,
 // mesh build, present submit, BSP world, Present call), the last frame's
@@ -140,6 +200,64 @@ uint64_t fnv(const void *data, size_t size, uint64_t h = 1469598103934665603ull)
   return XXH3_64bits_withSeed(data, size, h);
 }
 
+// A draw's geometry by its contents (game::kFixedFunction engines): its
+// indices relative to the first vertex they use, and the bytes of the
+// vertices from that one to the last they use in every stream its layout
+// reads. (The declared range may be the whole dynamic buffer: Source names
+// its batches so.) 0 when the draw cannot be read.
+uint64_t contentHash(const Draw &d) {
+  const uint32_t indexCount = d.type == D3DPT_TRIANGLELIST ? d.primCount * 3
+                              : d.type == D3DPT_TRIANGLESTRIP || d.type == D3DPT_TRIANGLEFAN ? d.primCount + 2
+                                                                                               : 0;
+  if (!indexCount || !d.indices.data || !d.numVertices)
+    return 0;
+  const uint32_t size = d.indices.is32 ? 4 : 2;
+  const uint64_t first = uint64_t(d.startIndex) * size;
+  if (first + uint64_t(indexCount) * size > d.indices.size)
+    return 0;
+  const uint8_t *at = d.indices.data + first;
+  const auto index = [&](uint32_t k) {
+    if (size == 2) {
+      uint16_t v;
+      std::memcpy(&v, at + k * 2, 2);
+      return uint32_t(v);
+    }
+    uint32_t v;
+    std::memcpy(&v, at + k * 4, 4);
+    return v;
+  };
+  uint32_t low = ~0u, high = 0;
+  for (uint32_t k = 0; k < indexCount; ++k) {
+    const uint32_t v = index(k);
+    low = std::min(low, v);
+    high = std::max(high, v);
+  }
+  uint64_t h = 1469598103934665603ull;
+  bool streams[4] = {};
+  for (const D3DVERTEXELEMENT9 *e = d.elements; e && e->Stream != 0xff; ++e)
+    if (e->Stream < 4)
+      streams[e->Stream] = true;
+  for (int i = 0; i < 4; ++i) {
+    if (!streams[i])
+      continue;
+    const auto &st = d.streams[i];
+    const int64_t begin = int64_t(st.offset) + (int64_t(d.baseVertex) + low) * st.stride;
+    const int64_t bytes = (int64_t(high) - low + 1) * st.stride;
+    if (!st.data || !st.stride || begin < 0 || begin + bytes > int64_t(st.size))
+      return 0;
+    h = fnv(st.data + begin, size_t(bytes), h);
+  }
+  // The indices, relative to the first used.
+  std::vector<uint32_t> &relative = [] () -> std::vector<uint32_t> & {
+    static thread_local std::vector<uint32_t> v;
+    return v;
+  }();
+  relative.resize(indexCount);
+  for (uint32_t k = 0; k < indexCount; ++k)
+    relative[k] = index(k) - low;
+  return fnv(relative.data(), relative.size() * sizeof(uint32_t), h) | 1;
+}
+
 struct CachedMesh {
   remixapi_MeshHandle handle = nullptr;
   uint64_t lastFrame = 0;
@@ -152,14 +270,33 @@ std::unordered_map<uint64_t, CachedMesh> g_meshes;
 // (remixapi_MeshInfoDeformEXT), so the face stays the same mesh and
 // the same instance from frame to frame: motion vectors and denoiser history,
 // which a new mesh every frame did not have (a talking face smeared).
+// What a refreshed mesh's last full build read (buildMesh): with the same
+// draw topology a refresh sends only new positions, normals and texture
+// coordinates (remixapi_UpdateMeshVerticesEXT), over the same vertex span.
+struct RefreshTopology {
+  remixapi_MeshHandle handle = nullptr; // what the build registered
+  const void *indexBuffer = nullptr, *declaration = nullptr;
+  uint32_t indexVersion = 0, startIndex = 0, primCount = 0, minIndex = 0, type = 0, bonesPerVertex = 0;
+  uint32_t low = 0, count = 0, boneCount = 0; // the span's start (rebased) and size; buildMesh's *boneCount
+  bool valid = false;
+  bool matches(const Draw &d, uint32_t bones) const {
+    return valid && indexBuffer == d.indices.buffer && indexVersion == d.indices.version && !d.indices.dynamic &&
+           declaration == d.declaration && startIndex == d.startIndex && primCount == d.primCount &&
+           minIndex == d.minIndex && type == uint32_t(d.type) && bonesPerVertex == bones;
+  }
+};
 struct FlexMesh {
   remixapi_MeshHandle handle = nullptr;
+  RefreshTopology topology;
   uint64_t lastFrame = 0;
   uint64_t content = 0; // the flex deltas it was built from (0: at rest)
   uint32_t bones = 0;
   uint64_t geometry = 0;
+  uint64_t builtFrame = ~0ull; // the frame its vertices were last refreshed (diagnostics)
 };
 std::unordered_map<uint64_t, FlexMesh> g_flexMeshes;
+// Diagnostics: deforming instances submitted with a mesh refreshed this frame, and with an older one.
+uint64_t g_deformFresh = 0, g_deformStale = 0;
 // Diagnostics: cached (static-buffer) meshes built anew, by the material bound
 // at the time, with the cache key of the last two builds. A mesh that is
 // rebuilt every frame is a new mesh, and a new instance, every frame: it has
@@ -177,8 +314,10 @@ std::vector<remixapi_MeshHandle> g_transient; // destroyed after Present
 struct RemixTexture {
   remixapi_TextureHandle texture = nullptr;
   remixapi_MaterialHandle material = nullptr;
+  remixapi_MaterialHandle pointMaterial = nullptr; // nearest filter variant (pixel-art)
   remixapi_MaterialHandle skyMaterial = nullptr; // tinted by rtx.skyBrightness
   remixapi_MaterialHandle clampMaterial = nullptr; // clamp-to-edge variant (an eye's iris)
+  remixapi_MaterialHandle pointClampMaterial = nullptr; // nearest clamp variant
   float skyBrightness = 0;
   uint64_t hash = 0;
   // dxvk::legacyTextureHash of the upload (0: none): a second key mods may
@@ -212,7 +351,11 @@ struct CpuTexture {
   uint32_t width = 0, height = 0;
   D3DFORMAT format = D3DFMT_UNKNOWN;
   std::vector<uint8_t> data;
+#if defined(PROXY_GAME_EZ2)
+  uint32_t version = 1;
+#else
   uint32_t version = 0;
+#endif
   uint32_t registeredVersion = 0; // UI texture contents last registered (0 = never)
   // Texels changed since registration (x0, y0, x1, y1; empty: x1 <= x0):
   // forwarded as a region update (Chromium repaints dirty rectangles).
@@ -241,10 +384,30 @@ bool levelLayout(D3DFORMAT format, uint32_t width, uint32_t height, uint32_t &ro
     rowBytes = width * 4;
     rows = height;
     return true;
+#if defined(PROXY_GAME_EZ2)
+  case D3DFMT_A8:
+  case D3DFMT_L8:
+    rowBytes = width;
+    rows = height;
+    return true;
+  case D3DFMT_A8L8:
+  case D3DFMT_R5G6B5:
+  case D3DFMT_A1R5G5B5:
+  case D3DFMT_A4R4G4B4:
+    rowBytes = width * 2;
+    rows = height;
+    return true;
   case D3DFMT_DXT1:
     rowBytes = bw * 8;
     rows = bh;
     return true;
+  case D3DFMT_DXT3:
+#else
+  case D3DFMT_DXT1:
+    rowBytes = bw * 8;
+    rows = bh;
+    return true;
+#endif
   case D3DFMT_DXT5:
     rowBytes = bw * 16;
     rows = bh;
@@ -256,9 +419,355 @@ bool levelLayout(D3DFORMAT format, uint32_t width, uint32_t height, uint32_t &ro
 
 // CPU copies feed UI textures (RegisterUITexture). GMod's Chromium panels
 // (main menu, DHTML) are A8R8G8B8 textures of up to 2048x2048 or more.
+#if defined(PROXY_GAME_EZ2)
+// Font cache textures (A8 / L8) can also reach up to 2048x2048.
+bool keepCpuCopy(D3DFORMAT format, uint32_t width, uint32_t height) {
+  return uint64_t(width) * height <= 4096u * 4096u;
+}
+
+// Caller holds g_textureLock.
+void storeCpuCopy(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, std::vector<uint8_t> pixels) {
+  if (!keepCpuCopy(format, width, height))
+    return;
+  auto &cpu = g_cpuTextures[texture];
+  if (!cpu || cpu.use_count() > 1 || cpu->width != width || cpu->height != height || cpu->format != format)
+    cpu = std::make_shared<CpuTexture>();
+  cpu->width = width;
+  cpu->height = height;
+  cpu->format = format;
+  cpu->data = std::move(pixels);
+  cpu->registeredVersion = 0;
+  cpu->touch(0, 0, width, height);
+  ++cpu->version;
+}
+
+bool isUnpackFormat(D3DFORMAT format) {
+  switch (format) {
+  case D3DFMT_A8:
+  case D3DFMT_L8:
+  case D3DFMT_A8L8:
+  case D3DFMT_R5G6B5:
+  case D3DFMT_A1R5G5B5:
+  case D3DFMT_A4R4G4B4:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Unpacks 8-bit or 16-bit D3D9 formats into 32-bit B8G8R8A8_SRGB for the runtime.
+std::vector<uint8_t> unpackToBgra(D3DFORMAT format, uint32_t width, uint32_t height, const uint8_t *raw, size_t rawSize) {
+  std::vector<uint8_t> bgra(size_t(width) * height * 4, 0);
+  const size_t pixelCount = size_t(width) * height;
+  switch (format) {
+  case D3DFMT_A8:
+    for (size_t i = 0; i < pixelCount && i < rawSize; ++i) {
+      bgra[i * 4 + 0] = 0xff;
+      bgra[i * 4 + 1] = 0xff;
+      bgra[i * 4 + 2] = 0xff;
+      bgra[i * 4 + 3] = raw[i];
+    }
+    break;
+  case D3DFMT_L8:
+    for (size_t i = 0; i < pixelCount && i < rawSize; ++i) {
+      const uint8_t lum = raw[i];
+      bgra[i * 4 + 0] = lum;
+      bgra[i * 4 + 1] = lum;
+      bgra[i * 4 + 2] = lum;
+      bgra[i * 4 + 3] = 0xff;
+    }
+    break;
+  case D3DFMT_A8L8:
+    for (size_t i = 0; i < pixelCount && (i * 2 + 1) < rawSize; ++i) {
+      const uint8_t lum = raw[i * 2 + 0];
+      const uint8_t alpha = raw[i * 2 + 1];
+      bgra[i * 4 + 0] = lum;
+      bgra[i * 4 + 1] = lum;
+      bgra[i * 4 + 2] = lum;
+      bgra[i * 4 + 3] = alpha;
+    }
+    break;
+  case D3DFMT_R5G6B5:
+    for (size_t i = 0; i < pixelCount && (i * 2 + 1) < rawSize; ++i) {
+      const uint16_t w = raw[i * 2 + 0] | (uint16_t(raw[i * 2 + 1]) << 8);
+      bgra[i * 4 + 0] = uint8_t((w & 0x1f) * 255 / 31);
+      bgra[i * 4 + 1] = uint8_t(((w >> 5) & 0x3f) * 255 / 63);
+      bgra[i * 4 + 2] = uint8_t(((w >> 11) & 0x1f) * 255 / 31);
+      bgra[i * 4 + 3] = 0xff;
+    }
+    break;
+  case D3DFMT_A1R5G5B5:
+    for (size_t i = 0; i < pixelCount && (i * 2 + 1) < rawSize; ++i) {
+      const uint16_t w = raw[i * 2 + 0] | (uint16_t(raw[i * 2 + 1]) << 8);
+      bgra[i * 4 + 0] = uint8_t((w & 0x1f) * 255 / 31);
+      bgra[i * 4 + 1] = uint8_t(((w >> 5) & 0x1f) * 255 / 31);
+      bgra[i * 4 + 2] = uint8_t(((w >> 10) & 0x1f) * 255 / 31);
+      bgra[i * 4 + 3] = (w & 0x8000) ? 0xff : 0x00;
+    }
+    break;
+  case D3DFMT_A4R4G4B4:
+    for (size_t i = 0; i < pixelCount && (i * 2 + 1) < rawSize; ++i) {
+      const uint16_t w = raw[i * 2 + 0] | (uint16_t(raw[i * 2 + 1]) << 8);
+      bgra[i * 4 + 0] = uint8_t((w & 0x0f) * 17);
+      bgra[i * 4 + 1] = uint8_t(((w >> 4) & 0x0f) * 17);
+      bgra[i * 4 + 2] = uint8_t(((w >> 8) & 0x0f) * 17);
+      bgra[i * 4 + 3] = uint8_t(((w >> 12) & 0x0f) * 17);
+    }
+    break;
+  default:
+    break;
+  }
+  return bgra;
+}
+
+// A level's layout: the runtime's format, the bytes of a row (of a block row
+// for BC formats) and the rows. False for formats that are not forwarded.
+bool textureLayout(D3DFORMAT format, uint32_t width, uint32_t height, remixapi_Format &remixFormat, uint32_t &rowBytes,
+                   uint32_t &rows) {
+  const uint32_t blocksW = std::max(1u, (width + 3) / 4), blocksH = std::max(1u, (height + 3) / 4);
+  switch (format) {
+  case D3DFMT_A8R8G8B8:
+  case D3DFMT_X8R8G8B8:
+    remixFormat = REMIXAPI_FORMAT_B8G8R8A8_SRGB; // memory order B, G, R, A
+    rowBytes = width * 4;
+    rows = height;
+    break;
+  case D3DFMT_A8:
+  case D3DFMT_L8:
+    remixFormat = REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+    rowBytes = width;
+    rows = height;
+    break;
+  case D3DFMT_A8L8:
+  case D3DFMT_R5G6B5:
+  case D3DFMT_A1R5G5B5:
+  case D3DFMT_A4R4G4B4:
+    remixFormat = REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+    rowBytes = width * 2;
+    rows = height;
+    break;
+  case D3DFMT_DXT1:
+    remixFormat = static_cast<remixapi_Format>(134); // BC1_RGBA_SRGB_EXT
+    rowBytes = blocksW * 8;
+    rows = blocksH;
+    break;
+  case D3DFMT_DXT3: // transcoded to BC3 (formats::transcodeBC2toBC3)
+  case D3DFMT_DXT5:
+    remixFormat = REMIXAPI_FORMAT_BC3_SRGB;
+    rowBytes = blocksW * 16;
+    rows = blocksH;
+    break;
+  default:
+    return false;
+  }
+  return true;
+}
+
+// A level's bytes, rows packed.
+std::vector<uint8_t> packLevel(const uint8_t *data, uint32_t pitch, uint32_t rowBytes, uint32_t rows) {
+  std::vector<uint8_t> pixels(size_t(rowBytes) * rows);
+  for (uint32_t r = 0; r < rows; ++r)
+    std::memcpy(pixels.data() + size_t(r) * rowBytes, data + size_t(r) * pitch, rowBytes);
+  return pixels;
+}
+
+// A mipmapped texture is given to the runtime with the levels the game wrote,
+// not level 0 alone with a chain for the runtime to build: building one means
+// decoding the BC blocks and filtering every level on the game's thread
+// (10-14 ms a texture, in the frame that loads it), and the result is kept
+// uncompressed, six times the memory. The game writes a texture's levels one
+// after another: they are held here until all are in, then created at once.
+// Level 0 with levels still missing waits until needed by a draw or at the next Present.
+struct PendingTexture {
+  uint32_t width = 0, height = 0, levels = 0;
+  D3DFORMAT format = D3DFMT_UNKNOWN;
+  std::vector<std::vector<uint8_t>> level;
+  uint64_t contentHash = 0, legacyHash = 0, opaqueHash = 0;
+  bool levelZero = false;
+  bool complete() const {
+    for (const auto &bytes : level)
+      if (bytes.empty())
+        return false;
+    return !level.empty();
+  }
+};
+std::unordered_map<const void *, PendingTexture> g_pendingTextures; // g_textureLock
+std::atomic<uint32_t> g_textureChains{0}, g_textureChainsBuilt{0}, g_textureLevelsSeen{0}, g_textureSingle{0};
+
+PendingTexture &pendingTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format,
+                               uint32_t levels) {
+  auto &p = g_pendingTextures[texture];
+  if (p.width != width || p.height != height || p.format != format || p.levels != levels) {
+    p = {};
+    p.width = width;
+    p.height = height;
+    p.format = format;
+    p.levels = levels;
+    p.level.resize(std::max(levels, 1u));
+  }
+  return p;
+}
+
+// Creates the runtime texture from what is held: every level when all are
+// in, else level 0 with a chain the runtime builds. g_textureLock held.
+void createPendingTexture(const void *texture, PendingTexture &p) {
+  remixapi_Format remixFormat;
+  uint32_t rowBytes, rows;
+  if (!p.levelZero || !textureLayout(p.format, p.width, p.height, remixFormat, rowBytes, rows))
+    return;
+  auto t = std::make_shared<RemixTexture>();
+  t->hash = p.contentHash ? p.contentHash : 1;
+  t->legacyHash = p.legacyHash;
+  t->opaqueHash = p.opaqueHash;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.hash = t->hash;
+  info.width = p.width;
+  info.height = p.height;
+  info.depth = 1;
+  info.format = remixFormat;
+  remixapi_TextureInfoGenerateMipsEXT mips = {};
+  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
+  mips.generate = true;
+  std::vector<uint8_t> chain;
+  if (p.levels > 1 && p.complete()) {
+    for (const auto &bytes : p.level)
+      chain.insert(chain.end(), bytes.begin(), bytes.end());
+    info.mipLevels = p.levels;
+    info.data = chain.data();
+    info.dataSize = chain.size();
+    ++g_textureChains;
+  } else {
+    info.mipLevels = 1;
+    info.data = p.level[0].data();
+    info.dataSize = p.level[0].size();
+    if (p.levels > 1) {
+      info.pNext = &mips;
+      ++g_textureChainsBuilt;
+    } else
+      ++g_textureSingle;
+  }
+  const bool created = g_api.CreateTexture(&info, &t->texture) == REMIXAPI_ERROR_CODE_SUCCESS;
+  ++g_stats.textures;
+  if (created) {
+    g_texturesByHash[p.contentHash] = t;
+    if (t->opaqueHash)
+      if (auto &alias = g_texturesByHash[t->opaqueHash]; alias.expired())
+        alias = t;
+    g_textures[texture] = std::move(t);
+  }
+}
+
+// System-memory textures over the caller's memory (onUserMemoryTexture).
+struct UserMemoryTexture {
+  const uint8_t *bits = nullptr;
+  uint32_t width = 0, height = 0;
+  D3DFORMAT format = D3DFMT_UNKNOWN;
+};
+std::unordered_map<const void *, UserMemoryTexture> g_userMemoryTextures; // g_textureLock
+
+// Realizes a CPU texture copy (from partial updates, UpdateSurface, font cache, etc.) into a RemixTexture.
+// Caller holds g_textureLock.
+void createCpuTexture(const void *texture, CpuTexture &cpu) {
+  if (cpu.data.empty() || !cpu.width || !cpu.height)
+    return;
+  remixapi_Format remixFormat;
+  uint32_t rowBytes, rows;
+  if (!textureLayout(cpu.format, cpu.width, cpu.height, remixFormat, rowBytes, rows))
+    return;
+  std::vector<uint8_t> pixels = isUnpackFormat(cpu.format)
+                                    ? unpackToBgra(cpu.format, cpu.width, cpu.height, cpu.data.data(), cpu.data.size())
+                                    : cpu.data;
+  if (cpu.format == D3DFMT_DXT3)
+    formats::transcodeBC2toBC3(pixels.data(), pixels.size());
+  if (cpu.format == D3DFMT_X8R8G8B8)
+    for (size_t i = 3; i < pixels.size(); i += 4)
+      pixels[i] = 0xff;
+
+  const uint64_t contentHash = dxvk::textureHash(pixels.data(), pixels.size());
+  const uint64_t legacyHash = dxvk::legacyTextureHash(pixels.data(), pixels.size());
+  noteReplacementKey(contentHash, 'T');
+  uint64_t opaqueHash = 0;
+  if (cpu.format == D3DFMT_X8R8G8B8) {
+    opaqueHash = dxvk::textureHash(pixels.data(), pixels.size());
+    if (opaqueHash == contentHash)
+      opaqueHash = 0;
+  }
+  for (uint64_t hash : {contentHash, opaqueHash}) {
+    auto shared = hash ? g_texturesByHash.find(hash) : g_texturesByHash.end();
+    if (shared != g_texturesByHash.end()) {
+      if (auto existing = shared->second.lock()) {
+        g_textures[texture] = std::move(existing);
+        return;
+      }
+    }
+  }
+  auto t = std::make_shared<RemixTexture>();
+  t->hash = contentHash ? contentHash : 1;
+  t->legacyHash = legacyHash;
+  t->opaqueHash = opaqueHash;
+  t->width = cpu.width;
+  t->height = cpu.height;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.hash = t->hash;
+  info.width = cpu.width;
+  info.height = cpu.height;
+  info.depth = 1;
+  info.mipLevels = 1;
+  info.format = remixFormat;
+  info.data = pixels.data();
+  info.dataSize = pixels.size();
+  if (g_api.CreateTexture(&info, &t->texture) == REMIXAPI_ERROR_CODE_SUCCESS) {
+    ++g_stats.textures;
+    g_texturesByHash[contentHash] = t;
+    if (opaqueHash)
+      if (auto &alias = g_texturesByHash[opaqueHash]; alias.expired())
+        alias = t;
+    g_textures[texture] = std::move(t);
+  }
+}
+
+// Realizes pending texture on demand if level 0 was written. Caller holds g_textureLock.
+std::shared_ptr<RemixTexture> findOrRealizeTexture(const void *texture) {
+  if (!texture)
+    return nullptr;
+  auto it = g_textures.find(texture);
+  if (it != g_textures.end())
+    return it->second;
+  auto pit = g_pendingTextures.find(texture);
+  if (pit != g_pendingTextures.end() && pit->second.levelZero) {
+    createPendingTexture(pit->first, pit->second);
+    g_pendingTextures.erase(pit);
+    auto created = g_textures.find(texture);
+    if (created != g_textures.end())
+      return created->second;
+  }
+  auto cit = g_cpuTextures.find(texture);
+  if (cit != g_cpuTextures.end() && cit->second && !cit->second->data.empty()) {
+    createCpuTexture(texture, *cit->second);
+    auto created = g_textures.find(texture);
+    if (created != g_textures.end())
+      return created->second;
+  }
+  return nullptr;
+}
+
+// Level 0 written with levels that never came: created before the frame is.
+void flushPendingTextures() {
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  for (auto it = g_pendingTextures.begin(); it != g_pendingTextures.end();) {
+    if (it->second.levelZero) {
+      createPendingTexture(it->first, it->second);
+      it = g_pendingTextures.erase(it);
+    } else
+      ++it;
+  }
+#else
 bool keepCpuCopy(D3DFORMAT format, uint32_t width, uint32_t height) {
   const bool wide = format == D3DFMT_A8R8G8B8 || format == D3DFMT_X8R8G8B8;
   return uint64_t(width) * height <= (wide ? 4096u * 4096u : 512u * 512u);
+#endif
 }
 
 // dxvk-remix variables the proxy implements itself (l4d2-rtx map configs).
@@ -269,6 +778,15 @@ uint64_t textureHash(const void *texture) {
   if (!texture)
     return 0;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+#if defined(PROXY_GAME_EZ2)
+  auto t = findOrRealizeTexture(texture);
+  return t ? t->hash : 0;
+}
+
+// Dev aid (OPENREMIX_PROXY_DUMP_KEYS=1): every mesh replacement key drawn is
+// appended once to bin/replacement_keys.txt, for matching against mods.
+void noteReplacementKey(uint64_t key, char kind) {
+#else
   auto it = g_textures.find(texture);
   return it == g_textures.end() ? 0 : it->second->hash;
 }
@@ -276,6 +794,7 @@ uint64_t textureHash(const void *texture) {
 // Dev aid (OPENREMIX_PROXY_DUMP_KEYS=1): every mesh replacement key drawn is
 // appended once to bin/replacement_keys.txt, for matching against mods.
 void noteReplacementKey(uint64_t key, char kind = 'M') {
+#endif
   static const bool dump = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_KEYS", v, sizeof(v)) && v[0] == '1';
@@ -293,15 +812,25 @@ void noteReplacementKey(uint64_t key, char kind = 'M') {
   }
 }
 
+// Whether a D3D9 sampler state requests point (nearest) filtering (e.g. for
+// pixel-art): its magnification filter, what a close look shows. A point
+// minification filter alone still magnifies smoothly in D3D; taken as nearest
+// it drew blood on a face as blocks (issue #104).
+bool isPointSampler(const DWORD (*samplerStates)[16], uint32_t sampler = 0) {
+  if (!samplerStates || sampler >= 16)
+    return false;
+  return samplerStates[sampler][D3DSAMP_MAGFILTER] == D3DTEXF_POINT;
+}
+
 // `skyBrightness` > 0 selects the sky variant, whose tint scales the texture.
 // Caller holds g_textureLock.
-remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
+remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness, bool nearest = false) {
   const bool sky = skyBrightness > 0;
   if (sky && t.skyMaterial && t.skyBrightness != skyBrightness) {
     g_api.DestroyMaterial(t.skyMaterial);
     t.skyMaterial = nullptr;
   }
-  remixapi_MaterialHandle &slot = sky ? t.skyMaterial : t.material;
+  remixapi_MaterialHandle &slot = sky ? t.skyMaterial : (nearest ? t.pointMaterial : t.material);
   if (!slot) {
     wchar_t path[32];
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
@@ -322,9 +851,9 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
-    info.hash = sky ? t.hash ^ 0x5ca1ab1e5ca1ab1eull : t.hash;
+    info.hash = sky ? t.hash ^ 0x5ca1ab1e5ca1ab1eull : (nearest ? (t.hash ^ 0x701475a1701475a1ull ? t.hash ^ 0x701475a1701475a1ull : ~t.hash) : t.hash);
     info.albedoTexture = path;
-    info.filterMode = 1; // linear (0 is nearest)
+    info.filterMode = nearest ? 0 : 1; // linear (0 is nearest)
     info.wrapModeU = info.wrapModeV = 1;
     if (g_api.CreateMaterial(&info, &slot) != REMIXAPI_ERROR_CODE_SUCCESS)
       slot = nullptr;
@@ -334,10 +863,128 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness) {
   return slot;
 }
 
-remixapi_MaterialHandle materialFor(const void *texture, float skyBrightness = 0) {
+// Screen cameras (remixapi_CameraScreensEXT): views the engine draws a world
+// into a render-target texture (render.RenderView into an RT camera's target,
+// at its "world_lists" marker), by that texture. A draw of the main view that
+// samples one (the camera's monitor) gets a screen material showing its slot:
+// the runtime traces what the camera sees there, instead of the texture's
+// rasterized contents. A view not drawn again for kScreenFrames frames frees
+// its slot.
+struct ScreenView {
+  float view[16], projection[16];
+  uint64_t frame = 0;
+  uint32_t slot = 0;
+};
+std::unordered_map<const void *, ScreenView> g_screenViews; // render thread
+// During a screen draw (onDraw): its base texture transform, two rows taking
+// (u, v, 0, 1) to the coordinates the shader samples with (Source's vertex
+// shaders take $basetexturetransform in c48 and c49: a func_monitor's
+// "gmod fix" scales its brush coordinates by 2 about the centre). The mesh's
+// coordinates are made those (buildMesh), so they name the camera's image.
+const float *g_screenUv = nullptr;
+// Screen-view instances left out (onPresent), by reason: raster only, blended
+// in world space, stencil, placed already; with a texture of each.
+uint64_t g_screenSkipped[4] = {};
+std::string g_screenSkippedExample[4];
+// The last screen draw's coordinates as stored and as made (statistics).
+float g_screenUvRange[8] = {1e30f, -1e30f, 1e30f, -1e30f, 1e30f, -1e30f, 1e30f, -1e30f}; // raw u, v; made u, v
+float g_screenUvRows[8] = {};
+std::string g_screenMaterial;
+remixapi_MaterialHandle g_screenMaterials[REMIXAPI_SCREEN_CAMERA_SLOTS_EXT] = {};
+constexpr uint64_t kScreenFrames = 30;
+
+// At a "world_lists 1" marker drawn into a render-target texture: that view's
+// matrices (left-handed, as world views are stored).
+void noteScreenView(const void *target, const float view[16], const float projection[16]) {
+  auto it = g_screenViews.find(target);
+  if (it == g_screenViews.end()) {
+    bool used[REMIXAPI_SCREEN_CAMERA_SLOTS_EXT] = {};
+    for (const auto &[texture, v] : g_screenViews)
+      used[v.slot] = true;
+    uint32_t slot = 0;
+    while (slot < REMIXAPI_SCREEN_CAMERA_SLOTS_EXT && used[slot])
+      ++slot;
+    if (slot == REMIXAPI_SCREEN_CAMERA_SLOTS_EXT) {
+      ++g_stats.screenViewsFull;
+      return;
+    }
+    it = g_screenViews.emplace(target, ScreenView{}).first;
+    it->second.slot = slot;
+  }
+  std::memcpy(it->second.view, view, sizeof(it->second.view));
+  std::memcpy(it->second.projection, projection, sizeof(it->second.projection));
+  it->second.frame = g_frame;
+}
+
+// The screen slot of a render-target texture a view was drawn into lately (-1: none).
+int screenSlot(const void *texture) {
+  const auto it = texture ? g_screenViews.find(texture) : g_screenViews.end();
+  return it != g_screenViews.end() && g_frame - it->second.frame <= kScreenFrames ? int(it->second.slot) : -1;
+}
+
+// The material of a screen showing `slot`: black where the camera is not
+// traced (a reflection of the screen, no raster primary).
+remixapi_MaterialHandle screenMaterial(int slot) {
+  remixapi_MaterialHandle &handle = g_screenMaterials[slot];
+  if (!handle) {
+    remixapi_MaterialInfoScreenCameraEXT screen = {};
+    screen.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_SCREEN_CAMERA_EXT;
+    screen.slot = uint32_t(slot);
+    remixapi_MaterialInfoOpaqueEXT opaque = {};
+    opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.pNext = &screen;
+    opaque.albedoConstant = {.02f, .02f, .02f};
+    opaque.opacityConstant = 1;
+    opaque.roughnessConstant = 1;
+    opaque.alphaTestType = 7;
+    remixapi_MaterialInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+    info.pNext = &opaque;
+    info.hash = 0x5c4ee7ca3e4a0000ull + uint64_t(slot);
+    if (g_api.CreateMaterial(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+      handle = nullptr;
+  }
+  return handle;
+}
+
+// This frame's screen cameras, for the world camera; forgets old views.
+std::vector<remixapi_ScreenCameraEXT> screenCameras() {
+  std::vector<remixapi_ScreenCameraEXT> out;
+  for (auto it = g_screenViews.begin(); it != g_screenViews.end();) {
+    if (g_frame - it->second.frame > kScreenFrames) {
+      it = g_screenViews.erase(it);
+      continue;
+    }
+    const float *v = it->second.view, *p = it->second.projection;
+    remixapi_ScreenCameraEXT c = {};
+    c.slot = it->second.slot;
+    float eye[3];
+    for (int i = 0; i < 3; ++i)
+      eye[i] = -(v[12] * v[i * 4] + v[13] * v[i * 4 + 1] + v[14] * v[i * 4 + 2]);
+    c.position = {eye[0], eye[1], eye[2]};
+    c.right = {v[0], v[4], v[8]};
+    c.up = {v[1], v[5], v[9]};
+    c.forward = {v[2], v[6], v[10]};
+    c.fovYDegrees = p[5] > 0 ? 2 * std::atan(1 / p[5]) * 180 / 3.14159265f : 0;
+    c.aspect = p[0] > 0 ? p[5] / p[0] : 0;
+    if (c.fovYDegrees > 0 && c.fovYDegrees < 180 && c.aspect > 0)
+      out.push_back(c);
+    ++it;
+  }
+  return out;
+}
+
+remixapi_MaterialHandle materialFor(const void *texture, float skyBrightness = 0, bool nearest = false) {
+  if (const int slot = screenSlot(texture); slot >= 0)
+    return screenMaterial(slot);
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+#if defined(PROXY_GAME_EZ2)
+  auto t = findOrRealizeTexture(texture);
+  return t ? ensureMaterial(*t, skyBrightness, nearest) : nullptr;
+#else
   auto it = g_textures.find(texture);
-  return it == g_textures.end() ? nullptr : ensureMaterial(*it->second, skyBrightness);
+  return it == g_textures.end() ? nullptr : ensureMaterial(*it->second, skyBrightness, nearest);
+#endif
 }
 
 float envScale(const char *name, float fallback);
@@ -381,10 +1028,14 @@ RemixTexture::~RemixTexture() {
     return;
   if (material)
     g_api.DestroyMaterial(material);
+  if (pointMaterial)
+    g_api.DestroyMaterial(pointMaterial);
   if (skyMaterial)
     g_api.DestroyMaterial(skyMaterial);
   if (clampMaterial)
     g_api.DestroyMaterial(clampMaterial);
+  if (pointClampMaterial)
+    g_api.DestroyMaterial(pointClampMaterial);
   if (texture)
     g_api.DestroyTexture(texture);
 }
@@ -399,13 +1050,19 @@ namespace {
 //   2  (default) also the self-illuminated parts of what the engine draws
 //      (models, the view model). Their emitters come and go with the prop;
 //      the runtime keeps them in the dynamic part of its light hierarchy.
-//   3  also every unlit surface (foliage cards, skybox scenery, 3D2D panels,
+//      Entropy : Zero 2 and Black Mesa: not skinned models' (see materialFor).
+//   3  also every unlit surface (and there, skinned models) (foliage cards, skybox scenery, 3D2D panels,
 //      sprites: many emitters, changing every frame).
-bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
+int emissiveLightsMode() {
   static const int mode = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 2;
   }();
+  return mode;
+}
+
+bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
+  const int mode = emissiveLightsMode();
   if (mode <= 0)
     return false;
   if (s.mode == engine_materials::Shading::Unlit)
@@ -415,54 +1072,95 @@ bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
 
 // The uploaded texture a mask name stands for (its dxvk hash), or 0.
 // Render thread. Candidate hashes come from the VTF file (as the BSP world's).
+// The one returned is the record's own, the runtime texture's: a candidate may
+// be an X8R8G8B8 upload's opaque alias (BGR888 files, such as most props'
+// normal maps), which no runtime texture is named by.
 struct NamedTexture {
   std::vector<uint64_t> candidates;
   uint64_t resolved = 0;
 };
-NamedTexture &namedTexture(const std::string &name) {
+// The runtime texture's hash of the live upload known by `hash` (its own or
+// its opaque alias), or 0. Caller holds g_textureLock.
+uint64_t uploadedTextureHash(uint64_t hash) {
+#if defined(PROXY_GAME_EZ2)
+  if (!hash)
+    return 0;
+  auto found = g_texturesByHash.find(hash);
+  if (found != g_texturesByHash.end()) {
+    const auto texture = found->second.lock();
+    if (texture)
+      return texture->hash;
+  }
+  for (auto pit = g_pendingTextures.begin(); pit != g_pendingTextures.end(); ++pit) {
+    if (pit->second.contentHash == hash || pit->second.opaqueHash == hash) {
+      if (pit->second.levelZero) {
+        createPendingTexture(pit->first, pit->second);
+        auto created = g_textures.find(pit->first);
+        const auto ret = created != g_textures.end() ? created->second->hash : 0;
+        g_pendingTextures.erase(pit);
+        return ret;
+      }
+    }
+  }
+  return 0;
+#else
+  auto found = g_texturesByHash.find(hash);
+  if (found == g_texturesByHash.end())
+    return 0;
+  const auto texture = found->second.lock();
+  return texture ? texture->hash : 0;
+#endif
+}
+
+// frame: of an animated texture, each frame its own upload.
+NamedTexture &namedTexture(const std::string &name, uint32_t frame = 0) {
   static std::unordered_map<std::string, NamedTexture> masks;
   if (masks.size() > 4096)
     masks.clear();
-  auto [it, added] = masks.try_emplace(name);
+  auto [it, added] = masks.try_emplace(frame ? name + '#' + std::to_string(frame) : name);
   if (added)
-    it->second.candidates = bsp::textureCandidates(name);
+    it->second.candidates = bsp::textureCandidates(name, frame);
   return it->second;
 }
 
-uint64_t maskTextureHash(const std::string &name, bool count = true) {
-  NamedTexture &mask = namedTexture(name);
+uint64_t maskTextureHash(const std::string &name, bool count = true, uint32_t frame = 0) {
+  NamedTexture &mask = namedTexture(name, frame);
   if (mask.candidates.empty()) {
     g_stats.emissiveMaskNoHash += count;
     return 0;
   }
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
-  auto live = [](uint64_t hash) {
-    auto found = g_texturesByHash.find(hash);
-    return found != g_texturesByHash.end() && !found->second.expired();
-  };
-  if (mask.resolved && live(mask.resolved))
-    return mask.resolved;
+  if (mask.resolved)
+    if (const uint64_t hash = uploadedTextureHash(mask.resolved))
+      return hash;
   mask.resolved = 0;
-  for (uint64_t hash : mask.candidates)
-    if (live(hash)) {
-      mask.resolved = hash;
-      break;
+  for (uint64_t candidate : mask.candidates)
+    if (const uint64_t hash = uploadedTextureHash(candidate)) {
+      mask.resolved = candidate;
+      return hash;
     }
-  if (!mask.resolved)
-    g_stats.emissiveMaskNotUploaded += count;
-  return mask.resolved;
+  g_stats.emissiveMaskNotUploaded += count;
+  return 0;
 }
 
 // The texture's material sampled clamp-to-edge: an iris is projected onto the
 // whole eye and must not repeat beside itself (its border texels are
 // transparent). Otherwise as ensureMaterial.
-remixapi_MaterialHandle clampedMaterialFor(const void *texture) {
+remixapi_MaterialHandle clampedMaterialFor(const void *texture, bool nearest = false) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+#if defined(PROXY_GAME_EZ2)
+  auto found = findOrRealizeTexture(texture);
+  if (!found)
+    return nullptr;
+  RemixTexture &t = *found;
+#else
   auto it = g_textures.find(texture);
   if (it == g_textures.end())
     return nullptr;
   RemixTexture &t = *it->second;
-  if (!t.clampMaterial) {
+#endif
+  remixapi_MaterialHandle &slot = nearest ? t.pointClampMaterial : t.clampMaterial;
+  if (!slot) {
     wchar_t path[32];
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
     remixapi_MaterialInfoOpaqueEXT opaque = {};
@@ -474,28 +1172,86 @@ remixapi_MaterialHandle clampedMaterialFor(const void *texture) {
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
-    info.hash = t.hash ^ 0xc1a3b0c1a3b0c1a3ull;
+    info.hash = nearest ? (t.hash ^ 0xc1a3b0c1a3b0c1a3ull ^ 0x701475a1701475a1ull) : (t.hash ^ 0xc1a3b0c1a3b0c1a3ull);
     info.albedoTexture = path;
-    info.filterMode = 1;
+    info.filterMode = nearest ? 0 : 1;
     info.wrapModeU = info.wrapModeV = 3; // clamp to edge (1: repeat)
-    if (g_api.CreateMaterial(&info, &t.clampMaterial) != REMIXAPI_ERROR_CODE_SUCCESS)
-      t.clampMaterial = nullptr;
+    if (g_api.CreateMaterial(&info, &slot) != REMIXAPI_ERROR_CODE_SUCCESS)
+      slot = nullptr;
   }
-  return t.clampMaterial;
+  return slot;
 }
 
 // The lit material of the uploaded texture a name stands for (nullptr: its
 // file gave no hashes, or none of them is uploaded now). For draws whose base
+#if defined(PROXY_GAME_EZ2)
+// texture is not on sampler 0 (onDraw: the Cable shader, decals, particles). The record is held
+// by the engine's D3D texture (g_textures), as a draw's own texture's is.
+remixapi_MaterialHandle materialForName(const std::string &name, bool nearest = false) {
+  if (name.empty())
+    return nullptr;
+  std::string cleanName = name;
+  if (nameStarts(cleanName.c_str(), "materials/") || nameStarts(cleanName.c_str(), "materials\\"))
+    cleanName.erase(0, 10);
+  const uint64_t hash = maskTextureHash(cleanName, false);
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    if (hash) {
+      const auto found = g_texturesByHash.find(hash);
+      const auto texture = found != g_texturesByHash.end() ? found->second.lock() : nullptr;
+      if (texture)
+        return ensureMaterial(*texture, 0, nearest);
+    }
+  }
+  uint32_t width = 0, height = 0;
+  std::vector<uint8_t> rgba;
+  if (bsp::textureRgba(cleanName, width, height, rgba) && width && height && !rgba.empty()) {
+    std::vector<uint8_t> bgra = std::move(rgba);
+    for (size_t i = 0; i + 3 < bgra.size(); i += 4)
+      std::swap(bgra[i], bgra[i + 2]);
+    const uint64_t contentHash = dxvk::textureHash(bgra.data(), bgra.size());
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    if (contentHash) {
+      auto found = g_texturesByHash.find(contentHash);
+      if (found != g_texturesByHash.end()) {
+        if (auto t = found->second.lock())
+          return ensureMaterial(*t, 0, nearest);
+      }
+    }
+    auto t = std::make_shared<RemixTexture>();
+    t->hash = contentHash ? contentHash : 1;
+    t->legacyHash = dxvk::legacyTextureHash(bgra.data(), bgra.size());
+    t->width = width;
+    t->height = height;
+    remixapi_TextureInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+    info.hash = t->hash;
+    info.width = width;
+    info.height = height;
+    info.depth = 1;
+    info.mipLevels = 1;
+    info.format = REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+    info.data = bgra.data();
+    info.dataSize = bgra.size();
+    if (g_api.CreateTexture(&info, &t->texture) == REMIXAPI_ERROR_CODE_SUCCESS) {
+      ++g_stats.textures;
+      g_texturesByHash[contentHash] = t;
+      return ensureMaterial(*t, 0, nearest);
+    }
+  }
+  return nullptr;
+#else
 // texture is not on sampler 0 (onDraw: the Cable shader). The record is held
 // by the engine's D3D texture (g_textures), as a draw's own texture's is.
-remixapi_MaterialHandle materialForName(const std::string &name) {
+remixapi_MaterialHandle materialForName(const std::string &name, bool nearest = false) {
   const uint64_t hash = name.empty() ? 0 : maskTextureHash(name, false);
   if (!hash)
     return nullptr;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   const auto found = g_texturesByHash.find(hash);
   const auto texture = found != g_texturesByHash.end() ? found->second.lock() : nullptr;
-  return texture ? ensureMaterial(*texture, 0) : nullptr;
+  return texture ? ensureMaterial(*texture, 0, nearest) : nullptr;
+#endif
 }
 
 // A draw belongs to the material bound when it reaches D3D, usually. Not
@@ -547,6 +1303,16 @@ engine_materials::Shading shadingFor(const void *texture, const engine_materials
   return bound;
 }
 
+// Statistics: the materials whose conversion was dropped because the draw's
+// texture is not their base texture's file (under g_transientSampleLock).
+struct PbrNotBase {
+  std::string material;
+  uint64_t texture = 0;
+  size_t candidates = 0;
+  uint32_t draws = 0;
+};
+std::map<std::string, PbrNotBase> g_pbrNotBase; // by base texture name
+
 // A PBR conversion's maps as uploaded textures (0: none).
 struct PbrMaps {
   bool use = false; // the conversion applies
@@ -568,6 +1334,14 @@ PbrMaps pbrMapsFor(const RemixTexture &t, const engine_materials::Shading &s, bo
     if (s.base.empty() || (maskTextureHash(s.base, false) != t.hash &&
                            std::find(candidates.begin(), candidates.end(), t.hash) == candidates.end())) {
       ++g_stats.pbrNotBase;
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      if (g_pbrNotBase.size() < 32 || g_pbrNotBase.count(s.base)) {
+        PbrNotBase &n = g_pbrNotBase[s.base];
+        n.material = engine_materials::currentName();
+        n.texture = t.hash;
+        n.candidates = candidates.size();
+        ++n.draws;
+      }
       return maps;
     }
   }
@@ -596,7 +1370,7 @@ PbrMaps pbrMapsFor(const RemixTexture &t, const engine_materials::Shading &s, bo
 // mask texture `maskHash` (0: none) and the PBR maps `pbr` (unused: diffuse).
 // Caller holds g_textureLock.
 EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shading &s, uint64_t maskHash, bool lights,
-                                 uint64_t *materialHash = nullptr, const PbrMaps &pbr = {}) {
+                                 uint64_t *materialHash = nullptr, const PbrMaps &pbr = {}, bool nearest = false) {
   using engine_materials::Shading;
   const bool emits = s.mode != Shading::Lit;
   static const float scale = envScale("OPENREMIX_PROXY_EMISSIVE_SCALE", 1.0f);
@@ -612,6 +1386,10 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     uint64_t normal, maps[2];
     float pbr[8];
     uint8_t pbrBits[3];
+    uint8_t nearest;
+    uint16_t albedo[3]; // Shading::albedo, 1/1024 steps
+    uint8_t metalColor[4]; // pbr::Material::metalColor, 1/255 steps; [3] whether it has one
+    uint8_t blur; // pbr::Material::blur, 1/16 mips
   } key;
   std::memset(&key, 0, sizeof(key)); // hashed as bytes
   key.mask = maskHash;
@@ -620,6 +1398,9 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     key.tint[c] = uint16_t(std::lround(std::clamp(std::isfinite(s.tint[c]) ? s.tint[c] : 0.0f, 0.0f, 64.0f) * 64));
   key.mode = uint8_t(s.mode);
   key.lights = lights;
+  key.nearest = nearest ? 1 : 0;
+  for (int c = 0; c < 3; ++c)
+    key.albedo[c] = uint16_t(std::lround(std::clamp(std::isfinite(s.albedo[c]) ? s.albedo[c] : 1.0f, 0.0f, 1.0f) * 1024));
   if (pbr.use) {
     const auto &p = s.pbr;
     key.normal = pbr.normal;
@@ -634,6 +1415,12 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
       key.pbr[4 + 3 * i] = m.scale;
       key.pbrBits[1 + i] = uint8_t(m.invert | (m.curve & 1) << 1 | (m.channel & 3) << 2);
     }
+    if (p.metalColored) {
+      for (int c = 0; c < 3; ++c)
+        key.metalColor[c] = uint8_t(std::lround(std::clamp(p.metalColor[c], 0.0f, 1.0f) * 255));
+      key.metalColor[3] = 1;
+    }
+    key.blur = uint8_t(std::lround(std::clamp(p.blur, 0.0f, 15.9375f) * 16));
   }
   uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), t.hash);
   if (!hash || hash == t.hash)
@@ -664,6 +1451,12 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   remixapi_MaterialInfoPbrEXT enable = {};
   enable.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
   enable.enabled = 1;
+  remixapi_MaterialMetalColorEXT metalColor = {};
+  metalColor.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_METAL_COLOR_EXT;
+  metalColor.color = {key.metalColor[0] / 255.0f, key.metalColor[1] / 255.0f, key.metalColor[2] / 255.0f};
+  remixapi_MaterialPbrBlurEXT blur = {};
+  blur.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_BLUR_EXT;
+  blur.roughnessMinimumLod = std::min(key.blur / 16.0f, 15.0f);
   remixapi_MaterialInfoReplacementHashEXT replacement = {};
   replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
   replacement.materialHash = t.legacyHash;
@@ -686,6 +1479,14 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     remap.pNext = chain;
     enable.pNext = &remap;
     chain = &enable;
+    if (key.metalColor[3]) {
+      metalColor.pNext = chain;
+      chain = &metalColor;
+    }
+    if (key.blur) {
+      blur.pNext = chain;
+      chain = &blur;
+    }
     if (pbr.normal) {
       encoding.pNext = chain;
       chain = &encoding;
@@ -698,7 +1499,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
       opaque.metallicTexture = mapPaths[1];
   }
   opaque.pNext = chain;
-  opaque.albedoConstant = {1, 1, 1};
+  opaque.albedoConstant = {key.albedo[0] / 1024.0f, key.albedo[1] / 1024.0f, key.albedo[2] / 1024.0f};
   opaque.opacityConstant = 1;
   opaque.alphaTestType = 7;
   opaque.useDrawCallAlphaState = 1;
@@ -715,7 +1516,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     info.emissiveIntensity = scale;
     info.emissiveColorConstant = {key.tint[0] / 64.0f, key.tint[1] / 64.0f, key.tint[2] / 64.0f};
   }
-  info.filterMode = 1;
+  info.filterMode = nearest ? 0 : 1;
   info.wrapModeU = info.wrapModeV = 1;
   if (g_api.CreateMaterial(&info, &variant.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
     g_emissiveMaterials.erase(hash);
@@ -744,43 +1545,82 @@ void countPbr(const PbrMaps &maps) {
 
 // A draw's material: the texture's lit one, or its unlit / self-illuminated
 // variant (falling back to the lit one when its mask texture is not known),
-// with the material's PBR conversion.
-remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s) {
+// with the material's PBR conversion. skinned: a skinned (studio model) draw.
+remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s, bool nearest = false,
+                                    bool skinned = false) {
   using engine_materials::Shading;
-  if (s.mode == Shading::Lit && !s.pbr.active)
-    return materialFor(texture);
+  if (const int slot = screenSlot(texture); slot >= 0)
+    return screenMaterial(slot);
+  const bool tinted = s.albedo[0] != 1 || s.albedo[1] != 1 || s.albedo[2] != 1;
+  if (s.mode == Shading::Lit && !s.pbr.active && !tinted)
+    return materialFor(texture, 0, nearest);
   const bool masked = s.mode == Shading::SelfIllumMask || s.mode == Shading::SelfIllumMaskAlpha;
   const uint64_t maskHash = masked ? maskTextureHash(s.mask) : 0;
   if (masked && !maskHash && !s.pbr.active)
-    return materialFor(texture);
+    return materialFor(texture, 0, nearest);
+#if defined(PROXY_GAME_EZ2)
+  // Skinned models' self-illumination glows without lighting the scene
+  // (unless OPENREMIX_PROXY_EMISSIVE_LIGHTS is 3): their emitters move with
+  // every frame's pose, which the runtime rebuilds. A dozen acid antlions
+  // (Entropy : Zero 2's ez2_c1_3) took 35 ms of every frame that way.
+  const bool lights = emissiveLights(s, false) && (!skinned || emissiveLightsMode() >= 3);
+#else
   const bool lights = emissiveLights(s, false);
+#endif
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+#if defined(PROXY_GAME_EZ2)
+  auto t = findOrRealizeTexture(texture);
+  if (!t)
+    return nullptr;
+  const PbrMaps maps = pbrMapsFor(*t, s, false);
+#else
   auto it = g_textures.find(texture);
   if (it == g_textures.end())
     return nullptr;
   const PbrMaps maps = pbrMapsFor(*it->second, s, false);
+#endif
   if (masked && !maskHash) {
     // Lit, with the conversion.
     Shading lit = s;
     lit.mode = Shading::Lit;
     if (!maps.use)
-      return ensureMaterial(*it->second, 0);
-    if (EmissiveMaterial *variant = ensureEmissive(*it->second, lit, 0, false, nullptr, maps)) {
+#if defined(PROXY_GAME_EZ2)
+      return ensureMaterial(*t, 0, nearest);
+    if (EmissiveMaterial *variant = ensureEmissive(*t, lit, 0, false, nullptr, maps, nearest)) {
       countPbr(maps);
       return variant->handle;
     }
-    return ensureMaterial(*it->second, 0);
+    return ensureMaterial(*t, 0, nearest);
   }
   if (s.mode == Shading::Lit) {
-    if (!maps.use)
-      return ensureMaterial(*it->second, 0);
-    if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, 0, false, nullptr, maps)) {
+    if (!maps.use && !tinted)
+      return ensureMaterial(*t, 0, nearest);
+    if (EmissiveMaterial *variant = ensureEmissive(*t, s, 0, false, nullptr, maps, nearest)) {
       countPbr(maps);
       return variant->handle;
     }
-    return ensureMaterial(*it->second, 0);
+    return ensureMaterial(*t, 0, nearest);
   }
-  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights, nullptr, maps)) {
+  if (EmissiveMaterial *variant = ensureEmissive(*t, s, maskHash, lights, nullptr, maps, nearest)) {
+#else
+      return ensureMaterial(*it->second, 0, nearest);
+    if (EmissiveMaterial *variant = ensureEmissive(*it->second, lit, 0, false, nullptr, maps, nearest)) {
+      countPbr(maps);
+      return variant->handle;
+    }
+    return ensureMaterial(*it->second, 0, nearest);
+  }
+  if (s.mode == Shading::Lit) {
+    if (!maps.use && !tinted)
+      return ensureMaterial(*it->second, 0, nearest);
+    if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, 0, false, nullptr, maps, nearest)) {
+      countPbr(maps);
+      return variant->handle;
+    }
+    return ensureMaterial(*it->second, 0, nearest);
+  }
+  if (EmissiveMaterial *variant = ensureEmissive(*it->second, s, maskHash, lights, nullptr, maps, nearest)) {
+#endif
     countPbr(maps);
     switch (s.mode) {
     case Shading::Unlit: ++g_stats.unlitDraws; break;
@@ -791,7 +1631,11 @@ remixapi_MaterialHandle materialFor(const void *texture, const engine_materials:
     g_stats.emissiveLightDraws += lights;
     return variant->handle;
   }
-  return ensureMaterial(*it->second, 0);
+#if defined(PROXY_GAME_EZ2)
+  return ensureMaterial(*t, 0, nearest);
+#else
+  return ensureMaterial(*it->second, 0, nearest);
+#endif
 }
 
 // Variants nothing drew for a while (a tint that changed) go; pinned ones
@@ -815,8 +1659,47 @@ void evictEmissiveMaterials() {
 // The material of an uploaded texture by its dxvk hash, for the BSP world;
 // `emission`: its unlit / self-illuminated variant, with the first uploaded
 // of `maskCandidates` as mask (no handle until that is uploaded).
+// A displacement's second texture as a sheet whose coverage a blend mask
+// shapes per texel (remixapi_MaterialBlendModulationEXT): the texture's lit
+// material with the mask, by texture, mask and transform. Kept for the
+// process (one per such layer and map). Texture lock held.
+std::map<std::tuple<uint64_t, uint64_t, std::array<float, 6>, bool>, remixapi_MaterialHandle> g_blendMaterials;
+remixapi_MaterialHandle blendMaterial(const RemixTexture &t, uint64_t maskHash, const float transform[2][3],
+                                      bool nearest) {
+  std::array<float, 6> rows;
+  std::copy_n(&transform[0][0], 6, rows.begin());
+  remixapi_MaterialHandle &slot = g_blendMaterials[{t.hash, maskHash, rows, nearest}];
+  if (slot)
+    return slot;
+  wchar_t path[32], maskPath[32];
+  swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
+  swprintf(maskPath, 32, L"0x%llX", static_cast<unsigned long long>(maskHash));
+  remixapi_MaterialBlendModulationEXT modulation = {};
+  modulation.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_BLEND_MODULATION_EXT;
+  modulation.maskTexture = maskPath;
+  std::copy_n(&transform[0][0], 6, &modulation.transform[0][0]);
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.pNext = &modulation;
+  opaque.albedoConstant = {1, 1, 1};
+  opaque.opacityConstant = 1;
+  opaque.alphaTestType = 7;
+  opaque.useDrawCallAlphaState = 1;
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = XXH3_64bits_withSeed(rows.data(), sizeof(rows), t.hash ^ maskHash ^ (nearest ? 0x6e656172ull : 0)) | 1;
+  info.albedoTexture = path;
+  info.filterMode = nearest ? 0 : 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  if (g_api.CreateMaterial(&info, &slot) != REMIXAPI_ERROR_CODE_SUCCESS)
+    slot = nullptr;
+  return slot;
+}
+
 bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading *emission,
-                                 const std::vector<uint64_t> *maskCandidates) {
+                                 const std::vector<uint64_t> *maskCandidates, bool nearest = false,
+                                 const bsp::BlendMask *blend = nullptr) {
   using engine_materials::Shading;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_texturesByHash.find(hash);
@@ -826,31 +1709,38 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   if (!texture)
     return {};
   bsp::MaterialRef ref;
+  if (blend && blend->candidates && (!emission || emission->mode == Shading::Lit)) {
+    uint64_t maskHash = 0;
+    for (uint64_t candidate : *blend->candidates)
+      if ((maskHash = uploadedTextureHash(candidate)))
+        break;
+    if (!maskHash)
+      return {}; // until the mask is uploaded
+    ref.handle = blendMaterial(*texture, maskHash, blend->transform, nearest);
+    ref.keep = std::move(texture);
+    return ref;
+  }
   // Its PBR conversion waits for the maps it names.
   bool complete = true;
   const PbrMaps maps = emission ? pbrMapsFor(*texture, *emission, true, &complete) : PbrMaps{};
   if (!complete)
     return {};
   if (!emission || (emission->mode == Shading::Lit && !maps.use)) {
-    ref.handle = ensureMaterial(*texture, 0);
+    ref.handle = ensureMaterial(*texture, 0, nearest);
     ref.keep = std::move(texture);
     return ref;
   }
   uint64_t maskHash = 0;
   if (emission->mode == Shading::SelfIllumMask || emission->mode == Shading::SelfIllumMaskAlpha) {
-    for (uint64_t candidate : maskCandidates ? *maskCandidates : std::vector<uint64_t>()) {
-      auto found = g_texturesByHash.find(candidate);
-      if (found != g_texturesByHash.end() && !found->second.expired()) {
-        maskHash = candidate;
+    for (uint64_t candidate : maskCandidates ? *maskCandidates : std::vector<uint64_t>())
+      if ((maskHash = uploadedTextureHash(candidate)))
         break;
-      }
-    }
     if (!maskHash)
       return {};
   }
   uint64_t materialHash = 0;
   EmissiveMaterial *variant =
-      ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash, maps);
+      ensureEmissive(*texture, *emission, maskHash, emissiveLights(*emission, true), &materialHash, maps, nearest);
   if (!variant)
     return {};
   ++variant->pins;
@@ -882,6 +1772,26 @@ std::unordered_map<uint64_t, uint32_t> g_keptWorldTextures;
 int g_overlays = 0;
 // Categories l4d2-rtx applies to the draws that follow (onMarker "body").
 uint32_t g_markerCategories = 0;
+// Portal 2 (portal2.h): depth of the engine's portal views' DrawWorldLists
+// (onMarker "portal_view"; their world is the BSP's: every draw in there is
+// dropped), and the placements of this frame's portal views (their view
+// matrices as the shader API had them at the marker, not made left-handed):
+// a view drawn from one of them is a portal view (View::portal).
+int g_portalWorldLists = 0;
+std::vector<std::array<float, 16>> g_portalViews;
+struct PortalViewStats {
+  std::atomic<uint64_t> views{0}, notBackBuffer{0}, worldDropped{0}, surfacesDropped{0}, surfaceMarks{0},
+      surfaceOverlays{0}, instances{0}, bodies{0}, mainBodies{0}, frames{0}, viewsDrawn{0}, worldViewsInPortals{0};
+  // The engine's rims replayed as host passes (portal2::engineRims): recorded,
+  // refused by hostpass (dropped), left out as drawn in a portal view.
+  std::atomic<uint64_t> engineRims{0}, engineRimsRefused{0}, engineRimsInViews{0};
+  std::atomic<uint64_t> skipped[4] = {}; // raster only, blended in world space, stencil, placed already
+  // Portal surfaces told by their shader alone (not under models/portals/),
+  // and the last one's material.
+  std::atomic<uint64_t> byShader{0};
+  std::mutex byShaderMutex;
+  std::string byShaderName;
+} g_portalViewStats;
 
 // --- Lights ------------------------------------------------------------------
 // LightDesc_t (public/mathlib/lightdesc.h), 88 bytes.
@@ -889,8 +1799,15 @@ struct SourceLight {
   int32_t type; // 1 point, 2 directional, 3 spot
   float color[3], position[3], direction[3];
   float range, falloff, attenuation0, attenuation1, attenuation2, theta, phi, thetaDot, phiDot;
+  // Not in LightDesc_t: a projected texture's cookie (the runtime texture's
+  // hash, 0: none), the projection's up vector and horizontal FOV in degrees.
+  // No padding (spare aligns the hash): the definition hashes these bytes.
+  float cookieUp[3], cookieFov, spare;
+  uint64_t cookie;
 };
-constexpr size_t kLightDescSize = 88;
+constexpr size_t kLightDescSize = 88, kLightDescPart = offsetof(SourceLight, cookieUp);
+static_assert(kLightDescPart <= kLightDescSize && offsetof(SourceLight, cookie) == kLightDescPart + 20 &&
+              sizeof(SourceLight) == kLightDescPart + 28);
 std::mutex g_lightLock;
 std::unordered_map<uint64_t, SourceLight> g_frameLights, g_lastLights;
 struct CachedLight {
@@ -925,6 +1842,8 @@ remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
   info.hash = hash;
   remixapi_LightInfoSphereEXT sphere = {};
   remixapi_LightInfoDistantEXT distant = {};
+  remixapi_LightInfoCookieEXT cookie = {};
+  wchar_t cookiePath[32] = {};
   if (l.type == 2) {
     constexpr float kSunDiameterDegrees = 0.5f;
     const float s = sunScale * 3.14159265f;
@@ -936,6 +1855,7 @@ remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
     distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
     distant.direction = {l.direction[0] / len, l.direction[1] / len, l.direction[2] / len};
     distant.angularDiameterDegrees = kSunDiameterDegrees;
+    distant.volumetricRadianceScale = 1; // dxvk-remix's default; 0 leaves it out of volumetrics
     info.pNext = &distant;
   } else {
     constexpr float kRadius = 2.0f, kReference = 100.0f;
@@ -948,6 +1868,7 @@ remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
     sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
     sphere.position = {l.position[0], l.position[1], l.position[2]};
     sphere.radius = kRadius;
+    sphere.volumetricRadianceScale = 1; // dxvk-remix's default; 0 leaves it out of volumetrics
     if (l.type == 3) {
       const float len = std::sqrt(l.direction[0] * l.direction[0] + l.direction[1] * l.direction[1] +
                                   l.direction[2] * l.direction[2]);
@@ -961,6 +1882,20 @@ remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
       }
     }
     info.pNext = &sphere;
+    // A projected texture's cookie: the texture spans the FOV and shapes the
+    // beam (dark outside it), so the cone only bounds the frustum, out to its
+    // corners, without a fade.
+    if (l.cookie && sphere.shaping_hasvalue && l.cookieFov > 0 && l.cookieFov < 180) {
+      swprintf(cookiePath, 32, L"0x%llX", static_cast<unsigned long long>(l.cookie));
+      cookie.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_COOKIE_EXT;
+      cookie.texture = cookiePath;
+      cookie.up = {l.cookieUp[0], l.cookieUp[1], l.cookieUp[2]};
+      cookie.fovDegrees = l.cookieFov;
+      const float corner = std::atan(1.41421356f * std::tan(l.cookieFov * 0.5f * 0.01745329252f));
+      sphere.shaping_value.coneAngleDegrees = std::min(corner * 57.2957795f + 1.0f, 89.0f);
+      sphere.shaping_value.coneSoftness = 0;
+      sphere.pNext = &cookie;
+    }
   }
   for (float c : {info.radiance.x, info.radiance.y, info.radiance.z})
     if (!std::isfinite(c) || c < 0)
@@ -990,11 +1925,18 @@ struct Instance {
   uint32_t categories;
   uint64_t replacementHash; // dxvk-remix mesh replacement key (0: none)
   bool persistent;          // mesh from static buffers (cached across frames)
-  bool singleSided = false; // blended draw D3D culls: its back faces are not seen
+  bool singleSided = false; // D3D culls its back faces (opaque models, blended draws by choice): not seen by any ray
   bool cameraCullBack = false; // D3D culls its back faces: hidden from the camera only
   std::vector<remixapi_Transform> bones; // skinned instances
   float transform[3][4];
   uint64_t view;
+  bool skinned = false;     // a skinned model's draw (bones may still be dropped: single-bone models are rigid)
+  bool modelLayer = false;  // a layer the proxy adds to a model (an eye's iris): of the model whatever its transform
+  bool playerModel = false; // drawn with the player's own materials (Portal 2: Chell, the gun in her hands)
+  bool deforming = false;   // its mesh is refreshed in place every frame (g_flexMeshes): never the static world
+  uint64_t builtFrame = ~0ull; // a deforming mesh's last refresh (diagnostics)
+  uint32_t primitives = 0, firstIndex = 0; // the draw's primitive count and first index (a screen view's dedupe)
+  bool offTarget = false; // drawn into a render-target texture: a screen camera's view (role Screen) or nothing
   // Stencil emulation: the draw's group (g_stencilGroups index) and part in it.
   int stencilGroup = -1;
   uint8_t stencilRole = 0;
@@ -1010,6 +1952,13 @@ struct Instance {
   // sprite overlays (remixapi_InstanceInfoSpriteEXT flags; 0: nothing).
   uint32_t spriteFlags = 0;
   float spriteSoft[3] = {}; // soft distance, fade start, fade end (view-space units)
+#ifdef PROXY_GAME_L4D2
+  // An infected's wounds (l4d2::infected): cut out of its bind-pose surface.
+  // `wound.cutTexture` is set at submission, to `woundTexture`.
+  bool woundCut = false;
+  remixapi_InstanceInfoWoundCutEXT wound = {};
+  wchar_t woundTexture[24] = {};
+#endif
 };
 std::vector<Instance> g_instances;
 
@@ -1049,6 +1998,21 @@ enum : uint8_t { kStencilNone, kStencilSource, kStencilSourceOnly, kStencilInsid
 std::vector<StencilGroup> g_stencilGroups;           // this frame's
 std::unordered_map<uint32_t, int> g_stencilCurrent;  // stencil value -> its current group
 std::vector<std::pair<int, bool>> g_uiCommandMasks;  // per g_uiCommands entry: group (-1 none), outside
+#if defined(PROXY_GAME_EZ2)
+// Stencil layers (Entropy : Zero 2's GamepadUI): each panel draws with a
+// lower reference than the one in front of it (GREATEREQUAL, REPLACE), the
+// front one first, so what a panel covered hides the panels behind it.
+// This frame's layer draws: screen bounds and the value they wrote.
+struct UiLayer {
+  float x0, y0, x1, y1;
+  uint32_t value;
+};
+std::vector<UiLayer> g_uiLayers;
+// An entity glow's coloured draw being taken (see onDraw): its colour and
+// opacity. Its groups' value is outside the stencil's range.
+const float *g_glowHalo = nullptr;
+constexpr uint32_t kGlowGroup = 0x100;
+#endif
 
 // Halo groups need their fill (the colour); the other groups that are both
 // marked and tested get a runtime mask. Once per frame, before submission.
@@ -1096,6 +2060,14 @@ struct View {
   bool cameraSpace = false;
   float view[16], projection[16];
   float cameraToWorld[3][4] = {}; // a view with a camera: its camera space (as the engine has it) to world
+  bool fixedFunction = false;     // its matrices are D3D's transforms (a fixed-function draw's)
+  // Drawn into a screen camera's render-target texture (screenSlot): the
+  // entities that camera sees, which the main view may not draw.
+  const void *screenTarget = nullptr;
+  // Portal 2: one of the engine's portal views (g_portalViews): what it draws
+  // besides its world (dropped) are scene instances (role Portal), never a
+  // camera; the stencil it is drawn through is not emulated.
+  bool portal = false;
 };
 // Source's client-side particle manager (CParticleMgr: the emitters of FX_
 // effects, env_smokestack, Lua's ParticleEmitter, ...) transforms its
@@ -1139,12 +2111,15 @@ std::atomic<uint32_t> g_fogSent{0}, g_fogFrames{0};
 float g_fogSample[8] = {}; // mode, start, end, max density, colour, sent end (statistics)
 
 void readSceneFog() {
+  if (!game::kSceneFogSlots)
+    return;
   auto *vtbl = *static_cast<void ***>(g_shaderApi);
   SceneFog fog;
-  fog.mode = reinterpret_cast<int (*)(void *)>(vtbl[kSlotGetSceneFogMode])(g_shaderApi);
-  reinterpret_cast<void (*)(void *, unsigned char *)>(vtbl[kSlotGetSceneFogColor])(g_shaderApi, fog.color);
-  reinterpret_cast<void (*)(void *, float *, float *, float *)>(vtbl[kSlotGetFogDistances])(g_shaderApi, &fog.start,
-                                                                                            &fog.end, &fog.z);
+  fog.mode = reinterpret_cast<int(PROXY_THISCALL *)(void *)>(vtbl[kSlotGetSceneFogMode])(g_shaderApi);
+  reinterpret_cast<void(PROXY_THISCALL *)(void *, unsigned char *)>(vtbl[kSlotGetSceneFogColor])(g_shaderApi,
+                                                                                                fog.color);
+  reinterpret_cast<void(PROXY_THISCALL *)(void *, float *, float *, float *)>(vtbl[kSlotGetFogDistances])(
+      g_shaderApi, &fog.start, &fog.end, &fog.z);
   fog.read = true;
   g_sceneFog = fog;
 }
@@ -1161,7 +2136,7 @@ void sendSceneFog() {
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_FOG", v, sizeof(v)) && v[0] == '0');
   }();
   static auto set = reinterpret_cast<PFN_remixapi_SetFogState>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_SetFogState"));
+      GetProcAddress(game::runtimeModule(), "remixapi_SetFogState"));
   if (!set)
     return;
   const SceneFog fog = g_sceneFog;
@@ -1309,13 +2284,13 @@ float g_lastSky[3] = {};
 std::string g_viewSummary; // last frame's views, for statistics
 
 int currentNumBones() {
-  using Fn = int(__thiscall *)(void *);
+  using Fn = int(PROXY_THISCALL *)(void *);
   auto *vtbl = *static_cast<void ***>(g_shaderApi);
   return reinterpret_cast<Fn>(vtbl[kSlotGetCurrentNumBones])(g_shaderApi);
 }
 
 void getMatrix(int mode, float *out) {
-  using Fn = void(__thiscall *)(void *, int, float *);
+  using Fn = void(PROXY_THISCALL *)(void *, int, float *);
   auto *vtbl = *static_cast<void ***>(g_shaderApi);
   reinterpret_cast<Fn>(vtbl[kSlotGetMatrix])(g_shaderApi, mode, out);
 }
@@ -1346,6 +2321,34 @@ const D3DVERTEXELEMENT9 *findElement(const D3DVERTEXELEMENT9 *e, BYTE usage, BYT
   return nullptr;
 }
 
+// A fixed-function draw's (render thread; set by onFixedFunctionDraw, see
+// fixed_function.h): how its vertices pick their bones and how many matrices
+// D3D blends (0: the shader convention: indices in memory order, bone count
+// from the shader API), its base texture's transform (8 floats as
+// g_screenUv's) and its coordinates projected from the world position.
+ff::Blend g_ffBlend = ff::kBlendNone;
+uint32_t g_ffMatrices = 0;
+const float *g_ffUv = nullptr, *g_ffGenerated = nullptr;
+// The fixed-function draw onDraw is converting (nullptr: a shader draw).
+const ff::Converted *g_ffDraw = nullptr;
+
+// The draw's bones as cModel's rows, and how many it can index: a shader
+// draw's registers (kMaxBones), a fixed-function draw's world matrices.
+const float *boneRows(const Draw &d) { return g_ffDraw ? g_ffDraw->bones : d.vsConstants + kRegModel * 4; }
+uint32_t boneLimit() { return g_ffDraw ? g_ffDraw->boneRows : kMaxBones; }
+// Fixed-function draws (fixed_function.h): what they were, what was made of
+// them, per statistics interval.
+struct FixedFunctionStats {
+  std::atomic<uint32_t> draws{0}, rigid{0}, indexed{0}, indexedColor{0}, nonIndexed{0}, flat{0}, pretransformed{0},
+      fvf{0}, tweening{0}, fourMatrices{0}, uvTransforms{0}, projected{0}, generated{0}, untextured{0},
+      otherStage{0}, irises{0}, textureFactor{0}, layers{0}, views{0}, flatViews{0}, mainFrames{0};
+  std::atomic<uint32_t> outcomes[11] = {};
+} g_ffStats;
+const char *const kFfOutcomes[11] = {"instance",      "UI",          "flat, not UI", "off target",
+                                     "depth only",    "no position", "no data",      "mesh refused",
+                                     "pass layer",    "rtx.conf ignored", "other (onDraw rules)"};
+std::map<std::string, uint32_t> g_ffSkipped; // reason -> draws (render thread; read under g_transientSampleLock)
+
 // UI texture (re)registrations: count, bytes and time since the last dump.
 std::atomic<uint32_t> g_usUiRegister{0}, g_usUiRegisterApi{0};
 std::atomic<uint64_t> g_uiRegistrations{0}, g_uiRegionUpdates{0}, g_uiRegisteredBytes{0};
@@ -1358,12 +2361,16 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
   if (it == g_cpuTextures.end())
     return 0;
   auto &t = *it->second;
+#if defined(PROXY_GAME_EZ2)
+  const auto id = static_cast<remixapi_UITextureHandle>(reinterpret_cast<uintptr_t>(texture));
+#else
   const auto id = static_cast<remixapi_UITextureHandle>(reinterpret_cast<uintptr_t>(it->second.get()));
+#endif
   // A registered 32-bit texture changes in place: only its dirty region goes
   // to the runtime (remixapi_UpdateUITextureRegionEXT), without a copy when
   // its alpha is real.
   static const auto updateRegion = reinterpret_cast<PFN_remixapi_UpdateUITextureRegionEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateUITextureRegionEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_UpdateUITextureRegionEXT"));
   const bool wide = t.format == D3DFMT_A8R8G8B8 || t.format == D3DFMT_X8R8G8B8;
   if (t.registeredVersion && t.registeredVersion != t.version && updateRegion && wide &&
       t.data.size() == size_t(t.width) * t.height * 4) {
@@ -1394,7 +2401,13 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
       return id;
     }
   }
+#if defined(PROXY_GAME_EZ2)
+  if (!t.registeredVersion || t.registeredVersion != t.version) {
+    if (t.data.empty() || !t.width || !t.height)
+      return 0;
+#else
   if (t.registeredVersion != t.version) {
+#endif
     Timer timer(g_usUiRegister);
     ++g_uiRegistrations;
     g_uiRegisteredBytes += uint64_t(t.width) * t.height * 4;
@@ -1405,6 +2418,30 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
       rgba = formats::decodeBC1(t.data.data(), t.width, t.height);
     } else if (t.format == D3DFMT_DXT5) {
       rgba = formats::decodeBC3(t.data.data(), t.width, t.height);
+#if defined(PROXY_GAME_EZ2)
+    } else if (t.format == D3DFMT_A8) {
+      rgba.resize(size_t(t.width) * t.height * 4);
+      for (size_t i = 0; i < t.data.size() && i * 4 + 3 < rgba.size(); ++i) {
+        rgba[i * 4 + 0] = 0xff;
+        rgba[i * 4 + 1] = 0xff;
+        rgba[i * 4 + 2] = 0xff;
+        rgba[i * 4 + 3] = t.data[i];
+      }
+      format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+    } else if (t.format == D3DFMT_L8) {
+      rgba.resize(size_t(t.width) * t.height * 4);
+      for (size_t i = 0; i < t.data.size() && i * 4 + 3 < rgba.size(); ++i) {
+        const uint8_t lum = t.data[i];
+        rgba[i * 4 + 0] = lum;
+        rgba[i * 4 + 1] = lum;
+        rgba[i * 4 + 2] = lum;
+        rgba[i * 4 + 3] = 0xff;
+      }
+      format = REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+    } else if (isUnpackFormat(t.format)) {
+      rgba = unpackToBgra(t.format, t.width, t.height, t.data.data(), t.data.size());
+      format = REMIXAPI_FORMAT_B8G8R8A8_UNORM;
+#endif
     } else {
       rgba = t.data; // BGRA in memory
       format = REMIXAPI_FORMAT_B8G8R8A8_UNORM;
@@ -1412,6 +2449,10 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
         for (size_t i = 3; i < rgba.size(); i += 4)
           rgba[i] = 0xff;
     }
+#if defined(PROXY_GAME_EZ2)
+    if (rgba.size() != size_t(t.width) * t.height * 4)
+      return 0;
+#endif
     remixapi_ErrorCode registered;
     {
       Timer apiTimer(g_usUiRegisterApi);
@@ -1419,7 +2460,11 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
     }
     if (registered != REMIXAPI_ERROR_CODE_SUCCESS)
       return 0;
+#if defined(PROXY_GAME_EZ2)
+    t.registeredVersion = t.version ? t.version : 1;
+#else
     t.registeredVersion = t.version;
+#endif
   }
   return id;
 }
@@ -1453,6 +2498,10 @@ uint32_t uiBlendFlags(const Draw &d) {
   return REMIXAPI_UI_NATIVE_CUSTOM_BLEND | factor(src) << REMIXAPI_UI_NATIVE_SRC_BLEND_SHIFT |
          factor(dst) << REMIXAPI_UI_NATIVE_DST_BLEND_SHIFT;
 }
+#if defined(PROXY_GAME_EZ2)
+
+extern FILE *g_dumpFlat;
+#endif
 
 void captureUi(const Draw &d) {
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
@@ -1539,6 +2588,16 @@ void captureUi(const Draw &d) {
     return at + bytes <= s.size ? s.data + at : nullptr;
   };
   const float *mvp = d.vsConstants + kRegModelViewProj * 4; // register k = column k
+  // The material's ColorModulate / AlphaModulate ($color, $alpha), which its
+  // shader multiplies in: a screen fade (env_fade, ViewDrawFade) is a white
+  // quad with the fade's colour and opacity there, and was drawn white.
+  float modulation[4] = {1, 1, 1, 1};
+  engine_materials::currentVector("$color", modulation);
+  engine_materials::currentFloat("$alpha", modulation[3]);
+  uint8_t modulate[4];
+  for (int c = 0; c < 4; ++c)
+    modulate[c] = uint8_t(std::lround(std::clamp(modulation[c], 0.0f, 1.0f) * 255));
+  const bool modulated = modulate[0] != 255 || modulate[1] != 255 || modulate[2] != 255 || modulate[3] != 255;
   const uint32_t base = uint32_t(g_uiVertices.size());
   for (uint32_t v = low; v < low + count; ++v) {
     remixapi_UIVertex out = {};
@@ -1549,25 +2608,59 @@ void captureUi(const Draw &d) {
     for (int k = 0; k < 4; ++k)
       clip[k] = p[0] * mvp[k * 4] + p[1] * mvp[k * 4 + 1] + p[2] * mvp[k * 4 + 2] + mvp[k * 4 + 3];
     const float w = std::fabs(clip[3]) > 1e-6f ? clip[3] : 1.0f;
-    out.x = (clip[0] / w * 0.5f + 0.5f) * g_displayWidth;
-    out.y = (0.5f - clip[1] / w * 0.5f) * g_displayHeight;
+    out.x = (clip[0] / w * 0.5f + 0.5f) * g_displayWidth + 0.5f;
+    out.y = (0.5f - clip[1] / w * 0.5f) * g_displayHeight + 0.5f;
     if (tex && tex->Type >= D3DDECLTYPE_FLOAT2 && tex->Type <= D3DDECLTYPE_FLOAT4)
       if (const uint8_t *t = fetch(tex, v, 8)) {
         std::memcpy(&out.u, t, 4);
         std::memcpy(&out.v, t + 4, 4);
+        if (g_ffUv) { // a fixed-function texture transform
+          const float u = out.u, w = out.v;
+          out.u = g_ffUv[0] * u + g_ffUv[1] * w + g_ffUv[3];
+          out.v = g_ffUv[4] * u + g_ffUv[5] * w + g_ffUv[7];
+        }
       }
     out.color = 0xffffffff;
     if (col && col->Type == D3DDECLTYPE_D3DCOLOR)
       if (const uint8_t *c = fetch(col, v, 4)) // memory B, G, R, A -> R in the low byte
         out.color = uint32_t(c[2]) | uint32_t(c[1]) << 8 | uint32_t(c[0]) << 16 | uint32_t(c[3]) << 24;
+    if (modulated) {
+      uint32_t color = 0;
+      for (int c = 0; c < 4; ++c)
+        color |= ((out.color >> (8 * c) & 255) * modulate[c] + 127) / 255 << (8 * c);
+      out.color = color;
+    }
     g_uiVertices.push_back(out);
   }
+#if defined(PROXY_GAME_EZ2)
+  const bool layer = d.stencil && d.stencilFunc == D3DCMP_GREATEREQUAL && d.stencilPass == D3DSTENCILOP_REPLACE &&
+                     (d.stencilRef & d.stencilMask & 0xff) > 0;
+  if (layer) {
+    // Hidden by a layer in front (a higher value) that covered it.
+    const uint32_t value = d.stencilRef & d.stencilMask & 0xff;
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (size_t i = base; i < g_uiVertices.size(); ++i) {
+      x0 = std::min(x0, g_uiVertices[i].x), x1 = std::max(x1, g_uiVertices[i].x);
+      y0 = std::min(y0, g_uiVertices[i].y), y1 = std::max(y1, g_uiVertices[i].y);
+    }
+    for (const UiLayer &l : g_uiLayers)
+      if (l.value > value && l.x0 <= x0 + 1 && l.y0 <= y0 + 1 && l.x1 >= x1 - 1 && l.y1 >= y1 - 1) {
+        g_uiVertices.resize(base);
+        ++g_stats.uiStencil;
+        return;
+      }
+    g_uiLayers.push_back({x0, y0, x1, y1, value});
+  }
+#else
+  const bool layer = false;
+#endif
   // A stencil-tested draw over the whole screen is a masked fill or composite
   // (halo.lua: surface.DrawRect(0, 0, ScrW(), ScrH()) in the halo colour where
   // stencil == 1; a thermal sight's tint in its lens). With its group known
   // it is masked; otherwise it would cover everything and is dropped. Smaller
-  // draws of unknown groups (addons' round avatars) stay, unmasked.
-  if (stencilTested) {
+  // draws of unknown groups (addons' round avatars) stay, unmasked. A layer's
+  // (a panel's background) is drawn as it is.
+  if (stencilTested && !layer) {
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (size_t i = base; i < g_uiVertices.size(); ++i) {
       x0 = std::min(x0, g_uiVertices[i].x), x1 = std::max(x1, g_uiVertices[i].x);
@@ -1588,6 +2681,10 @@ void captureUi(const Draw &d) {
         ++g_stats.uiStencil;
         return;
       }
+#if defined(PROXY_GAME_EZ2)
+    } else {
+      maskGroup = -1;
+#endif
     }
   }
   remixapi_UIDrawCommand command = {};
@@ -1597,9 +2694,58 @@ void captureUi(const Draw &d) {
   command.indexOffset = uint32_t(g_uiIndices.size());
   for (uint32_t i : indices)
     g_uiIndices.push_back(base + i - low);
+#if defined(PROXY_GAME_EZ2)
+  if (g_dumpFlat) {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    for (size_t i = base; i < g_uiVertices.size(); ++i) {
+      x0 = std::min(x0, g_uiVertices[i].x), x1 = std::max(x1, g_uiVertices[i].x);
+      y0 = std::min(y0, g_uiVertices[i].y), y1 = std::max(y1, g_uiVertices[i].y);
+    }
+    fprintf(g_dumpFlat, "   -> captureUi: cmd=%zu idx=%zu verts=%u bounds=[%.0f,%.0f-%.0f,%.0f] tex=%p uiTex=%p flags=0x%x mask=%d\n",
+            g_uiCommands.size(), indices.size(), count, x0, y0, x1, y1, (void*)d.texture0, (void*)texture, command.flags, maskGroup);
+  }
+#endif
   g_uiCommands.push_back(command);
   g_uiCommandMasks.push_back({maskGroup, maskOutside});
   ++g_stats.uiDraws;
+}
+
+// What a model draw's vertex shader declares (its constant table, read once
+// per shader object): where cFlexScale and the eye shaders' iris projection
+// are (-1: not named), and whether it is the Eyes or the EyeRefract shader's
+// (eyes_vs*: cIrisProjectionU and cGlintProjectionU; eye_refract_vs*:
+// g_vIrisProjectionU and g_cEyeOrigin; their flashlight passes declare no
+// glint, and are blended). The eye shaders are told by the material's shader
+// name where it is known (engine_materials), by these where it is not.
+enum EyeShader : uint8_t { kNotEyes, kEyesShader, kEyeRefractShader };
+struct ModelShader {
+  int flexScale = -1, irisU = -1; // irisU: U, and V the register after it
+  EyeShader eye = kNotEyes;
+};
+ModelShader describeModelShader(const std::vector<uint32_t> &code) {
+  ModelShader s;
+  shader_tables::ConstantTable t;
+  if (!shader_tables::parse(code, t))
+    return s;
+  s.flexScale = t.floatRegister("cFlexScale");
+  if (s.flexScale >= 256)
+    s.flexScale = -1;
+  const int eyesU = t.floatRegister("cIrisProjectionU"), eyesV = t.floatRegister("cIrisProjectionV");
+  const int refractU = t.floatRegister("g_vIrisProjectionU"), refractV = t.floatRegister("g_vIrisProjectionV");
+  if (eyesU >= 0 && eyesU < 255 && eyesV == eyesU + 1 && t.floatRegister("cGlintProjectionU") >= 0) {
+    s.eye = kEyesShader;
+    s.irisU = eyesU;
+  } else if (refractU >= 0 && refractU < 255 && refractV == refractU + 1 && t.floatRegister("g_cEyeOrigin") >= 0) {
+    s.eye = kEyeRefractShader;
+    s.irisU = refractU;
+  }
+  return s;
+}
+shader_tables::Cache<ModelShader> g_modelShaders; // render thread
+const ModelShader &modelShader(const Draw &d) {
+  static const ModelShader none;
+  const ModelShader *s = shader_tables::lookup(g_modelShaders, d.vertexShader, describeModelShader);
+  return s ? *s : none;
 }
 
 // Flexes (facial animation, common_vs_fxc.h ApplyMorph). Every model
@@ -1607,7 +2753,9 @@ void captureUi(const Draw &d) {
 // and NORMAL1 on stream 2. Without flexes that stream is a buffer of zeros
 // with stride 0; for a flexed strip group studiorender writes this frame's
 // deltas into a dynamic "flex mesh" and binds it there, and the vertex shader
-// adds delta * cFlexScale.x to the position and the normal before skinning.
+// adds delta * cFlexScale.x to the position and the normal before skinning
+// (c3 in GMod's and Half-Life 2 RTX's shaders, c13 in L4D2's: as the shader's
+// table says).
 // Returns that scale (0: nothing to add). A flex mesh whose deltas are all
 // zero (a face at rest) counts as none: the draw keeps its cached mesh.
 float flexScale(const Draw &d) {
@@ -1617,7 +2765,9 @@ float flexScale(const Draw &d) {
   const auto &s = d.streams[delta->Stream];
   if (!s.data || !s.stride)
     return 0;
-  const float scale = d.vsConstants[kRegFlexScale * 4];
+  const int named = modelShader(d).flexScale;
+  g_stats.flexAssumed += named < 0;
+  const float scale = d.vsConstants[(named >= 0 ? unsigned(named) : kRegFlexScale) * 4];
   if (!std::isfinite(scale) || scale == 0) {
     ++g_stats.flexUnscaled; // a flex stream with the switch off: not this build's register?
     return 0;
@@ -1638,7 +2788,12 @@ float flexScale(const Draw &d) {
 // Converts one indexed draw into a Remix mesh. Returns nullptr when the draw
 // cannot be represented yet.
 float g_liftVertexStep = 0; // added lift per vertex index (render thread; set by onDraw for decals)
-// `normalOffset` > 0 lifts the surface off its receiver (decals, see onDraw):
+float g_liftVertexCap = 0.3f; // at most this much of it
+// Forwarded vertex colours keep their hue only: each scaled so its largest
+// channel is full (render thread; set by onDraw for lit Lua meshes, whose
+// colours carry baked shading the path tracer replaces).
+bool g_hueColors = false;
+// `normalOffset` lifts the surface off its receiver (decals, see onDraw; below 0 lowers it):
 // along the vertex normals, or without them (DecalModulate's vertices are a
 // position and a texture coordinate) along the summed face normals, e1 x e2
 // times `faceNormalSign` (see faceNormalSign()). `usedFaceNormals`: which.
@@ -1653,12 +2808,22 @@ float g_liftVertexStep = 0; // added lift per vertex index (render thread; set b
 // `refresh`: new vertices for the mesh already registered under `hash`
 // (g_flexMeshes), or a plain create when there is none. `eyeScale`: the
 // projected coordinates are scaled by it about the texture's centre.
+uint64_t timedGeometryHash(const Draw &d) {
+  Timer timer(g_usGeometryHash);
+  ++g_geometryHashes;
+  return dxvk::geometryHash(d);
+}
+
 remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVertex, uint32_t *boneCount,
                               float normalOffset = 0, bool vertexColors = false, bool keepBlack = false,
                               float faceNormalSign = 1, bool *usedFaceNormals = nullptr, float flex = 0,
                               const float *eyeProjection = nullptr, bool refresh = false,
-                              float eyeScale = 1) {
+                              float eyeScale = 1, RefreshTopology *topology = nullptr) {
   Timer timer(g_usBuild, &g_totalUs[1]);
+  const BuildKind kind = std::exchange(g_buildKind, kBuildCached);
+  Timer kindTimer(g_usBuildKind[kind]);
+  g_buildCalls[kind].fetch_add(1, std::memory_order_relaxed);
+  g_buildVertices[kind].fetch_add(d.numVertices, std::memory_order_relaxed);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
   const auto *boneIndices = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0);
@@ -1671,6 +2836,107 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   const auto *flexNrm = flex != 0 ? findElement(d.elements, D3DDECLUSAGE_NORMAL, 1) : nullptr;
   uint32_t anyRgb = 0;
   const auto &ps = d.streams[pos->Stream];
+  // A refresh of the topology the last full build read: new positions,
+  // normals and texture coordinates only, decoded as below. Whatever else a
+  // build may change (lift, colours, projected or transformed coordinates)
+  // takes the full path.
+  // OPENREMIX_PROXY_VERTEX_UPDATES=0: every refresh in full (comparison).
+  static const auto updateVertices = [] {
+    char value[8] = {};
+    const bool off = GetEnvironmentVariableA("OPENREMIX_PROXY_VERTEX_UPDATES", value, sizeof(value)) && value[0] == '0';
+    return off ? nullptr
+               : reinterpret_cast<PFN_remixapi_UpdateMeshVerticesEXT>(
+                     GetProcAddress(game::runtimeModule(), "remixapi_UpdateMeshVerticesEXT"));
+  }();
+  const bool simple = refresh && topology && updateVertices && !eyeProjection && !g_ffGenerated && normalOffset == 0 &&
+                      !col && !g_ffUv && !g_screenUv;
+  if (simple && topology->matches(d, bonesPerVertex)) {
+    const uint32_t first = uint32_t(d.baseVertex) + d.minIndex + topology->low, count = topology->count;
+    auto fetch = [&](const D3DVERTEXELEMENT9 *e, uint32_t v, uint32_t bytes) -> const uint8_t * {
+      const auto &s = d.streams[e->Stream];
+      if (!s.data)
+        return nullptr;
+      const uint64_t at = uint64_t(s.offset) + uint64_t(first + v) * s.stride + e->Offset;
+      return at + bytes <= s.size ? s.data + at : nullptr;
+    };
+    const bool floatTex = tex && (tex->Type == D3DDECLTYPE_FLOAT2 || tex->Type == D3DDECLTYPE_FLOAT3 ||
+                                  tex->Type == D3DDECLTYPE_FLOAT4);
+    const bool normals = (nrm && (nrm->Type == D3DDECLTYPE_UBYTE4 || nrm->Type == D3DDECLTYPE_FLOAT3)) ||
+                         (flexNrm && flexNrm->Type == D3DDECLTYPE_FLOAT3);
+    static thread_local std::vector<float> positions, normalValues, texcoords;
+    positions.resize(size_t(count) * 3);
+    normalValues.assign(normals ? size_t(count) * 3 : 0, 0.0f);
+    texcoords.assign(floatTex ? size_t(count) * 2 : 0, 0.0f);
+    bool ok = true;
+    for (uint32_t v = 0; v < count && ok; ++v) {
+      float *out = &positions[size_t(v) * 3];
+      const uint8_t *p = fetch(pos, v, 12);
+      if (!p) {
+        ok = false;
+        break;
+      }
+      std::memcpy(out, p, 12);
+      if (flexPos)
+        if (const uint8_t *f = fetch(flexPos, v, 12)) {
+          float delta[3];
+          std::memcpy(delta, f, 12);
+          for (int j = 0; j < 3; ++j)
+            out[j] += delta[j] * flex;
+        }
+      ok = std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+      if (floatTex) {
+        float *uv = &texcoords[size_t(v) * 2];
+        if (const uint8_t *t = fetch(tex, v, 8))
+          std::memcpy(uv, t, 8);
+        if (!std::isfinite(uv[0]) || !std::isfinite(uv[1]))
+          uv[0] = uv[1] = 0;
+      }
+      if (normals) {
+        float *n = &normalValues[size_t(v) * 3];
+        if (nrm && nrm->Type == D3DDECLTYPE_UBYTE4) {
+          if (const uint8_t *e = fetch(nrm, v, 4))
+            unpackNormalUByte4(e, n);
+        } else if (nrm && nrm->Type == D3DDECLTYPE_FLOAT3) {
+          if (const uint8_t *e = fetch(nrm, v, 12))
+            std::memcpy(n, e, 12);
+          if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2]))
+            n[0] = n[1] = n[2] = 0;
+        }
+        if (flexNrm && flexNrm->Type == D3DDECLTYPE_FLOAT3)
+          if (const uint8_t *f = fetch(flexNrm, v, 12)) {
+            float delta[3], m[3];
+            std::memcpy(delta, f, 12);
+            for (int j = 0; j < 3; ++j)
+              m[j] = n[j] + delta[j] * flex;
+            const float len = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+            if (std::isfinite(len) && len > 1e-6f)
+              for (int j = 0; j < 3; ++j)
+                n[j] = m[j] / len;
+          }
+      }
+    }
+    if (!ok) {
+      ++g_stats.nonFinite;
+      return nullptr;
+    }
+    const remixapi_MeshHandle handle = topology->handle;
+    const remixapi_MeshVerticesEXT update = {0, count, positions.data(), normals ? normalValues.data() : nullptr,
+                                             floatTex ? texcoords.data() : nullptr};
+    remixapi_ErrorCode result;
+    {
+      Timer createTimer(g_usCreateMesh);
+      result = updateVertices(handle, 1, &update);
+    }
+    if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+      ++g_vertexUpdates;
+      if (boneCount)
+        *boneCount = topology->boneCount;
+      return handle;
+    }
+    // Refused (the mesh was replaced meanwhile): rebuilt in full below.
+    ++g_vertexUpdatesRefused;
+    topology->valid = false;
+  }
 
   std::vector<uint32_t> indices;
   auto index = [&](uint32_t i, uint32_t &out) {
@@ -1755,6 +3021,21 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         std::memcpy(out.texcoord, t, 8);
       if (!std::isfinite(out.texcoord[0]) || !std::isfinite(out.texcoord[1]))
         out.texcoord[0] = out.texcoord[1] = 0;
+      if (g_ffUv) { // a fixed-function texture transform
+        const float u = out.texcoord[0], v = out.texcoord[1];
+        out.texcoord[0] = g_ffUv[0] * u + g_ffUv[1] * v + g_ffUv[3];
+        out.texcoord[1] = g_ffUv[4] * u + g_ffUv[5] * v + g_ffUv[7];
+      }
+      if (g_screenUv) {
+        const float u = out.texcoord[0], v = out.texcoord[1];
+        out.texcoord[0] = g_screenUv[0] * u + g_screenUv[1] * v + g_screenUv[3];
+        out.texcoord[1] = g_screenUv[4] * u + g_screenUv[5] * v + g_screenUv[7];
+        const float values[4] = {u, v, out.texcoord[0], out.texcoord[1]};
+        for (int k = 0; k < 4; ++k) {
+          g_screenUvRange[2 * k] = std::min(g_screenUvRange[2 * k], values[k]);
+          g_screenUvRange[2 * k + 1] = std::max(g_screenUvRange[2 * k + 1], values[k]);
+        }
+      }
     }
     if (nrm && nrm->Type == D3DDECLTYPE_UBYTE4) {
       if (const uint8_t *n = fetch(nrm, v, 4))
@@ -1780,6 +3061,12 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     if (col)
       if (const uint8_t *c = fetch(col, v, 4)) { // D3DCOLOR in memory, the runtime's layout
         std::memcpy(&out.color, c, 4);
+        if (g_hueColors) {
+          const uint32_t r = (out.color >> 16) & 255, g = (out.color >> 8) & 255, b = out.color & 255;
+          const uint32_t top = std::max({r, g, b});
+          out.color = top ? (out.color & 0xff000000u) | (r * 255 / top) << 16 | (g * 255 / top) << 8 | b * 255 / top
+                          : out.color | 0xffffff;
+        }
         anyRgb |= out.color & 0xffffff;
       }
   }
@@ -1799,7 +3086,47 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     weights.resize(size_t(count) * bonesPerVertex);
     bones.resize(weights.size());
     for (uint32_t v = 0; v < count; ++v) {
-      const uint8_t *bi = fetch(boneIndices, v, 4);
+      const uint8_t *bi = boneIndices ? fetch(boneIndices, v, 4) : nullptr;
+      if (g_ffBlend != ff::kBlendNone) {
+        // D3D's vertex blending (fixed_function.h): the stored weights the
+        // element has (missing ones 0), the last of D3D's matrices 1 minus
+        // their sum; bonesPerVertex of them, summing to one.
+        float stored[4] = {};
+        const int components = boneWeights && boneWeights->Type <= D3DDECLTYPE_FLOAT4 ? boneWeights->Type + 1 : 0;
+        if (components)
+          if (const uint8_t *bw = fetch(boneWeights, v, uint32_t(components) * 4))
+            std::memcpy(stored, bw, size_t(components) * 4);
+        float w[4] = {}, last = 1;
+        const uint32_t matrices = std::clamp<uint32_t>(g_ffMatrices, 1, 4);
+        for (uint32_t k = 0; k + 1 < matrices; ++k) {
+          w[k] = std::isfinite(stored[k]) ? stored[k] : 0;
+          last -= w[k];
+        }
+        w[matrices - 1] = last;
+        // Four matrices (D3DVBF_3WEIGHTS) for three bones: the three that
+        // weigh most (a two-weight layout leaves the third at 0).
+        uint32_t order[4] = {0, 1, 2, 3};
+        if (matrices > bonesPerVertex)
+          std::stable_sort(order, order + matrices, [&](uint32_t a, uint32_t b) { return w[a] > w[b]; });
+        float sum = 0;
+        for (uint32_t k = 0; k < bonesPerVertex; ++k)
+          sum += w[order[k]] = std::clamp(w[order[k]], 0.0f, 1.0f);
+        static const int kColorOrder[4] = {2, 1, 0, 3}; // D3DCOLOR's R, G, B, A in memory
+        for (uint32_t j = 0; j < bonesPerVertex; ++j) {
+          const uint32_t k = order[j];
+          const uint32_t bone = g_ffBlend == ff::kBlendNonIndexed ? k
+                                : !bi                             ? 0
+                                : g_ffBlend == ff::kBlendIndexedColor ? bi[kColorOrder[k]]
+                                                                      : bi[k];
+          const float weight = sum > 0 ? w[k] / sum : (j == 0 ? 1.0f : 0.0f);
+          weights[size_t(v) * bonesPerVertex + j] = weight;
+          bones[size_t(v) * bonesPerVertex + j] = bone;
+          maxBone = std::max(maxBone, bone);
+          if (weight > 0)
+            maxWeightedBone = std::max(maxWeightedBone, bone);
+        }
+        continue;
+      }
       float stored[2] = {1, 0};
       if (boneWeights && boneWeights->Type == D3DDECLTYPE_FLOAT2) {
         if (const uint8_t *bw = fetch(boneWeights, v, 8))
@@ -1821,13 +3148,10 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         w[1] = stored[1];
         w[2] = 1 - stored[0] - stored[1];
       }
-      // A stored weight can round slightly below zero (1.0 and -0.00003, the
-      // implied one then +0.00003); the runtime rejects negatives. Clamped,
-      // the weights are scaled back to a sum of one: a sum of 1.00003 scales
-      // the bone matrices' translation too, which far from the map's origin
-      // (12800 units) put the vertex 0.4 units out, apart from its neighbour
-      // in a draw placed exactly (cracks along faces, whose flexed parts the
-      // engine skins on the CPU and draws rigid).
+      // The implied weight can round slightly below zero, which the runtime
+      // rejects; clamped, the weights then summed above one and scaled the
+      // vertex about the world origin (a face drifting off its head the
+      // further a character stood from the origin). They sum to one again.
       // Slots naming one bone are one weight (summed first, so 1.0, -0.00003
       // and +0.00003 on one bone are exactly 1): a vertex on a single bone is
       // then exactly that bone's matrix times its position, as in a draw
@@ -1840,10 +3164,8 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
             break;
           }
       float sum = 0;
-      for (uint32_t k = 0; k < bonesPerVertex; ++k) {
-        w[k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
-        sum += w[k];
-      }
+      for (uint32_t k = 0; k < bonesPerVertex; ++k)
+        sum += w[k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
       for (uint32_t k = 0; k < bonesPerVertex; ++k)
         w[k] = sum > 0 ? w[k] / sum : (k == 0 ? 1.0f : 0.0f);
       for (uint32_t k = 0; k < bonesPerVertex; ++k) {
@@ -1855,7 +3177,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
           maxWeightedBone = std::max(maxWeightedBone, bone);
       }
     }
-    if (maxBone >= kMaxBones) {
+    if (maxBone >= boneLimit()) {
       ++g_stats.badRange;
       return nullptr;
     }
@@ -1865,8 +3187,10 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   // position, u = dot(c50, (world, 1)), v = dot(c51, (world, 1)), which
   // studiorender aims along the eyeball's gaze every frame. The world position
   // is this bind-pose vertex moved by its bones, as the runtime will skin it.
+  if (!eyeProjection && g_ffGenerated) // fixed-function coordinates generated from the position
+    eyeProjection = g_ffGenerated;
   if (eyeProjection) {
-    const float *model = d.vsConstants + kRegModel * 4;
+    const float *model = boneRows(d);
     for (uint32_t v = 0; v < count; ++v) {
       const float *p = vertices[v].position;
       float world[3] = {0, 0, 0};
@@ -1899,7 +3223,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     else if (along < 0)
       ++g_stats.windingAgainst;
   }
-  if (normalOffset > 0) {
+  if (normalOffset != 0) {
     // Vertex normal where present, else the summed face normals.
     bool anyFace = false;
     std::vector<float> faces(vertices.size() * 3, 0.0f);
@@ -1922,7 +3246,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       anyFace |= !(vlen > 1e-6f);
       if (len > 1e-12f)
         for (int j = 0; j < 3; ++j)
-          vertices[v].position[j] += n[j] / len * (normalOffset + std::min(float(v) * g_liftVertexStep, 0.3f)) * sign;
+          vertices[v].position[j] += n[j] / len * (normalOffset + std::min(float(v) * g_liftVertexStep, g_liftVertexCap)) * sign;
     }
     if (usedFaceNormals)
       *usedFaceNormals = anyFace;
@@ -1960,11 +3284,22 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   if (refresh)
     info.pNext = &deform;
   remixapi_MeshHandle handle = nullptr;
-  if (g_api.CreateMesh(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
+  remixapi_ErrorCode created;
+  {
+    Timer createTimer(g_usCreateMesh);
+    created = g_api.CreateMesh(&info, &handle);
+  }
+  if (created != REMIXAPI_ERROR_CODE_SUCCESS) {
     ++g_stats.rejected;
     return nullptr;
   }
   ++g_stats.created;
+  if (topology) {
+    *topology = {};
+    if (simple)
+      *topology = {handle, d.indices.buffer, d.declaration, d.indices.version, d.startIndex, d.primCount, d.minIndex,
+                   uint32_t(d.type), bonesPerVertex, low, count, boneCount ? *boneCount : 0, true};
+  }
   return handle;
 }
 
@@ -1981,6 +3316,190 @@ remixapi_ErrorCode g_modsResult = REMIXAPI_ERROR_CODE_FEATURE_UNAVAILABLE;
 // first pixel shader registers (effect parameters).
 int g_dumpFlatFrames = 0;   // render thread
 FILE *g_dumpFlat = nullptr; // render thread
+// Dev aid: bin/shaderapi_proxy_material.request names a texture ("hunter/
+// myplastic"); the next draws of it are described in bin/material_probe.txt:
+// the material bound, the shading taken and its PBR conversion.
+struct MaterialProbe {
+  std::vector<uint64_t> hashes;
+  std::string name;
+  uint32_t left = 0;
+} g_materialProbe; // render thread
+void serviceMaterialProbeRequest() {
+  if (g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_material.request";
+  FILE *f = _wfopen(request.c_str(), L"r");
+  if (!f)
+    return;
+  char line[256] = {};
+  if (!fgets(line, sizeof(line), f))
+    line[0] = 0;
+  fclose(f);
+  DeleteFileW(request.c_str());
+  std::string name = line;
+  while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+    name.pop_back();
+  g_materialProbe.name = name;
+  g_materialProbe.hashes = bsp::textureCandidates(name);
+  g_materialProbe.left = 64;
+  if (FILE *out = _wfopen((g_moduleDir + L"\\material_probe.txt").c_str(), L"w")) {
+    fprintf(out, "== %s: %zu candidate hashes, from frame %llu\n", name.c_str(), g_materialProbe.hashes.size(),
+            static_cast<unsigned long long>(g_frame));
+    fclose(out);
+  }
+}
+void probeMaterialDraw(const void *texture, const engine_materials::Shading &bound, const engine_materials::Shading &taken,
+                       bool additive, bool multiply) {
+  if (!g_materialProbe.left || !texture)
+    return;
+  const uint64_t hash = textureHash(texture);
+  const auto &h = g_materialProbe.hashes;
+  if (std::find(h.begin(), h.end(), hash) == h.end())
+    return;
+  --g_materialProbe.left;
+  FILE *out = _wfopen((g_moduleDir + L"\\material_probe.txt").c_str(), L"a");
+  if (!out)
+    return;
+  // As read, whatever reaches the draw (the x86 games: OPENREMIX_PROXY_MATERIALS).
+  const auto &b = engine_materials::boundRead();
+  fprintf(out, "f%llu texture %016llX | bound %s (%s, flags %08X) base %s pbr %d | taken mode %d base %s pbr %d normal %s rough %s ch %u bias %g scale %g, roughness %g | metal %s ch %u inv %d bias %g scale %g, metallic %g, colour %d (%g %g %g)%s%s\n",
+          static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(hash), engine_materials::nameRead(),
+          b.known ? b.shader : "?", unsigned(b.flags), bound.base.c_str(), int(bound.pbr.active), int(taken.mode),
+          taken.base.c_str(), int(taken.pbr.active), taken.pbr.normal.c_str(), taken.pbr.maps[0].texture.c_str(),
+          taken.pbr.maps[0].channel, taken.pbr.maps[0].bias, taken.pbr.maps[0].scale, taken.pbr.roughness,
+          taken.pbr.maps[1].texture.c_str(), taken.pbr.maps[1].channel, int(taken.pbr.maps[1].invert),
+          taken.pbr.maps[1].bias, taken.pbr.maps[1].scale, taken.pbr.metallic, int(taken.pbr.metalColored),
+          taken.pbr.metalColor[0], taken.pbr.metalColor[1], taken.pbr.metalColor[2], additive ? " additive" : "",
+          multiply ? " multiply" : "");
+  fclose(out);
+}
+
+// Dev aid: bin/shaderapi_proxy_shader.request names a shader
+// ("shatteredglass"); its next 64 draws are described in bin/shader_probe.txt:
+// the material, its $basetexture as bound (after material proxies), each
+// sampler's texture (hash; whether the runtime has it), blending and the
+// shading taken.
+struct ShaderProbe {
+  std::string shader;
+  std::string material; // after a space in the request: a part of the material's name the draws must have
+  uint32_t left = 0;
+} g_shaderProbe; // render thread
+void serviceShaderProbeRequest() {
+  if (g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_shader.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  std::string name;
+  if (FILE *in = _wfopen(request.c_str(), L"r")) {
+    char line[256] = {};
+    if (std::fgets(line, sizeof(line), in))
+      name = line;
+    fclose(in);
+  }
+  DeleteFileW(request.c_str());
+  while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back())))
+    name.pop_back();
+  for (char &c : name)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  const size_t space = name.find(' ');
+  g_shaderProbe.shader = name.substr(0, space);
+  g_shaderProbe.material = space == std::string::npos ? std::string() : name.substr(space + 1);
+  g_shaderProbe.left = name.empty() ? 0 : g_shaderProbe.material.empty() ? 64 : 256;
+  if (FILE *out = _wfopen((g_moduleDir + L"\\shader_probe.txt").c_str(), L"w")) {
+    fprintf(out, "== shader %s, from frame %llu\n", name.c_str(), static_cast<unsigned long long>(g_frame));
+    fclose(out);
+  }
+}
+void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
+  if (!g_shaderProbe.left)
+    return;
+  // As read, whatever reaches the draw (the x86 games: OPENREMIX_PROXY_MATERIALS).
+  const auto &b = engine_materials::boundRead();
+  if (!b.known)
+    return;
+  std::string shader = b.shader;
+  for (char &c : shader)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  if (shader.rfind(g_shaderProbe.shader, 0) != 0)
+    return;
+  if (!g_shaderProbe.material.empty()) {
+    std::string material = engine_materials::nameRead();
+    for (char &c : material)
+      c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (material.find(g_shaderProbe.material) == std::string::npos)
+      return;
+  }
+  --g_shaderProbe.left;
+  FILE *out = _wfopen((g_moduleDir + L"\\shader_probe.txt").c_str(), L"a");
+  if (!out)
+    return;
+  fprintf(out, "f%llu %s (%s, translucent %d alphaTest %d) base \"%s\" | blend %d %u/%u alphaTest %d | taken mode %d base \"%s\" | verts %u prims %u\n",
+          static_cast<unsigned long long>(g_frame), engine_materials::nameRead(), b.shader, int(b.translucent),
+          int(b.alphaTest), engine_materials::currentRead().base.c_str(), int(d.blend), d.srcBlend, d.dstBlend, int(d.alphaTest),
+          int(taken.mode), taken.base.c_str(), d.numVertices, d.primCount);
+  if (d.psConstants) {
+    fprintf(out, "   ps");
+    for (int r = 0; r < 4; ++r)
+      fprintf(out, " c%d=(%.3g %.3g %.3g %.3g)", r, d.psConstants[r * 4], d.psConstants[r * 4 + 1],
+              d.psConstants[r * 4 + 2], d.psConstants[r * 4 + 3]);
+    fprintf(out, "\n");
+  }
+  // Skinning: dynamic buffers (rewritten per draw: per-frame meshes), bones,
+  // flex, the first vertex's position and bone 0's translation.
+  {
+    const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+    float p[3] = {};
+    if (pos && pos->Stream < 4 && pos->Type == D3DDECLTYPE_FLOAT3) {
+      const auto &st = d.streams[pos->Stream];
+      const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * st.stride + pos->Offset;
+      if (st.data && at + 12 <= st.size)
+        std::memcpy(p, st.data + at, 12);
+    }
+    const float *bone = d.vsConstants + kRegModel * 4;
+    // The first vertex in world space by its first bone (as a one-weight draw is skinned).
+    float world[3] = {p[0], p[1], p[2]};
+    if (currentNumBones() > 0)
+      if (const auto *bi = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0); bi && bi->Stream < 4) {
+        const auto &st = d.streams[bi->Stream];
+        const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * st.stride + bi->Offset;
+        if (st.data && at + 4 <= st.size && st.data[at] < 53) {
+          const float *m = d.vsConstants + (kRegModel + 3 * st.data[at]) * 4;
+          for (int r = 0; r < 3; ++r)
+            world[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+        }
+      }
+    fprintf(out, "   vb dynamic %d ib dynamic %d | bones %d skinned decl %d flex %g | vertex0 %.3f %.3f %.3f | world0 %.3f %.3f %.3f | bone0 t %.3f %.3f %.3f\n",
+            pos && pos->Stream < 4 ? int(d.streams[pos->Stream].dynamic) : -1, int(d.indices.dynamic),
+            currentNumBones(), int(findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr), flexScale(d),
+            p[0], p[1], p[2], world[0], world[1], world[2], bone[3], bone[7], bone[11]);
+  }
+  // The vertex layout, and the first vertex's texture coordinates.
+  if (d.elements) {
+    fprintf(out, "   elements:");
+    for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff; ++e) {
+      fprintf(out, " s%u+%u u%u.%u t%u", e->Stream, e->Offset, e->Usage, e->UsageIndex, e->Type);
+      const auto &st = d.streams[e->Stream < 4 ? e->Stream : 0];
+      const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * st.stride + e->Offset;
+      if (e->Usage == D3DDECLUSAGE_TEXCOORD && e->Stream < 4 && st.data && e->Type <= D3DDECLTYPE_FLOAT4 &&
+          at + (e->Type + 1) * 4 <= st.size) {
+        float v[4] = {};
+        std::memcpy(v, st.data + at, (e->Type + 1) * 4);
+        fprintf(out, "=(%.3g %.3g %.3g %.3g)", v[0], v[1], v[2], v[3]);
+      }
+    }
+    fprintf(out, "\n");
+  }
+  for (int s = 0; s < 8; ++s)
+    if (d.stageTextures[s]) {
+      const uint64_t hash = textureHash(d.stageTextures[s]);
+      std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+      fprintf(out, "   s%d %p hash %016llX%s\n", s, d.stageTextures[s], static_cast<unsigned long long>(hash),
+              hash && uploadedTextureHash(hash) ? " (runtime has it)" : hash ? "" : " (no upload seen)");
+    }
+  fclose(out);
+}
+
 void serviceFlatDumpRequest() {
   if (g_dumpFlatFrames) {
     if (--g_dumpFlatFrames == 0 && g_dumpFlat) {
@@ -1994,11 +3513,26 @@ void serviceFlatDumpRequest() {
   const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_flat.request";
   if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
     return;
+#if defined(PROXY_GAME_EZ2)
+  int requestedFrames = 300;
+  if (FILE *rf = _wfopen(request.c_str(), L"r")) {
+    int val = 0;
+    if (fscanf(rf, "%d", &val) == 1 && val > 0)
+      requestedFrames = val;
+    fclose(rf);
+  }
+  DeleteFileW(request.c_str());
+  g_dumpFlat = _wfopen((g_moduleDir + L"\\shaderapi_proxy_flat.txt").c_str(), L"a");
+  if (g_dumpFlat) {
+    fprintf(g_dumpFlat, "== frames from %llu (dumping %d frames)\n", (unsigned long long)g_frame, requestedFrames);
+    g_dumpFlatFrames = requestedFrames;
+#else
   DeleteFileW(request.c_str());
   g_dumpFlat = _wfopen((g_moduleDir + L"\\shaderapi_proxy_flat.txt").c_str(), L"a");
   if (g_dumpFlat) {
     fprintf(g_dumpFlat, "== frames from %llu\n", (unsigned long long)g_frame);
     g_dumpFlatFrames = 3;
+#endif
   }
 }
 void dumpFlat(const Draw &d) {
@@ -2028,15 +3562,19 @@ void dumpFlat(const Draw &d) {
         std::memcpy(&color, s.data + at + col->Offset, 4);
     }
   }
-  const auto &b = engine_materials::bound();
+  const auto &b = engine_materials::boundRead(); // as read (the x86 games: whatever OPENREMIX_PROXY_MATERIALS says)
   fprintf(g_dumpFlat,
           "f%llu %s [%s] tex0=%p%s%s tex1=%p blend=%d %u/%u op%u sep=%d write=%x alphaTest=%d stencil=%d z=%d prim=%u verts=%u "
           "color(argb)=%08x bounds=%.0f,%.0f-%.0f,%.0f target=%ux%u main=%d",
-          (unsigned long long)g_frame, engine_materials::currentName(), b.known ? b.shader : "?", d.texture0,
+          (unsigned long long)g_frame, engine_materials::nameRead(), b.known ? b.shader : "?", d.texture0,
           d.texture0Target ? "(target)" : "", d.texture0 && !uiTextureFor(d.texture0) ? "(no ui)" : "", d.texture1,
           int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.separateAlpha), d.colorWrite, int(d.alphaTest),
           int(d.stencil), int(d.depthTest), d.primCount, d.numVertices, color, x0, y0, x1, y1, d.targetWidth,
           d.targetHeight, int(d.mainTarget));
+  if (d.stencil)
+    fprintf(g_dumpFlat, " stencil func %u ref %u mask %x write %x pass %u fail %u", unsigned(d.stencilFunc),
+            unsigned(d.stencilRef), unsigned(d.stencilMask), unsigned(d.stencilWriteMask), unsigned(d.stencilPass),
+            unsigned(d.stencilFail));
   if (d.psConstants) {
     fprintf(g_dumpFlat, " ps:");
     for (int r = 0; r < 8; ++r)
@@ -2050,12 +3588,12 @@ void serviceScreenshotRequest() {
   // Checked every 16th frame: a file system call per frame shows in profiles.
   if (g_frame % 16)
     return;
-  // Dev aid: shaderapi_proxy_ui.request toggles the developer panel as F12
-  // does (posted to the window, whose thread owns the panel's input).
+  // Dev aid: shaderapi_proxy_ui.request toggles the developer panel (posted to
+  // the window, whose thread owns the panel's input).
   const std::wstring ui = g_moduleDir + L"\\shaderapi_proxy_ui.request";
   if (GetFileAttributesW(ui.c_str()) != INVALID_FILE_ATTRIBUTES) {
     DeleteFileW(ui.c_str());
-    PostMessageW(g_gameWindow, WM_KEYUP, VK_F12, 0);
+    PostMessageW(g_gameWindow, remix_ui::kToggleMessage, 0, 0);
   }
   const std::wstring request = g_moduleDir + L"\\remix_screenshot.request";
   if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
@@ -2083,16 +3621,17 @@ bool startRemix() {
   GetModuleFileNameW(self, path, MAX_PATH);
   std::wstring dll = path;
   g_moduleDir = dll.substr(0, dll.find_last_of(L"\\/"));
-  // OpenRemix runs in process (GMod is x64): bin/win64/openremix/remix.dll,
+  // GMod: OpenRemix runs in process (x64), bin/win64/openremix/remix.dll,
   // its dependencies (SDL3, OpenUSD, DLSS) resolved from that directory.
-  dll = g_moduleDir + L"\\openremix\\remix.dll";
-  diag::stage("OpenRemix: loading openremix\\remix.dll");
+  // L4D2, Half-Life 2 RTX: the bridge client beside the proxy (game.h).
+  dll = g_moduleDir + game::kRuntimePath;
+  diag::stage("OpenRemix: loading %s", game::kRuntimeLabel);
   if (!LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
     // 126: the file or one of the DLLs it needs is missing; 193: wrong architecture.
-    diag::stage("OpenRemix: FAILED to load remix.dll (error %lu)", GetLastError());
+    diag::stage("OpenRemix: FAILED to load %s (error %lu)", game::kRuntimeName, GetLastError());
     return false;
   }
-  diag::stage("OpenRemix: remix.dll loaded, initializing the API");
+  diag::stage("OpenRemix: %s loaded, initializing the API", game::kRuntimeName);
   remixapi_HMODULE lib = nullptr;
   if (const auto status = remixapi_lib_loadRemixDllAndInitialize(dll.c_str(), &g_api, &lib);
       status != REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -2125,7 +3664,7 @@ bool startRemix() {
       strcat(mods, "\\rtx-remix\\mods");
     }
     auto configure = reinterpret_cast<decltype(&remixapi_ConfigureUSDModsEXT)>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_ConfigureUSDModsEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_ConfigureUSDModsEXT"));
     if (configure && std::strcmp(mods, "0") != 0) {
       remixapi_USDModsOptionsEXT options = {};
       options.structSize = sizeof(options);
@@ -2152,7 +3691,7 @@ bool startRemix() {
   // undo it: ReSTIR DI came back on). An older runtime without it takes them
   // as plain settings.
   static const auto configDefault = reinterpret_cast<PFN_remixapi_SetConfigDefaultEXT>(
-      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_SetConfigDefaultEXT")));
+      reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_SetConfigDefaultEXT")));
   auto setDefault = [](const char *key, const char *value) {
     if (!configDefault || configDefault(key, value) != REMIXAPI_ERROR_CODE_SUCCESS)
       g_api.SetConfigVariable(key, value);
@@ -2164,16 +3703,9 @@ bool startRemix() {
   // thresholds tuned for meter-scale scenes; with Source's light intensities
   // nearly every pixel takes the maximum 4 shadow rays (~10 ms on c8m1).
   setDefault("rtx.native.pathtrace.adaptiveLocalSampling", "0");
-  // Hundreds of mod lights, mostly behind walls, would otherwise take most
-  // samples from a nearby flashlight: RIS over 4 candidates weighs their
-  // unshadowed contributions (spot cones included) before the shadow ray.
-  setDefault("rtx.native.pathtrace.sphereCandidates", "4");
   // Source units are inches: the runtime converts its meter-based defaults
   // (denoiser hit distances, visibility-guiding cells) with the scene scale.
   setDefault("rtx.native.pathtrace.sceneScale", "0.0254");
-  // Hundreds of mod lights, mostly behind walls: reservoir reuse (ReSTIR DI)
-  // keeps the visible samples instead of re-drawing from the light tree.
-  setDefault("rtx.native.pathtrace.restir", "1");
   // Static world brushes (onPresent) would otherwise make every ray traverse
   // a static and a dynamic acceleration structure.
   setDefault("rtx.native.pathtrace.combinedTlas", "1");
@@ -2182,6 +3714,10 @@ bool startRemix() {
   // The view model is path-traced in front of the scene (see the cameras in
   // onPresent).
   setDefault("rtx.native.pathtrace.viewModel", "1");
+#if defined(PROXY_GAME_EZ2)
+  // The game's screen-space passes (host_passes.cpp): its night vision is one.
+  setDefault("rtx.native.hostPasses", "1");
+#endif
   // OPENREMIX_PROXY_CONFIG="key=value;key=value": runtime settings at startup.
   char config[2048] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_CONFIG", config, sizeof(config))) {
@@ -2216,7 +3752,8 @@ bool viewMatrices(float view[16], float projection[16]) {
 }
 
 bool isSkyDraw(const Draw &d) {
-  return g_ready && g_worldLists > 0 && d.mainTarget && !d.blend && d.streams[0].dynamic && d.colorWrite;
+  return g_ready && g_worldLists > 0 && g_portalWorldLists == 0 && d.mainTarget && !d.blend && d.streams[0].dynamic &&
+         d.colorWrite;
 }
 
 // --- Sky dome ----------------------------------------------------------------
@@ -2675,6 +4212,29 @@ struct ParticleRow {
 };
 std::unordered_map<uint64_t, ParticleRow> g_particleRows; // per interval; under g_transientSampleLock
 std::unordered_set<uint64_t> g_particlesDumped;           // under g_transientSampleLock
+#if defined(PROXY_GAME_EZ2)
+// OPENREMIX_PROXY_DUMP_PARTICLES=1, or bin/shaderapi_proxy_particles.request
+// (in a running game: starts bin/particles.txt over). Render thread.
+bool g_dumpParticles = [] {
+  char v[8] = {};
+  return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_PARTICLES", v, sizeof(v)) && v[0] == '1';
+}();
+bool g_particlesTruncate = true;
+// Where the last particle draw's material came from (the dump).
+const char *g_particleSource = "";
+void serviceParticleDumpRequest() {
+  if (g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_particles.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  DeleteFileW(request.c_str());
+  std::lock_guard<std::mutex> lock(g_transientSampleLock);
+  g_particlesDumped.clear();
+  g_particlesTruncate = true;
+  g_dumpParticles = true;
+}
+#endif
 struct ParticleLeft {
   std::string shader;
   uint32_t draws = 0, srcBlend = 0, dstBlend = 0;
@@ -2684,7 +4244,10 @@ struct ParticleLeft {
 std::map<std::string, ParticleLeft> g_particlesLeft;
 std::atomic<uint32_t> g_usParticles{0};
 
+#if defined(PROXY_GAME_EZ2)
+#else
 bool nameStarts(const char *name, const char *prefix) { return _strnicmp(name, prefix, std::strlen(prefix)) == 0; }
+#endif
 
 bool particlesEnabled() {
   static const bool enabled = [] {
@@ -2696,6 +4259,10 @@ bool particlesEnabled() {
 
 // The material lies in one of the particle directories.
 bool particleMaterialPath(const char *material) {
+#if defined(PROXY_GAME_EZ2)
+  if (nameStarts(material, "materials/") || nameStarts(material, "materials\\"))
+    material += 10;
+#endif
   static const std::vector<std::string> prefixes = [] {
     std::vector<std::string> list = {"particle/", "particles/", "effects/", "sprites/", "trails/"};
     char extra[1024] = {};
@@ -2709,8 +4276,16 @@ bool particleMaterialPath(const char *material) {
       }
     return list;
   }();
+#if defined(PROXY_GAME_EZ2)
+  std::string norm = material;
+  for (char &c : norm)
+    c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+  for (const auto &prefix : prefixes)
+    if (norm.compare(0, prefix.size(), prefix) == 0)
+#else
   for (const auto &prefix : prefixes)
     if (std::strncmp(material, prefix.c_str(), prefix.size()) == 0)
+#endif
       return true;
   return false;
 }
@@ -2813,11 +4388,34 @@ void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, con
                       uint32_t spriteFlags, const float *spriteSoft, bool softConfirmed,
                       const particles::SpriteVertex *sprites, const vsprog::Stream *streams, uint32_t first, uint32_t count, const particles::Vertex *expanded,
                       const particles::Result *result) {
+#if defined(PROXY_GAME_EZ2)
+  bool &truncate = g_particlesTruncate;
+#else
   static bool truncate = true;
+#endif
   FILE *f = _wfopen((g_moduleDir + L"\\particles.txt").c_str(), truncate ? L"w" : L"a");
   truncate = false;
   if (!f)
     return;
+#if defined(PROXY_GAME_EZ2)
+  {
+    // Sampler 0's texture as the proxy holds it, and what the material came from.
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    const auto t = d.texture0 ? g_textures.find(d.texture0) : g_textures.end();
+    const auto p = d.texture0 ? g_pendingTextures.find(d.texture0) : g_pendingTextures.end();
+    fprintf(f, "-- frame %llu texture0 %p: ", static_cast<unsigned long long>(g_frame), d.texture0);
+    if (t != g_textures.end())
+      fprintf(f, "uploaded, hash %016llX, runtime texture %s, %ld holders", static_cast<unsigned long long>(t->second->hash),
+              t->second->texture ? "created" : "none", long(t->second.use_count()));
+    else
+      fprintf(f, "no upload");
+    if (p != g_pendingTextures.end())
+      fprintf(f, " | pending %ux%u format %u, %u levels, level 0 %d", p->second.width, p->second.height,
+              unsigned(p->second.format), p->second.levels, int(p->second.levelZero));
+    fprintf(f, " | CPU copy %d | material from %s\n", int(d.texture0 && g_cpuTextures.count(d.texture0)),
+            g_particleSource);
+  }
+#endif
   const engine_materials::Bound &bound = engine_materials::bound();
   fprintf(f, "== %s | material %s shader %s flags %08X%s\n", kParticleKindNames[kind], engine_materials::currentName(),
           bound.shader, unsigned(bound.flags), bound.known ? "" : " (not read)");
@@ -2953,10 +4551,14 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
   Timer timer(g_usParticles);
   using engine_materials::Shading;
   const engine_materials::Bound &bound = engine_materials::bound();
+#if defined(PROXY_GAME_EZ2)
+  const bool dumpAll = g_dumpParticles;
+#else
   static const bool dumpAll = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_PARTICLES", v, sizeof(v)) && v[0] == '1';
   }();
+#endif
   static const bool traceBlended = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_PARTICLES_TRACED", v, sizeof(v)) && v[0] == '1';
@@ -3053,6 +4655,13 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
         if (parameter("$maxlumframeblend2", 0) != 0)
           spriteFlags |= REMIXAPI_SPRITE_SEQUENCE_MAX_LUMINANCE_EXT;
       }
+    }
+#if defined(PROXY_GAME_EZ2)
+    // UnlitGeneric takes $depthblend too (Entropy : Zero 2's impact dust).
+    if ((spritecard || nameStarts(bound.shader, "unlitgeneric")) && overlay) {
+#else
+    if (spritecard && overlay) {
+#endif
       // Soft particles. The pixel shader computes, on projected z over the
       // range it keeps in the frame buffer's alpha (c29.w = 1 / 192),
       //   saturate(max(smoothstep(0.75, 1, scene c29.w), |scene - z| c29.w c2.x))
@@ -3220,7 +4829,7 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     Instance inst;
     inst.mesh = mesh;
     inst.texture0 = d.texture0;
-    if (d.texture0Target)
+    if (d.texture0Target && screenSlot(d.texture0) < 0)
       d3d::requestTargetContents(d.texture0);
     inst.blend = blendState(d);
     if (premultiplied) { // see above: the alpha factor moves from the shader to the blend
@@ -3234,14 +4843,51 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     inst.blend.textureAlphaOperation = 3;
     inst.blend.textureAlphaArg1Source = 1;
     inst.blend.textureAlphaArg2Source = 2;
+    const bool nearest = isPointSampler(d.samplerStates, 0);
+#if defined(PROXY_GAME_EZ2)
+    Shading shading;
+    if (traced) {
+#else
     if (traced) {
       Shading shading;
+#endif
       shading.mode = Shading::Unlit;
       shading.vertexColor = shading.vertexAlpha = true;
-      inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+      inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest) : nullptr;
     } else {
-      inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+      inst.material = d.texture0 ? materialFor(d.texture0, 0, nearest) : nullptr;
       inst.rasterOnly = true;
+#if defined(PROXY_GAME_EZ2)
+    }
+    g_particleSource = inst.material ? "sampler 0" : "";
+    // Sampler 0's texture not uploaded (yet): the base texture by name, then
+    // another sampler's, never a render target (soft particles sample the
+    // depth on sampler 1: black squares).
+    if (!inst.material && !engine_materials::current().base.empty()) {
+      inst.material = materialForName(engine_materials::current().base, nearest);
+      g_particleSource = inst.material ? "the base texture's name" : "";
+    }
+    if (!inst.material) {
+      for (int s = 1; s < 8; ++s) {
+        if (d.stageTextures[s] && !(d.textureTargets >> s & 1)) {
+          inst.material = traced ? materialFor(d.stageTextures[s], shading, nearest)
+                                 : materialFor(d.stageTextures[s], 0, nearest);
+          if (inst.material) {
+            inst.texture0 = d.stageTextures[s];
+            g_particleSource = "another sampler";
+            break;
+          }
+        }
+      }
+    }
+    if (!inst.material && engine_materials::currentName() && *engine_materials::currentName()) {
+      inst.material = materialForName(engine_materials::currentName(), nearest);
+      g_particleSource = inst.material ? "the material's name" : "";
+    }
+    if (!inst.material) {
+      failure = "particle texture not found";
+      break;
+#endif
     }
     inst.particle = true;
     if (inst.rasterOnly) {
@@ -3258,7 +4904,11 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     static const float identity[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
     std::memcpy(inst.transform, cameraToWorld ? cameraToWorld : identity, sizeof(inst.transform));
     inst.view = viewKey;
-    const bool marks = stencilRole(d, inst); // sets the depth state of stencil draws
+    inst.offTarget = !d.mainTarget;
+    inst.primitives = d.primCount;
+    inst.firstIndex = d.startIndex;
+    // (sets the depth state of stencil draws; a portal view's are not emulated)
+    const bool marks = g_views[viewKey].portal || stencilRole(d, inst);
     inst.depthTest = d.depthTest && inst.depthTest;
     inst.depthWrite = d.zWrite && !d.blend;
     if (!marks) {
@@ -3307,8 +4957,15 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
       if (row.material.empty() || outcome == kParticleFailed)
         row.material = engine_materials::currentName();
     }
-    if (dumpAll && g_particlesDumped.size() < 512)
-      dump = g_particlesDumped.insert(rowKey ^ (outcome == kParticleFailed ? 0x5a5a5a5a5a5a5a5aull : 0)).second;
+    if (dumpAll && g_particlesDumped.size() < 512) {
+      uint64_t dumpKey = rowKey ^ (outcome == kParticleFailed ? 0x5a5a5a5a5a5a5a5aull : 0);
+#if defined(PROXY_GAME_EZ2)
+      // Once per material too (one layout and shader carries many effects).
+      const char *material = engine_materials::currentName();
+      dumpKey = fnv(material, std::strlen(material), dumpKey);
+#endif
+      dump = g_particlesDumped.insert(dumpKey).second;
+    }
   }
   if (dump)
     dumpParticleDraw(d, kind, kParticleOutcomeNames[outcome], failure, cameraToWorld != nullptr, spriteFlags, spriteSoft,
@@ -3319,11 +4976,965 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
   return outcome != kParticleFailed || kind == kParticleExpanded;
 }
 
+// ShatteredGlass edge pieces (onDraw): Source's shader multiplies the glass
+// ($detail, on the window's coordinates) by the piece's shape mask (on its
+// own). A runtime material has one set of coordinates, so each piece quad
+// gets a texture of the two composed on the mask's coordinates. Render thread.
+struct ShardSource {
+  uint32_t width = 0, height = 0;
+  std::vector<uint8_t> rgba;
+};
+const ShardSource *shardSource(const std::string &name) {
+  static std::unordered_map<std::string, std::unique_ptr<ShardSource>> images;
+  auto [it, added] = images.try_emplace(name);
+  if (added) {
+    auto image = std::make_unique<ShardSource>();
+    if (bsp::textureRgba(name, image->width, image->height, image->rgba) && image->width && image->height)
+      it->second = std::move(image);
+  }
+  return it->second.get();
+}
+struct ShardTexture {
+  std::unique_ptr<uint8_t> identity; // the key standing for a D3D texture in g_textures
+  uint64_t lastFrame = 0;
+};
+std::unordered_map<uint64_t, ShardTexture> g_shardTextures;
+bool g_inShardDraw = false; // drawing a piece's quad with its composed texture
+// `map`: the glass coordinates over the mask's, glass = (map[0], map[1]) +
+// mask.x * (map[2], map[3]) + mask.y * (map[4], map[5]).
+const void *shardTexture(const std::string &mask, const std::string &glass, const float map[6]) {
+  float key[6];
+  for (int i = 0; i < 6; ++i)
+    key[i] = std::round(map[i] * 4096) / 4096;
+  uint64_t hash = XXH3_64bits_withSeed(key, sizeof(key), XXH3_64bits(mask.data(), mask.size()));
+  hash = XXH3_64bits_withSeed(glass.data(), glass.size(), hash) | 1;
+  auto &entry = g_shardTextures[hash];
+  entry.lastFrame = g_frame;
+  if (entry.identity)
+    return entry.identity.get();
+  const ShardSource *m = shardSource(mask), *g = shardSource(glass);
+  if (!m || !g) {
+    g_shardTextures.erase(hash);
+    return nullptr;
+  }
+  const uint32_t width = std::min(m->width, 128u), height = std::min(m->height, 128u);
+  std::vector<uint8_t> out(size_t(width) * height * 4);
+  for (uint32_t y = 0; y < height; ++y)
+    for (uint32_t x = 0; x < width; ++x) {
+      const float u = (x + 0.5f) / width, v = (y + 0.5f) / height;
+      const uint8_t *mt = &m->rgba[(size_t(std::min(uint32_t(v * m->height), m->height - 1)) * m->width +
+                                    std::min(uint32_t(u * m->width), m->width - 1)) * 4];
+      float gu = map[0] + u * map[2] + v * map[4], gv = map[1] + u * map[3] + v * map[5];
+      gu -= std::floor(gu);
+      gv -= std::floor(gv);
+      if (!std::isfinite(gu) || !std::isfinite(gv))
+        gu = gv = 0;
+      const uint8_t *gt = &g->rgba[(size_t(std::min(uint32_t(gv * g->height), g->height - 1)) * g->width +
+                                    std::min(uint32_t(gu * g->width), g->width - 1)) * 4];
+      uint8_t *o = &out[(size_t(y) * width + x) * 4];
+      o[0] = gt[0];
+      o[1] = gt[1];
+      o[2] = gt[2];
+      o[3] = uint8_t((unsigned(gt[3]) * mt[3] + 127) / 255);
+    }
+  auto t = std::make_shared<RemixTexture>();
+  t->hash = hash;
+  remixapi_TextureInfoGenerateMipsEXT mips = {};
+  mips.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_GENERATE_MIPS_EXT;
+  mips.generate = true;
+  remixapi_TextureInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+  info.pNext = &mips;
+  info.hash = hash;
+  info.width = width;
+  info.height = height;
+  info.depth = 1;
+  info.mipLevels = 1;
+  info.format = REMIXAPI_FORMAT_R8G8B8A8_SRGB;
+  info.data = out.data();
+  info.dataSize = out.size();
+  if (g_api.CreateTexture(&info, &t->texture) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_shardTextures.erase(hash);
+    return nullptr;
+  }
+  ++g_stats.shatteredTextures;
+  entry.identity = std::make_unique<uint8_t>(0);
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  g_texturesByHash[hash] = t;
+  g_textures[entry.identity.get()] = std::move(t);
+  // Pieces of windows long out of sight go (a few dozen per window).
+  if (g_shardTextures.size() > 1024)
+    for (auto it = g_shardTextures.begin(); it != g_shardTextures.end();)
+      if (g_frame - it->second.lastFrame > 600) {
+        g_textures.erase(it->second.identity.get());
+        g_texturesByHash.erase(it->first);
+        it = g_shardTextures.erase(it);
+      } else
+        ++it;
+  return entry.identity.get();
+}
+
+// A ShatteredGlass edge piece's quads, each drawn with its composed texture
+// (shardTexture). False when the draw is not quads of the two coordinate sets.
+void onDraw(const Draw &d);
+bool drawShardQuads(const Draw &d, const std::string &mask, const std::string &glass) {
+  const auto *maskCoord = findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 0);
+  const auto *glassCoord = findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 2);
+  if (d.type != D3DPT_TRIANGLELIST || !d.indices.data || d.primCount % 2 || !maskCoord || !glassCoord ||
+      maskCoord->Type != D3DDECLTYPE_FLOAT2 || glassCoord->Type != D3DDECLTYPE_FLOAT2)
+    return false;
+  const auto fetch = [&](const D3DVERTEXELEMENT9 *e, uint32_t index, float out[2]) {
+    if (e->Stream >= 4)
+      return false;
+    const auto &s = d.streams[e->Stream];
+    const int64_t vertex = int64_t(d.baseVertex) + index;
+    const uint64_t at = uint64_t(s.offset) + uint64_t(vertex) * s.stride + e->Offset;
+    if (!s.data || vertex < 0 || at + 8 > s.size)
+      return false;
+    std::memcpy(out, s.data + at, 8);
+    return std::isfinite(out[0]) && std::isfinite(out[1]);
+  };
+  // Every quad's map first: a piece is drawn whole or not at all.
+  const uint32_t quads = d.primCount / 2;
+  std::vector<const void *> textures(quads);
+  for (uint32_t q = 0; q < quads; ++q) {
+    const uint64_t first = uint64_t(d.startIndex) + q * 6;
+    const uint32_t bytes = d.indices.is32 ? 4 : 2;
+    if ((first + 3) * bytes > d.indices.size)
+      return false;
+    float m[3][2], g[3][2];
+    for (int k = 0; k < 3; ++k) {
+      uint32_t index = 0;
+      std::memcpy(&index, d.indices.data + (first + k) * bytes, bytes);
+      if (!fetch(maskCoord, index, m[k]) || !fetch(glassCoord, index, g[k]))
+        return false;
+    }
+    // The affine map of the first triangle (the quad is a parallelogram).
+    const float a = m[1][0] - m[0][0], b = m[2][0] - m[0][0], c = m[1][1] - m[0][1], e = m[2][1] - m[0][1];
+    const float det = a * e - b * c;
+    if (!(std::fabs(det) > 1e-8f))
+      return false;
+    float map[6];
+    for (int axis = 0; axis < 2; ++axis) {
+      const float p = g[1][axis] - g[0][axis], r = g[2][axis] - g[0][axis];
+      const float du = (p * e - r * c) / det, dv = (r * a - p * b) / det; // d glass / d mask.x, mask.y
+      map[2 + axis] = du;
+      map[4 + axis] = dv;
+      map[axis] = g[0][axis] - du * m[0][0] - dv * m[0][1];
+    }
+    if (!(textures[q] = shardTexture(mask, glass, map)))
+      return false;
+  }
+  g_inShardDraw = true;
+  for (uint32_t q = 0; q < quads; ++q) {
+    Draw piece = d;
+    piece.startIndex = d.startIndex + q * 6;
+    piece.primCount = 2;
+    piece.texture0 = textures[q];
+    onDraw(piece);
+  }
+  g_inShardDraw = false;
+  ++g_stats.shatteredEdges;
+  return true;
+}
+
+// Whether a draw is a $translucent world material blended as Source blends it
+// (src alpha, 1 - src alpha) that shows nothing behind it: its texture's alpha
+// at least 250 everywhere, without vertex alpha or an $alpha below one. Drawn
+// as opaque it is a surface of the scene, which the raster effects drawn after
+// it are hidden behind (gm_area51_rc1's race track sign: the lamps' glows
+// showed through it). Texture opacity cached by name.
+bool opaqueTranslucent(const Draw &d) {
+  if (!d.blend || d.srcBlend != D3DBLEND_SRCALPHA || d.dstBlend != D3DBLEND_INVSRCALPHA ||
+      d.blendOp != D3DBLENDOP_ADD)
+    return false;
+  const auto &m = engine_materials::bound();
+  if (!m.known || !m.lightmapped || !m.translucent || m.additive || m.vertexAlpha || m.decal || m.decalShader)
+    return false;
+  float alpha = 1;
+  if (engine_materials::currentFloat("$alpha", alpha) && alpha < 1)
+    return false;
+  const std::string &base = engine_materials::current().base;
+  if (base.empty())
+    return false;
+  static std::unordered_map<std::string, bool> opaque; // render thread
+  auto [it, added] = opaque.emplace(base, false);
+  if (added) {
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> rgba;
+    if (bsp::textureRgba(base, width, height, rgba) && !rgba.empty()) {
+      it->second = true;
+      for (size_t i = 3; i < rgba.size() && it->second; i += 4)
+        it->second = rgba[i] >= 250;
+    }
+  }
+  return it->second;
+}
+
+#ifdef PROXY_GAME_L4D2
+// --- Left 4 Dead 2's common infected -------------------------------------------
+// (l4d2::infected tells their draws apart and reads their constants.) Their
+// material is the base texture's, gradient-mapped (remixapi_MaterialGradientMapEXT)
+// by the gradient, detail and burn textures the draw binds and the rows,
+// sprite, detail transform, blood, burn strength and opacity its constants
+// say: one per combination, made on first use and dropped when unused for a
+// while (the burn strength and opacity, which animate, in steps of 1/64). It
+// holds the records of the textures it names, so they outlive it. Wounded
+// draws get their cut (remixapi_InstanceInfoWoundCutEXT) on the instance.
+namespace {
+struct InfectedMaterial {
+  remixapi_MaterialHandle handle = nullptr;
+  uint64_t lastFrame = 0;
+  std::shared_ptr<RemixTexture> textures[4]; // base, gradient, detail, burn
+};
+std::unordered_map<uint64_t, InfectedMaterial> g_infectedMaterials; // by material hash; under g_textureLock
+
+// The texture bound to a sampler (0-15).
+const void *stageTexture(const Draw &d, int stage) {
+  if (stage < 0 || stage >= 16)
+    return nullptr;
+  return d.textures ? d.textures[stage] : stage < 8 ? d.stageTextures[stage] : nullptr;
+}
+
+// A stage's texture record (nullptr: none uploaded). Caller holds g_textureLock.
+std::shared_ptr<RemixTexture> stageRecord(const Draw &d, int stage) {
+  const void *texture = stageTexture(d, stage);
+  if (!texture)
+    return nullptr;
+#if defined(PROXY_GAME_EZ2)
+  auto t = findOrRealizeTexture(texture);
+  return t && t->texture ? t : nullptr;
+#else
+  auto it = g_textures.find(texture);
+  return it == g_textures.end() || !it->second->texture ? nullptr : it->second;
+#endif
+}
+
+remixapi_MaterialHandle infectedMaterial(const Draw &d, const l4d2::infected::Params &p, bool nearest) {
+  using namespace l4d2::infected;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  // Burning at strength 0 is no burn (saturate(U.a - 1)): the unburnt material.
+  const int burnStage = p.burnStrength > 0 ? p.burnStage : -1;
+  const auto base = stageRecord(d, p.baseStage), gradient = stageRecord(d, p.gradientStage),
+             detail = stageRecord(d, p.detailStage), burn = stageRecord(d, burnStage);
+  if (!base)
+    noteMissing(kMissingBase);
+  if (!gradient)
+    noteMissing(kMissingGradient);
+  if (p.detailStage >= 0 && stageTexture(d, p.detailStage) && !detail)
+    noteMissing(kMissingDetail);
+  if (burnStage >= 0 && !burn)
+    noteMissing(kMissingBurn);
+  if (!base || !gradient)
+    return nullptr;
+  struct Key {
+    uint64_t base, gradient, detail, burn;
+    float skinRow, clothRow, sprite[2], detailU[2], detailV[2], blood[3], range[2], burnStrength, opacity;
+    uint32_t nearest;
+  } key;
+  static_assert(sizeof(Key) == 4 * sizeof(uint64_t) + 16 * sizeof(float), "hashed as bytes: no padding");
+  std::memset(&key, 0, sizeof(key));
+  key.base = base->hash;
+  key.gradient = gradient->hash;
+  key.detail = detail ? detail->hash : 0;
+  key.burn = burn ? burn->hash : 0;
+  // Quantized (l4d2::infected::Params::kQuantum) as classify read them.
+  key.burnStrength = burn ? p.burnStrength : 0;
+  key.opacity = p.opacity;
+  key.skinRow = p.skinRow;
+  key.clothRow = p.clothRow;
+  std::copy_n(p.spriteOffset, 2, key.sprite);
+  std::copy_n(p.detailU, 2, key.detailU);
+  std::copy_n(p.detailV, 2, key.detailV);
+  std::copy_n(p.bloodColor, 3, key.blood);
+  std::copy_n(p.bloodRange, 2, key.range);
+  key.nearest = nearest;
+  uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), 0x1f3c7ed1f3c7edull);
+  if (!hash || hash == base->hash)
+    hash = ~base->hash;
+  InfectedMaterial &m = g_infectedMaterials[hash];
+  m.lastFrame = g_frame;
+  if (m.handle)
+    return m.handle;
+  wchar_t basePath[24], gradientPath[24], detailPath[24], burnPath[24];
+  swprintf(basePath, 24, L"0x%llX", static_cast<unsigned long long>(key.base));
+  swprintf(gradientPath, 24, L"0x%llX", static_cast<unsigned long long>(key.gradient));
+  swprintf(detailPath, 24, L"0x%llX", static_cast<unsigned long long>(key.detail));
+  swprintf(burnPath, 24, L"0x%llX", static_cast<unsigned long long>(key.burn));
+  remixapi_MaterialGradientMapEXT map = {};
+  map.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_GRADIENT_MAP_EXT;
+  map.gradientTexture = gradientPath;
+  map.detailTexture = detail ? detailPath : L""; // empty: no detail step
+  // The shader reads the burn texture at the detail coordinates swapped, as
+  // the runtime does.
+  map.burnTexture = burn ? burnPath : L""; // empty: no burn step
+  map.burnStrength = key.burnStrength;
+  // The shader's rows are v coordinates, (row + 0.5) / height; the runtime
+  // takes the row.
+  float rows = 16;
+  {
+    auto *texture = static_cast<IDirect3DBaseTexture9 *>(const_cast<void *>(d.stageTextures[p.gradientStage]));
+    D3DSURFACE_DESC desc = {};
+    if (texture->GetType() == D3DRTYPE_TEXTURE &&
+        SUCCEEDED(static_cast<IDirect3DTexture9 *>(texture)->GetLevelDesc(0, &desc)) && desc.Height)
+      rows = float(desc.Height);
+  }
+  map.skinRow = key.skinRow * rows - 0.5f;
+  map.clothRow = key.clothRow * rows - 0.5f;
+  std::copy_n(key.sprite, 2, map.spriteOffset);
+  std::copy_n(key.detailU, 2, map.detailU);
+  std::copy_n(key.detailV, 2, map.detailV);
+  // The runtime takes a colour of 0 to 1 and an increasing range.
+  map.bloodColor = {std::clamp(key.blood[0], 0.0f, 1.0f), std::clamp(key.blood[1], 0.0f, 1.0f),
+                    std::clamp(key.blood[2], 0.0f, 1.0f)};
+  std::copy_n(key.range, 2, map.bloodRange);
+  if (!(map.bloodRange[0] < map.bloodRange[1]))
+    map.bloodRange[1] = map.bloodRange[0] + 1.0f / 1024;
+  // As the base texture's lit material (ensureMaterial), gradient-mapped. Its
+  // base alpha is luminance, not coverage: not the draw's alpha state (the
+  // draws taken are not alpha-tested, and blended only to fade), its opacity
+  // the fade's (1: opaque).
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.pNext = &map;
+  opaque.albedoConstant = {1, 1, 1};
+  opaque.opacityConstant = key.opacity;
+  opaque.alphaTestType = 7; // always pass
+  opaque.useDrawCallAlphaState = 0;
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = hash;
+  info.albedoTexture = basePath;
+  info.filterMode = nearest ? 0 : 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  if (g_api.CreateMaterial(&info, &m.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_infectedMaterials.erase(hash);
+    noteMaterialCreated(true);
+    return nullptr;
+  }
+  noteMaterialCreated(false);
+  m.textures[0] = base;
+  m.textures[1] = gradient;
+  m.textures[2] = detail;
+  m.textures[3] = burn;
+  return m.handle;
+}
+
+// Materials no infected drew for a while (another infected's rows) go.
+void evictInfectedMaterials() {
+  if (g_frame % 64)
+    return;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  for (auto it = g_infectedMaterials.begin(); it != g_infectedMaterials.end();) {
+    if (g_frame - it->second.lastFrame > 300) {
+      if (it->second.handle)
+        g_api.DestroyMaterial(it->second.handle);
+      it = g_infectedMaterials.erase(it);
+    } else
+      ++it;
+  }
+}
+
+// What the probe shows of any infected shader's draw: its textures and blend state.
+l4d2::infected::ProbeDraw infectedProbe(const Draw &d, const l4d2::infected::Params &p) {
+  l4d2::infected::ProbeDraw probe;
+  const int stages[l4d2::infected::ProbeDraw::kTextures] = {p.baseStage, p.detailStage, p.gradientStage, p.cutStage,
+                                                            p.burnStage};
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    for (int i = 0; i < l4d2::infected::ProbeDraw::kTextures; ++i) {
+      probe.stages[i] = stages[i] >= 0 && stages[i] < 16 ? stages[i] : -1;
+      probe.textures[i] = stageTexture(d, probe.stages[i]);
+      if (probe.stages[i] >= 0 && d.samplerStates)
+        probe.srgb[i] = d.samplerStates[probe.stages[i]][D3DSAMP_SRGBTEXTURE];
+      auto it = probe.textures[i] ? g_textures.find(probe.textures[i]) : g_textures.end();
+      if (it != g_textures.end()) {
+        probe.hashes[i] = it->second->hash;
+        probe.uploaded[i] = it->second->texture != nullptr;
+      }
+    }
+  }
+  probe.pixelShader = d.pixelShader;
+  probe.vertices = d.numVertices;
+  probe.primitives = d.primCount;
+  probe.blend = d.blend;
+  probe.srcBlend = d.srcBlend;
+  probe.dstBlend = d.dstBlend;
+  probe.blendOp = d.blendOp;
+  probe.separateAlpha = d.separateAlpha;
+  probe.srcBlendAlpha = d.srcBlendAlpha;
+  probe.dstBlendAlpha = d.dstBlendAlpha;
+  probe.blendOpAlpha = d.blendOpAlpha;
+  probe.alphaTest = d.alphaTest;
+  probe.alphaFunc = d.alphaFunc;
+  probe.alphaRef = d.alphaRef;
+  probe.frame = g_frame;
+  return probe;
+}
+
+// An infected shader's draw not taken (counted, and probed under "refused").
+void refuseInfected(const Draw &d, const l4d2::infected::Params &p, bool lifted, bool particle) {
+  l4d2::infected::noteRefused(d.blend, d.alphaTest, lifted, particle, p);
+  if (!l4d2::infected::probing())
+    return;
+  l4d2::infected::ProbeDraw probe = infectedProbe(d, p);
+  probe.refused = true;
+  probe.lifted = lifted;
+  probe.particle = particle;
+  l4d2::infected::probe(p, d.psConstants, d.vsConstants, probe);
+}
+
+// The infected draw's material and wound on its instance (inst.material is
+// left as it was when the gradient cannot be had), and the probe.
+void applyInfected(const Draw &d, const l4d2::infected::Params &p, Instance &inst, bool nearest,
+                   uint32_t bonesPerVertex, uint32_t boneCount, bool skinnedLayout, bool dynamicVertices,
+                   bool flexIgnored) {
+  using namespace l4d2::infected;
+  const remixapi_MaterialHandle material = infectedMaterial(d, p, nearest);
+  if (material)
+    inst.material = material;
+  if (p.wounded) {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    if (const auto cut = stageRecord(d, p.cutStage)) {
+      inst.woundCut = true;
+      swprintf(inst.woundTexture, 24, L"0x%llX", static_cast<unsigned long long>(cut->hash));
+      auto &w = inst.wound;
+      w = {};
+      w.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_WOUND_CUT_EXT;
+      for (int e = 0; e < 2; ++e) {
+        w.ellipsoids[e].center = {p.center[e][0], p.center[e][1], p.center[e][2]};
+        w.ellipsoids[e].axisX = {p.axisX[e][0], p.axisX[e][1], p.axisX[e][2]};
+        w.ellipsoids[e].axisY = {p.axisY[e][0], p.axisY[e][1], p.axisY[e][2]};
+        w.ellipsoids[e].axisZ = {p.axisZ[e][0], p.axisZ[e][1], p.axisZ[e][2]};
+      }
+      w.mappingScale = p.mappingScale;
+      w.secondBlend = p.secondBlend;
+      std::copy_n(p.projectionScale, 4, w.projectionScale);
+      std::copy_n(p.projectionBias, 4, w.projectionBias);
+      std::memcpy(w.cutScaleBias, p.cutScaleBias, sizeof(w.cutScaleBias));
+      w.threshold = p.threshold;
+    } else
+      noteMissing(kMissingCut);
+  }
+  noteDraw(p, material != nullptr, inst.woundCut);
+  if (!probing())
+    return;
+  ProbeDraw probe = infectedProbe(d, p);
+  probe.bonesPerVertex = bonesPerVertex;
+  probe.boneCount = boneCount;
+  probe.skinnedLayout = skinnedLayout;
+  probe.dynamicVertices = dynamicVertices;
+  probe.flexIgnored = flexIgnored;
+  probe.material = material != nullptr;
+  probe.woundSent = inst.woundCut;
+  l4d2::infected::probe(p, d.psConstants, d.vsConstants, probe);
+}
+} // namespace
+#endif
+
+// --- Fixed-function draws ------------------------------------------------------
+// Dev aid: bin/shaderapi_proxy_ff.request ("[count] [filter]": count, default
+// 64, of the next fixed-function draws whose kind or material matches the
+// filter: 3d, 2d, skinned, rigid, blended, opaque, or a part of the material's
+// name; none: every draw) describes them in bin/ff_probe.txt: the layout,
+// transforms, blending, lighting, fog and texture stage state D3D had, the
+// first vertices decoded and placed, what the conversion made of the draw
+// (fixed_function.h) and what onDraw did with it; and after each frame that
+// had one, the frame's views and their roles.
+struct FixedFunctionProbe {
+  uint32_t left = 0;
+  std::string filter;
+  FILE *out = nullptr;
+  uint64_t frame = ~0ull; // the last frame a draw was described in
+  uint32_t index = 0;     // fixed-function draws so far in this frame
+  uint64_t indexFrame = ~0ull;
+} g_ffProbe; // render thread
+
+void serviceFixedFunctionProbeRequest() {
+  if (!game::kFixedFunction || g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_ff.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  std::string line;
+  if (FILE *in = _wfopen(request.c_str(), L"r")) {
+    char text[256] = {};
+    if (std::fgets(text, sizeof(text), in))
+      line = text;
+    fclose(in);
+  }
+  DeleteFileW(request.c_str());
+  while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
+    line.pop_back();
+  for (char &c : line)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  uint32_t count = 64;
+  char *end = nullptr;
+  const unsigned long n = std::strtoul(line.c_str(), &end, 10);
+  if (end != line.c_str()) {
+    count = uint32_t(std::clamp<unsigned long>(n, 1, 100000));
+    line.erase(0, size_t(end - line.c_str()));
+  }
+  while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front())))
+    line.erase(0, 1);
+  if (g_ffProbe.out)
+    fclose(g_ffProbe.out);
+  g_ffProbe = {};
+  g_ffProbe.out = _wfopen((g_moduleDir + L"\\ff_probe.txt").c_str(), L"w");
+  if (!g_ffProbe.out)
+    return;
+  g_ffProbe.left = count;
+  g_ffProbe.filter = line;
+  fprintf(g_ffProbe.out, "== fixed-function probe: %u draws, filter \"%s\", from frame %llu\n"
+                         "   (matrices row-major, D3D's row vectors; D3DRS/D3DTSS values as numbers)\n",
+          count, line.c_str(), static_cast<unsigned long long>(g_frame));
+  fflush(g_ffProbe.out);
+}
+
+void printMatrix(FILE *out, const char *name, const float *m) {
+  fprintf(out, "   %s: [%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]\n", name, m[0],
+          m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+}
+
+bool fixedFunctionProbeWants(const Draw &d, const ff::Converted &c) {
+  if (!g_ffProbe.left || !g_ffProbe.out)
+    return false;
+  const std::string &f = g_ffProbe.filter;
+  if (f.empty())
+    return true;
+  if (f == "3d")
+    return !c.flat;
+  if (f == "2d")
+    return c.flat;
+  if (f == "skinned")
+    return c.blend != ff::kBlendNone;
+  if (f == "rigid")
+    return c.blend == ff::kBlendNone && !c.flat;
+  if (f == "blended")
+    return d.blend;
+  if (f == "opaque")
+    return !d.blend;
+  std::string material = engine_materials::nameRead();
+  for (char &ch : material)
+    ch = char(std::tolower(static_cast<unsigned char>(ch)));
+  return material.find(f) != std::string::npos;
+}
+
+void probeFixedFunctionDraw(const Draw &d, const ff::Converted &c, const char *outcome) {
+  FILE *out = g_ffProbe.out;
+  const FixedFunction &f = *d.fixedFunction;
+  const DWORD *rs = f.renderStates;
+  --g_ffProbe.left;
+  g_ffProbe.frame = g_frame;
+  const auto &b = engine_materials::boundRead();
+  const uint64_t viewKey = fnv(c.constants + kRegViewProj * 4, 16 * sizeof(float));
+  const auto view = g_views.find(viewKey);
+  fprintf(out, "f%llu #%u %s [%s] base \"%s\" | outcome: %s%s%s | view %016llX (order %d, %s, %u draws so far)\n",
+          static_cast<unsigned long long>(g_frame), g_ffProbe.index, engine_materials::nameRead(), b.known ? b.shader : "?",
+          engine_materials::currentRead().base.c_str(), outcome, c.skip ? ": " : "", c.skip ? c.skip : "",
+          static_cast<unsigned long long>(viewKey), view != g_views.end() ? int(view->second.order) : -1,
+          c.flat ? "flat" : "perspective", view != g_views.end() ? view->second.draws : 0);
+  fprintf(out, "   layout %s%s: %s\n", f.fvf ? "FVF " : "declaration", f.fvf ? std::to_string(f.fvf).c_str() : "",
+          describeDeclaration(d.elements).c_str());
+  for (int i = 0; i < 4; ++i)
+    if (d.streams[i].buffer)
+      fprintf(out, "   stream %d: %p offset %u stride %u size %u%s\n", i, d.streams[i].buffer, d.streams[i].offset,
+              d.streams[i].stride, d.streams[i].size, d.streams[i].dynamic ? " dynamic" : "");
+  fprintf(out, "   prim type %u base %d min %u verts %u start %u prims %u | ib %p%s%s\n", unsigned(d.type), d.baseVertex,
+          d.minIndex, d.numVertices, d.startIndex, d.primCount, d.indices.buffer, d.indices.is32 ? " 32-bit" : "",
+          d.indices.dynamic ? " dynamic" : "");
+  fprintf(out, "   target %s %p %ux%u | viewport %lu %lu %lu %lu | cull %u z %d write %d func %u | blend %d %u/%u op %u | "
+               "alpha test %d func %u ref %u | color write %X fill %u stencil %d depth bias %d\n",
+          d.mainTarget ? "back buffer" : d.target ? "RT" : "other", d.target, d.targetWidth, d.targetHeight,
+          d.viewport.X, d.viewport.Y, d.viewport.Width, d.viewport.Height, d.cullMode, int(d.zEnable), int(d.zWrite),
+          d.zFunc, int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.alphaTest), d.alphaFunc, d.alphaRef,
+          d.colorWrite, d.fillMode, int(d.stencil), int(d.depthBias));
+  fprintf(out, "   vertex blend %lu indexed %lu normalize normals %lu | -> %s, D3D matrices %u, bones per vertex %u%s | "
+               "world matrices set since launch %u | shader API bones %d\n",
+          rs[D3DRS_VERTEXBLEND], rs[D3DRS_INDEXEDVERTEXBLENDENABLE], rs[D3DRS_NORMALIZENORMALS],
+          c.blend == ff::kBlendNone            ? "rigid"
+          : c.blend == ff::kBlendIndexedColor  ? "indexed (D3DCOLOR)"
+          : c.blend == ff::kBlendIndexedUByte4 ? "indexed (UBYTE4)"
+                                               : "non-indexed",
+          c.matrices, c.bonesPerVertex, c.tweening ? " (tweening)" : "", f.worldsSet, currentNumBones());
+  printMatrix(out, "world (WORLDMATRIX 0)", f.worlds[0]);
+  printMatrix(out, "view", f.view);
+  printMatrix(out, "projection", f.projection);
+  // The bone matrices the first vertices name (and 1..3 without indexing).
+  uint32_t highest = c.blend == ff::kBlendNone ? 0 : c.blend == ff::kBlendNonIndexed ? c.matrices - 1 : 0;
+  const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+  const auto *posT = findElement(d.elements, D3DDECLUSAGE_POSITIONT, 0);
+  const auto *bi = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0);
+  auto vertexAt = [&](const D3DVERTEXELEMENT9 *e, uint32_t v, uint32_t bytes) -> const uint8_t * {
+    if (!e || e->Stream >= 4)
+      return nullptr;
+    const auto &st = d.streams[e->Stream];
+    const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex + v) * st.stride + e->Offset;
+    return st.data && at + bytes <= st.size ? st.data + at : nullptr;
+  };
+  // The first indexed vertices (the declared range may cover a whole buffer).
+  uint32_t first[3] = {0, 1, 2};
+  for (uint32_t k = 0; k < 3; ++k) {
+    const uint64_t at = uint64_t(d.startIndex + k) * (d.indices.is32 ? 4 : 2);
+    if (d.indices.data && at + (d.indices.is32 ? 4 : 2) <= d.indices.size) {
+      uint32_t value = 0;
+      std::memcpy(&value, d.indices.data + at, d.indices.is32 ? 4 : 2);
+      first[k] = value >= d.minIndex ? value - d.minIndex : 0;
+    }
+  }
+  if (bi && c.blend != ff::kBlendNone && c.blend != ff::kBlendNonIndexed)
+    for (uint32_t v : first)
+      if (const uint8_t *x = vertexAt(bi, v, 4))
+        highest = std::max<uint32_t>(highest, std::max({x[0], x[1], x[2], x[3]}));
+  for (uint32_t i = 1; i <= std::min<uint32_t>(highest, 15); ++i) {
+    char name[24];
+    std::snprintf(name, sizeof(name), "WORLDMATRIX %u", i);
+    printMatrix(out, name, f.worlds[i]);
+  }
+  // Every matrix the draw's vertices weigh, and how many draws before this
+  // one it was last set (0: just before it; a large age: left over from
+  // another model).
+  if (bi && f.worldDraw && c.blend != ff::kBlendNone && c.blend != ff::kBlendNonIndexed) {
+    const auto *bw = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
+    const int components = bw && bw->Type <= D3DDECLTYPE_FLOAT4 ? bw->Type + 1 : 0;
+    bool used[256] = {};
+    for (uint32_t v = 0; v < d.numVertices; ++v) {
+      const uint8_t *x = vertexAt(bi, v, 4);
+      if (!x)
+        break;
+      float stored[4] = {};
+      if (const uint8_t *w = components ? vertexAt(bw, v, uint32_t(components) * 4) : nullptr)
+        std::memcpy(stored, w, size_t(components) * 4);
+      float last = 1;
+      for (uint32_t k = 0; k < c.matrices; ++k) {
+        const float weight = k + 1 < c.matrices ? stored[k] : last;
+        last -= k + 1 < c.matrices ? stored[k] : 0;
+        if (weight > 1e-4f)
+          used[c.blend == ff::kBlendIndexedColor ? x[(k < 3 ? 2 - k : 3)] : x[k]] = true;
+      }
+    }
+    fprintf(out, "   matrices weighed (index:draws since set):");
+    for (int i = 0; i < 256; ++i)
+      if (used[i])
+        fprintf(out, " %d:%u", i, f.draw - 1 - f.worldDraw[i]);
+    fprintf(out, "\n");
+    // Every vertex on screen as D3D draws it (the weighed world matrices,
+    // VIEW, PROJECTION) and as converted (the bones c58.., then c8..c11).
+    const auto *position = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+    float worst = 0;
+    uint32_t off = 0, worstVertex = 0, checked = 0;
+    for (uint32_t v = 0; position && v < d.numVertices; ++v) {
+      const uint8_t *x = vertexAt(bi, v, 4), *pp = vertexAt(position, v, 12);
+      if (!x || !pp)
+        break;
+      float p[3], stored[4] = {};
+      std::memcpy(p, pp, 12);
+      if (const uint8_t *w = components ? vertexAt(bw, v, uint32_t(components) * 4) : nullptr)
+        std::memcpy(stored, w, size_t(components) * 4);
+      float d3d[4] = {}, conv[4] = {}, last = 1;
+      for (uint32_t k = 0; k < c.matrices; ++k) {
+        const float weight = k + 1 < c.matrices ? stored[k] : last;
+        last -= k + 1 < c.matrices ? stored[k] : 0;
+        const uint32_t i = c.blend == ff::kBlendIndexedColor ? x[(k < 3 ? 2 - k : 3)] : x[k];
+        const float *m = f.worlds[i];
+        float world[4] = {};
+        for (int col = 0; col < 4; ++col)
+          world[col] = p[0] * m[col] + p[1] * m[4 + col] + p[2] * m[8 + col] + m[12 + col];
+        float eye[4] = {}, clip[4] = {};
+        for (int col = 0; col < 4; ++col)
+          for (int r = 0; r < 4; ++r)
+            eye[col] += world[r] * f.view[r * 4 + col];
+        for (int col = 0; col < 4; ++col)
+          for (int r = 0; r < 4; ++r)
+            clip[col] += eye[r] * f.projection[r * 4 + col];
+        for (int col = 0; col < 4; ++col)
+          d3d[col] += weight * clip[col];
+        const float *rows = c.bones + std::min<uint32_t>(i, c.boneRows - 1) * 12;
+        float placed[4] = {0, 0, 0, 1};
+        for (int r = 0; r < 3; ++r)
+          placed[r] = rows[r * 4] * p[0] + rows[r * 4 + 1] * p[1] + rows[r * 4 + 2] * p[2] + rows[r * 4 + 3];
+        const float *vp = c.constants + kRegViewProj * 4; // register k: column k
+        for (int col = 0; col < 4; ++col)
+          conv[col] += weight * (vp[col * 4] * placed[0] + vp[col * 4 + 1] * placed[1] + vp[col * 4 + 2] * placed[2] +
+                                 vp[col * 4 + 3]);
+      }
+      if (d3d[3] <= 0 || conv[3] <= 0)
+        continue;
+      ++checked;
+      const float dx = (d3d[0] / d3d[3] - conv[0] / conv[3]) * 960, dy = (d3d[1] / d3d[3] - conv[1] / conv[3]) * 540;
+      const float e = std::sqrt(dx * dx + dy * dy);
+      off += e > 1;
+      if (e > worst) {
+        worst = e;
+        worstVertex = v;
+      }
+    }
+    fprintf(out, "   vertices checked %u: off by more than a pixel %u, worst %.1f px (vertex %u)\n", checked, off, worst,
+            worstVertex);
+  }
+  const D3DMATERIAL9 &m = *f.material;
+  fprintf(out, "   lighting %lu ambient %08lX color vertex %lu sources diffuse %lu ambient %lu specular %lu emissive %lu "
+               "| material diffuse %.3g %.3g %.3g %.3g ambient %.3g %.3g %.3g emissive %.3g %.3g %.3g | specular enable %lu\n",
+          rs[D3DRS_LIGHTING], rs[D3DRS_AMBIENT], rs[D3DRS_COLORVERTEX], rs[D3DRS_DIFFUSEMATERIALSOURCE],
+          rs[D3DRS_AMBIENTMATERIALSOURCE], rs[D3DRS_SPECULARMATERIALSOURCE], rs[D3DRS_EMISSIVEMATERIALSOURCE], m.Diffuse.r,
+          m.Diffuse.g, m.Diffuse.b, m.Diffuse.a, m.Ambient.r, m.Ambient.g, m.Ambient.b, m.Emissive.r, m.Emissive.g,
+          m.Emissive.b, rs[D3DRS_SPECULARENABLE]);
+  for (int i = 0; i < 32; ++i)
+    if (f.lightsEnabled >> i & 1) {
+      const D3DLIGHT9 &l = f.lights[i];
+      fprintf(out, "     light %d: type %d diffuse %.3g %.3g %.3g pos %.0f %.0f %.0f dir %.2f %.2f %.2f range %.0f att %.3g %.3g %.3g\n",
+              i, int(l.Type), l.Diffuse.r, l.Diffuse.g, l.Diffuse.b, l.Position.x, l.Position.y, l.Position.z,
+              l.Direction.x, l.Direction.y, l.Direction.z, l.Range, l.Attenuation0, l.Attenuation1, l.Attenuation2);
+    }
+  float fogStart = 0, fogEnd = 0;
+  std::memcpy(&fogStart, &rs[D3DRS_FOGSTART], 4);
+  std::memcpy(&fogEnd, &rs[D3DRS_FOGEND], 4);
+  fprintf(out, "   fog enable %lu table %lu vertex %lu color %08lX start %g end %g range %lu | texture factor %08lX\n",
+          rs[D3DRS_FOGENABLE], rs[D3DRS_FOGTABLEMODE], rs[D3DRS_FOGVERTEXMODE], rs[D3DRS_FOGCOLOR], fogStart, fogEnd,
+          rs[D3DRS_RANGEFOGENABLE], rs[D3DRS_TEXTUREFACTOR]);
+  for (int s = 0; s < 8; ++s) {
+    const DWORD *t = f.stages[s];
+    const uint64_t hash = textureHash(d.stageTextures[s]);
+    fprintf(out, "   stage %d: tex %p %016llX %s | color op %lu %lX %lX %lX alpha op %lu %lX %lX %lX result %lX | "
+                 "texcoord index %lX transform flags %lX | address %lu %lu filter %lu\n",
+            s, d.stageTextures[s], static_cast<unsigned long long>(hash), hash ? bsp::materialName(hash).c_str() : "",
+            t[D3DTSS_COLOROP], t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], t[D3DTSS_COLORARG0], t[D3DTSS_ALPHAOP],
+            t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], t[D3DTSS_ALPHAARG0], t[D3DTSS_RESULTARG],
+            t[D3DTSS_TEXCOORDINDEX], t[D3DTSS_TEXTURETRANSFORMFLAGS], d.samplerStates[s][D3DSAMP_ADDRESSU],
+            d.samplerStates[s][D3DSAMP_ADDRESSV], d.samplerStates[s][D3DSAMP_MINFILTER]);
+    if (t[D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) {
+      char name[24];
+      std::snprintf(name, sizeof(name), "  TEXTURE%d", s);
+      printMatrix(out, name, f.textures[s]);
+    }
+    if (t[D3DTSS_COLOROP] == D3DTOP_DISABLE)
+      break; // and every stage above
+  }
+  fprintf(out, "   converted: base stage %d (texture %s) | uv transform %d (%g %g %g, %g %g %g) projected %d | texgen %d "
+               "(from the position %d) | iris %d | texture factor %d | layout changed %d pretransformed %d | placed under the camera %d\n",
+          c.baseStage, c.textureUsed ? "read" : "not read: untextured", int(c.uvTransform), c.uv[0], c.uv[1], c.uv[3],
+          c.uv[4], c.uv[5], c.uv[7], int(c.projected), int(c.texgen), int(c.generated), int(c.iris),
+          int(c.textureFactor), int(c.elementsChanged), int(c.pretransformed), int(c.placed));
+  // The first vertices: every element, and the position placed by the
+  // conversion (world, then the screen through view x projection).
+  const D3DVERTEXELEMENT9 *place = pos ? pos : posT;
+  for (uint32_t v : first) {
+    fprintf(out, "   vertex %u:", v);
+    for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff; ++e) {
+      static const uint8_t bytes[17] = {4, 8, 12, 16, 4, 4, 4, 8, 4, 4, 8, 4, 8, 4, 4, 4, 8};
+      const uint8_t *x = e->Type < 17 ? vertexAt(e, v, bytes[e->Type]) : nullptr;
+      if (!x)
+        continue;
+      fprintf(out, " u%u.%u=", e->Usage, e->UsageIndex);
+      if (e->Type <= D3DDECLTYPE_FLOAT4) {
+        float val[4] = {};
+        std::memcpy(val, x, (e->Type + 1) * 4);
+        for (int k = 0; k <= e->Type; ++k)
+          fprintf(out, "%s%.4g", k ? "," : "", val[k]);
+      } else if (e->Type == D3DDECLTYPE_SHORT2 || e->Type == D3DDECLTYPE_SHORT4) {
+        int16_t val[4] = {};
+        std::memcpy(val, x, e->Type == D3DDECLTYPE_SHORT2 ? 4 : 8);
+        fprintf(out, "s%d,%d,%d,%d", val[0], val[1], val[2], val[3]);
+      } else {
+        fprintf(out, "b%u,%u,%u,%u", x[0], x[1], x[2], x[3]);
+      }
+    }
+    if (const uint8_t *p = vertexAt(place, v, 12)) {
+      float in[3], world[3] = {}, clip[4] = {};
+      std::memcpy(in, p, 12);
+      const float *rows = c.constants + kRegModel * 4; // bone 0 / the model
+      if (bi && c.blend != ff::kBlendNone && c.blend != ff::kBlendNonIndexed)
+        if (const uint8_t *x = vertexAt(bi, v, 4))
+          rows = c.bones + std::min<uint32_t>(c.blend == ff::kBlendIndexedColor ? x[2] : x[0], c.boneRows - 1) * 12;
+      for (int r = 0; r < 3; ++r)
+        world[r] = rows[r * 4] * in[0] + rows[r * 4 + 1] * in[1] + rows[r * 4 + 2] * in[2] + rows[r * 4 + 3];
+      const float *vp = c.constants + kRegViewProj * 4;
+      for (int k = 0; k < 4; ++k)
+        clip[k] = world[0] * vp[k * 4] + world[1] * vp[k * 4 + 1] + world[2] * vp[k * 4 + 2] + vp[k * 4 + 3];
+      const float w = std::fabs(clip[3]) > 1e-6f ? clip[3] : 1.0f;
+      fprintf(out, " | world (first bone) %.1f %.1f %.1f | screen %.0f %.0f depth %.3f", world[0], world[1], world[2],
+              (clip[0] / w * 0.5f + 0.5f) * g_displayWidth, (0.5f - clip[1] / w * 0.5f) * g_displayHeight, clip[2] / w);
+    }
+    fprintf(out, "\n");
+  }
+  if (!g_ffProbe.left) {
+    fprintf(out, "== done\n");
+    fflush(out);
+  }
+}
+
+// A draw with no vertex shader in a game that draws through the
+// fixed-function pipeline: converted (fixed_function.h), then taken as a
+// shader draw.
+void onFixedFunctionDraw(const Draw &d) {
+  if (!g_ready || !g_shaderApi)
+    return;
+  const FixedFunction &f = *d.fixedFunction;
+  if (g_ffProbe.indexFrame != g_frame) {
+    g_ffProbe.indexFrame = g_frame;
+    g_ffProbe.index = 0;
+  }
+  ++g_ffProbe.index;
+  // The base texture: stage 0's, unless the material's $basetexture is bound
+  // on another stage that reads its texture (a lightmap on stage 0).
+  int baseStage = 0;
+  if (d.stageTextures[0] && d.stageTextures[1] && f.stages[1][D3DTSS_COLOROP] != D3DTOP_DISABLE) {
+    const std::string &base = engine_materials::current().base;
+    const uint64_t wanted = base.empty() ? 0 : maskTextureHash(base, false);
+    if (wanted && textureHash(d.stageTextures[0]) != wanted)
+      for (int s = 1; s < 4 && f.stages[s][D3DTSS_COLOROP] != D3DTOP_DISABLE; ++s)
+        if (d.stageTextures[s] && textureHash(d.stageTextures[s]) == wanted && ff::stageReadsTexture(f, s)) {
+          baseStage = s;
+          break;
+        }
+  }
+  static ff::Converted c; // render thread
+  ff::convert(d, baseStage, c);
+  ++g_ffStats.draws;
+  ++(c.flat ? g_ffStats.flat : c.blend == ff::kBlendNone ? g_ffStats.rigid
+     : c.blend == ff::kBlendNonIndexed                   ? g_ffStats.nonIndexed
+                                                          : g_ffStats.indexed);
+  g_ffStats.indexedColor += c.blend == ff::kBlendIndexedColor;
+  g_ffStats.pretransformed += c.pretransformed;
+  g_ffStats.fvf += f.fvf != 0;
+  g_ffStats.tweening += c.tweening;
+  g_ffStats.fourMatrices += c.matrices > 3 && c.blend != ff::kBlendNone;
+  g_ffStats.uvTransforms += c.uvTransform;
+  g_ffStats.projected += c.projected;
+  g_ffStats.generated += c.generated;
+  g_ffStats.untextured += !c.textureUsed;
+  g_ffStats.otherStage += baseStage != 0;
+  g_ffStats.irises += c.iris;
+  const bool probe = fixedFunctionProbeWants(d, c);
+  if (c.skip) {
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      ++g_ffSkipped[c.skip];
+    }
+    if (probe)
+      probeFixedFunctionDraw(d, c, "dropped");
+    return;
+  }
+  Draw x = d;
+  x.fixedFunctionConverted = true;
+  x.vsConstants = c.constants;
+  x.vertexProgram = c.program;
+  if (c.elementsChanged)
+    x.elements = c.elements;
+  x.texture0 = c.textureUsed ? d.stageTextures[c.baseStage] : nullptr;
+  x.texture0Target = x.texture0 && d.textureTargets >> c.baseStage & 1;
+  // What onDraw did with it: the counters it moves.
+  const size_t instances = g_instances.size(), ui = g_uiCommands.size();
+  const uint32_t before[] = {g_stats.flat, g_stats.offTarget, g_stats.depthOnly, g_stats.noPosition, g_stats.noData,
+                             g_stats.badRange + g_stats.badPrim + g_stats.nonFinite + g_stats.rejected +
+                                 g_stats.additiveBlack + g_stats.decalNoMesh,
+                             g_ffStats.layers, g_stats.ignored};
+  g_ffDraw = &c;
+  g_ffBlend = c.blend;
+  g_ffMatrices = c.matrices;
+  g_ffUv = c.uvTransform ? c.uv : nullptr;
+  g_ffGenerated = c.generated ? c.generatedRows : nullptr;
+  onDraw(x);
+  g_ffDraw = nullptr;
+  g_ffBlend = ff::kBlendNone;
+  g_ffMatrices = 0;
+  g_ffUv = g_ffGenerated = nullptr;
+  const uint32_t after[] = {g_stats.flat, g_stats.offTarget, g_stats.depthOnly, g_stats.noPosition, g_stats.noData,
+                            g_stats.badRange + g_stats.badPrim + g_stats.nonFinite + g_stats.rejected +
+                                g_stats.additiveBlack + g_stats.decalNoMesh,
+                            g_ffStats.layers, g_stats.ignored};
+  int outcome = 10;
+  if (g_instances.size() > instances)
+    outcome = 0;
+  else if (g_uiCommands.size() > ui)
+    outcome = 1;
+  else
+    for (int k = 0; k < 8; ++k)
+      if (after[k] != before[k]) {
+        outcome = k + 2;
+        break;
+      }
+  ++g_ffStats.outcomes[outcome];
+  if (probe)
+    probeFixedFunctionDraw(x, c, kFfOutcomes[outcome]);
+}
+
 void onDraw(const Draw &d) {
+  if (d.fixedFunction && !d.fixedFunctionConverted)
+    return onFixedFunctionDraw(d);
+  // A screen camera's monitor (screenSlot): an opaque surface the runtime
+  // traces the camera's view on, however the engine blends the texture.
+  if (d.texture0Target && d.mainTarget && (d.blend || d.alphaTest) && screenSlot(d.texture0) >= 0) {
+    Draw screen = d;
+    screen.blend = screen.alphaTest = false;
+    ++g_stats.screenDraws;
+    float uv[8] = {1, 0, 0, 0, 0, 1, 0, 0};
+    const float *rows = d.vsConstants + 48 * 4;
+    if (std::all_of(rows, rows + 8, [](float x) { return std::isfinite(x); }) &&
+        (rows[0] != 0 || rows[1] != 0) && (rows[4] != 0 || rows[5] != 0))
+      std::copy_n(rows, 8, uv);
+    g_screenUv = uv;
+    std::copy_n(uv, 8, g_screenUvRows);
+    g_screenMaterial = engine_materials::currentName();
+    onDraw(screen);
+    g_screenUv = nullptr;
+    return;
+  }
+  if (opaqueTranslucent(d)) {
+    Draw opaque = d;
+    opaque.blend = false;
+    ++g_stats.opaqueTranslucent;
+    return onDraw(opaque);
+  }
   Timer timer(g_usDraw, &g_totalUs[0]);
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
     return;
+  // Inside a portal view's world lists (Portal 2): the BSP's world stands in
+  // for everything drawn there (brushes, displacements, decals, the 2D sky).
+  if (g_portalWorldLists > 0) {
+    ++g_portalViewStats.worldDropped;
+    return;
+  }
+  // ShatteredGlass (a broken func_breakable_surf): each piece binds a shape
+  // mask as $basetexture (the BreakableSurface proxy's models/brokenglass/
+  // glassbroken_*: white, the shape in alpha, on TEXCOORD0) and the glass
+  // itself as $detail (sampler 3, on the window's TEXCOORD2); the shader
+  // multiplies them. Taken alone, the white mask made the pane white. A whole
+  // block (its mask solid) is drawn as the glass; an edge piece keeps its
+  // mask (the jagged outline) with the glass's mean colour.
+  float shatteredTint[4] = {1, 1, 1, 1};
+  bool shatteredEdge = false;
+  if (const auto &m = engine_materials::bound();
+      !g_inShardDraw && m.known && nameStarts(m.shader, "shatteredglass") && d.stageTextures[3] &&
+      d.texture0 != d.stageTextures[3] && d.elements && findElement(d.elements, D3DDECLUSAGE_TEXCOORD, 2)) {
+    const std::string &mask = engine_materials::current().base;
+    if (mask.size() >= 6 && mask.compare(mask.size() - 6, 6, "_solid") == 0) {
+      static D3DVERTEXELEMENT9 remapped[65]; // render thread
+      size_t n = 0;
+      for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff && n < 64; ++e, ++n) {
+        remapped[n] = *e;
+        if (e->Usage == D3DDECLUSAGE_TEXCOORD && (e->UsageIndex == 0 || e->UsageIndex == 2))
+          remapped[n].UsageIndex = BYTE(2 - e->UsageIndex);
+      }
+      remapped[n] = D3DVERTEXELEMENT9{0xff, 0, D3DDECLTYPE_UNUSED, 0, 0, 0}; // D3DDECL_END
+      Draw glass = d;
+      glass.texture0 = d.stageTextures[3];
+      glass.elements = remapped;
+      ++g_stats.shatteredSolid;
+      onDraw(glass);
+      return;
+    }
+    const std::string detail = engine_materials::currentTextureName("$detail");
+    if (!detail.empty() && drawShardQuads(d, mask, detail))
+      return;
+    // Else the mask, in the glass's mean colour.
+    if (!detail.empty() && bsp::textureMeanColor(detail, shatteredTint)) {
+      shatteredEdge = true;
+      ++g_stats.shatteredTinted;
+    }
+  }
   // $fogmaxdensity of the view being drawn (see SceneFog): cFogParams.z of a
   // world draw whose vertex shader computes fog.
   if (g_worldLists > 0 && d.mainTarget && d.vertexProgram && d.vsConstants) {
@@ -3334,6 +5945,29 @@ void onDraw(const Draw &d) {
   }
   if (d.stencil || d.texture0Target || d.target)
     census(d);
+#if defined(PROXY_GAME_EZ2)
+  // Entity glows (CGlowObjectManager: Entropy : Zero 2's squad outlines). The
+  // glowing models are drawn with dev/glow_color invisibly into the stencil
+  // (alpha 0), then in the glow colour (c1: colour, opacity) into
+  // _rt_FullFrameFB, which dev/halo_add_to_screen lays outside the marked
+  // silhouettes. As the runtime's halos: the coloured draws are the sources
+  // (g_glowHalo), the rest is dropped.
+  if (const char *name = engine_materials::currentName();
+      !g_glowHalo && name &&
+      (std::strcmp(name, "dev/glow_color") == 0 || std::strcmp(name, "dev/halo_add_to_screen") == 0)) {
+    if (name[4] == 'g' && !d.mainTarget && !d.stencil && d.psConstants && d.psConstants[1 * 4 + 3] > 0.01f) {
+      g_glowHalo = d.psConstants + 1 * 4;
+      Draw source = d;
+      source.mainTarget = true;
+      source.target = nullptr;
+      source.blend = false;
+      onDraw(source);
+      g_glowHalo = nullptr;
+    }
+    ++g_stats.glowDraws;
+    return;
+  }
+#endif
   // Flat draws into render-target textures or sampling them are the engine's
   // screen-space passes (effects): replayed by the runtime, not drawn here.
   // So are the draws of screenspace_general materials (addons' own shaders)
@@ -3343,11 +5977,26 @@ void onDraw(const Draw &d) {
     float projection[16];
     getMatrix(kMatrixProjection, projection);
     const bool perspective = std::fabs(std::fabs(projection[11]) - 1.0f) < 1e-3f && std::fabs(projection[15]) < 1e-3f;
-    const bool custom = material.known && nameStarts(material.shader, "screenspace_general");
-    if ((!perspective || custom) && hostpass::recordDraw(d, projection))
+    const bool screenspace = material.known && nameStarts(material.shader, "screenspace_general");
+    const bool isExoModel = screenspace && (material.isModel || engine_materials::current().pbr.active);
+    const bool custom = screenspace && !isExoModel;
+#if defined(PROXY_GAME_EZ2)
+    // Distortion (heat haze, particle/warp4_warp; refracting glass): the
+    // Refract shader samples the frame the engine copied (_rt_PowerOfTwoFB),
+    // which as a host copy is the path-traced frame, so the game's own shader
+    // bends it, tested against the runtime's depth.
+    const bool refract = material.known && nameStarts(material.shader, "refract") && d.textureTargets;
+#else
+    const bool refract = false;
+#endif
+    if ((!perspective || custom || refract) && hostpass::recordDraw(d, projection))
       return;
   }
-  if (!d.mainTarget) {
+  // A screen camera's view (render.RenderView, a point_camera): its scene
+  // draws are taken like the main view's (role Screen), so what only that
+  // camera sees is in the scene.
+  const bool screenView = !d.mainTarget && d.target && screenSlot(d.target) >= 0;
+  if (!d.mainTarget && !screenView) {
     // The engine's depth pass (addons' depth buffers): the runtime's own depth
     // stands in for the geometry.
     if (d.target && material.known && nameStarts(material.shader, "depthwrite") && hostpass::recordDepth(d))
@@ -3359,6 +6008,69 @@ void onDraw(const Draw &d) {
     ++g_stats.depthOnly; // depth prepass / shadow depth
     return;
   }
+  // The engine's portal surfaces (Portal 2, models/portals/...: the stencil
+  // hole, the render-target mesh, the static overlays) where the portals are
+  // ray portals (portal2.h): an opaque one is no instance (it would cover the
+  // ray portal's mesh); one that marks the stencil only marks it (what the
+  // engine draws through the hole afterwards stays masked to it); blended ones
+  // (rims, ghosts) are dropped while the proxy has the runtime draw its own
+  // (portal2::ownRims), else raster overlays.
+#ifdef PROXY_GAME_PORTAL2
+  // By its path, or by its shader (PortalRefract, PortalStaticOverlay: some
+  // portal draws' materials are not under models/portals/).
+  const bool portalShader = material.known && (nameStarts(material.shader, "portalrefract") ||
+                                               nameStarts(material.shader, "portalstaticoverlay"));
+  const bool portalSurface =
+      portal2::enabled() && (portal2::isPortalMaterial(engine_materials::currentName()) || portalShader);
+  if (portalSurface && !portal2::isPortalMaterial(engine_materials::currentName())) {
+    ++g_portalViewStats.byShader;
+    std::lock_guard<std::mutex> lock(g_portalViewStats.byShaderMutex);
+    g_portalViewStats.byShaderName = engine_materials::currentName() ? engine_materials::currentName() : "(none)";
+  }
+  // The ghosts (PortalStaticOverlay, $ghostoverlay: portals seen through
+  // walls) are never replayed: the proxy has the runtime draw them (with
+  // their depth test, GREATER; as plain overlays their corner marks showed
+  // beside every portal).
+  if (portalSurface && d.blend && portal2::ownRims() && portal2::engineRims() && !d.target &&
+      !(material.known && nameStarts(material.shader, "portalstaticoverlay"))) {
+    // The engine's own rims and static (PortalRefract $Stage 2): replayed on
+    // the path-traced frame with its shaders, whatever the host-pass setting,
+    // when asked for (portal2::engineRims; off by default). Those of
+    // the portal views are left out: drawn from a portal's virtual camera
+    // through a stencil the replay does not have, they would land unclipped.
+    // The portal views are not always told by their marker (not drawn into
+    // the back buffer then), so a rim is taken only from the main view: the
+    // frame's last world view so far (portal views add none), stored
+    // left-handed.
+    float view[16], projection[16];
+    getMatrix(kMatrixView, view);
+    getMatrix(kMatrixProjection, projection);
+    bool inPortalView = false;
+    for (const auto &placement : g_portalViews)
+      inPortalView |= samePlacement(view, placement.data());
+    if (projection[11] < 0)
+      for (int r = 0; r < 4; ++r)
+        view[r * 4 + 2] = -view[r * 4 + 2];
+    inPortalView |= g_worldViews.empty() || !samePlacement(view, g_worldViews.back().view);
+    if (inPortalView) {
+      ++g_portalViewStats.engineRimsInViews;
+    } else {
+      // Coplanar with the wall the portal is on: tested against the runtime's
+      // depth pushed back a little (portal2::engineRimDepthScale).
+      if (hostpass::recordAlways(d, projection, portal2::engineRimDepthScale())) {
+        ++g_portalViewStats.engineRims;
+        return;
+      }
+      ++g_portalViewStats.engineRimsRefused;
+    }
+  }
+  if (portalSurface && ((!d.blend && !d.stencil) || (d.blend && portal2::ownRims()))) {
+    ++g_portalViewStats.surfacesDropped;
+    return;
+  }
+#else
+  constexpr bool portalSurface = false;
+#endif
   uint32_t categories = remixCategories(d.forkCategories) | g_markerCategories;
   // rtx.conf texture categories, by the base texture's dxvk hash.
   const uint64_t baseTextureHash = textureHash(d.texture0);
@@ -3483,11 +6195,22 @@ void onDraw(const Draw &d) {
   if (d.blend)
     ++(d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE ? g_stats.additive : g_stats.blended);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
-  const bool skinnedDraw = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr;
+  // (A fixed-function draw blending without indices has no BLENDINDICES.)
+  const bool skinnedDraw = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr ||
+                           (g_ffDraw && g_ffDraw->bonesPerVertex);
+  // A studio model's decals come right after its own draws (studiorender
+  // draws a model, then its decals); a brush entity's after a brush.
+  static bool afterStudio = false;
+  const bool studioDecal = lifted && afterStudio;
+  if (!lifted)
+    afterStudio = skinnedDraw;
   // Particles (see submitParticles). A shader that builds its geometry reads
-  // POSITION as it likes (a curve parameter, any type).
+  // POSITION as it likes (a curve parameter, any type). Not the portal
+  // surfaces (PortalRefract expands its quad too): the stencil hole only marks
+  // the stencil (below), as a particle it was drawn, its texture over the
+  // portal.
   const ParticleKind particle =
-      pos && pos->Stream < 4
+      pos && pos->Stream < 4 && !portalSurface
           ? particleKind(d, bound, skinnedDraw, d.streams[pos->Stream].dynamic || d.indices.dynamic,
                          multiply && !decalHow)
           : kNotParticle;
@@ -3495,9 +6218,13 @@ void onDraw(const Draw &d) {
     ++g_stats.noPosition;
     return;
   }
+  // A skinned layout drawn with no bones was skinned on the CPU (studiorender's
+  // software path: world-space vertices, bone 0 the identity): rigid, as the
+  // shader draws it. Its blend indices are stale and name leftover matrices.
+  // A fixed-function draw blends as D3D's render states say (fixed_function.h).
   uint32_t bonesPerVertex = 0;
   if (skinnedDraw) {
-    bonesPerVertex = uint32_t(std::clamp(currentNumBones(), 1, 3));
+    bonesPerVertex = g_ffDraw ? g_ffDraw->bonesPerVertex : uint32_t(std::clamp(currentNumBones(), 0, 3));
     ++g_stats.skinned;
   }
   const auto &ps = d.streams[pos->Stream];
@@ -3510,8 +6237,18 @@ void onDraw(const Draw &d) {
   auto &view = g_views[viewKey];
   if (view.draws++ == 0) {
     view.order = g_viewOrder++;
-    getMatrix(kMatrixView, view.view);
-    getMatrix(kMatrixProjection, view.projection);
+    if (g_ffDraw) { // D3D's transforms (fixed_function.h)
+      std::memcpy(view.view, g_ffDraw->view, sizeof(view.view));
+      std::memcpy(view.projection, g_ffDraw->projection, sizeof(view.projection));
+      view.fixedFunction = true;
+    } else {
+      getMatrix(kMatrixView, view.view);
+      getMatrix(kMatrixProjection, view.projection);
+      for (const auto &placement : g_portalViews)
+        view.portal |= samePlacement(view.view, placement.data());
+      g_portalViewStats.viewsDrawn += view.portal;
+    }
+    view.screenTarget = screenView ? d.target : nullptr;
     // Source builds right-handed D3DX matrices (row vectors, camera looking
     // down -z, projection m[2][3] = -1, depth 0..1). Flipping view-space z
     // (negate the view's third column and the projection's third row) keeps
@@ -3537,6 +6274,8 @@ void onDraw(const Draw &d) {
         view.projection[8 + c] = -view.projection[8 + c];
     }
   }
+  if (!view.perspective && view.screenTarget)
+    return; // a screen view's 2D draws: in its image only
   if (!view.perspective) {
     ++g_stats.flat; // HUD / VGUI
     dumpFlat(d);
@@ -3556,6 +6295,51 @@ void onDraw(const Draw &d) {
     g_cameraSpace.valid = true;
   }
   const bool dynamicDraw = ps.dynamic || d.indices.dynamic;
+#if defined(PROXY_GAME_EZ2)
+  // Heat haze and other moving distortion (particle/warp4_warp: the Refract
+  // shader on a dynamic sprite) refracts a copy of the frame behind it, which
+  // the runtime does not have: drawn, its normal map showed as a coloured
+  // blob. Static Refract surfaces (glass) stay.
+  if (dynamicDraw && engine_materials::bound().known && nameStarts(engine_materials::bound().shader, "refract")) {
+    ++g_stats.refractOverlaysDropped;
+    return;
+  }
+  // Window imposters (dev/dev_windowportal, the WindowImposter shader): a
+  // func_areaportalwindow's stand-in for the room behind a doorway, a cubemap
+  // drawn over the opening. The path tracer has the room itself; drawn, the
+  // brush was a flat white or black wall across the doorway.
+  if (engine_materials::bound().known && nameStarts(engine_materials::bound().shader, "windowimposter")) {
+    ++g_stats.windowImpostersDropped;
+    return;
+  }
+  // A brush entity faded out by its render alpha (pixel shader c1.w, the
+  // modulation, which LightmappedGeneric blends by): a func_areaportalwindow's
+  // brush (halflife/black across a doorway) drawn at alpha 0 when the player
+  // is near, invisible in the game and a black wall here. Only alpha-blended:
+  // an additive brush's c1.w is 0 however visible (frosted glass, $additive).
+  if (d.blend && d.dstBlend == D3DBLEND_INVSRCALPHA && d.psConstants && !(d.psConstants[1 * 4 + 3] > 0.004f) &&
+      engine_materials::bound().known &&
+      nameStarts(engine_materials::bound().shader, "lightmappedgeneric")) {
+    ++g_stats.windowImpostersDropped;
+    return;
+  }
+#endif
+  // A water surface's $bottommaterial ($abovewater 0: the surface as seen
+  // from below) drawn while the camera is above the water: Source shows it
+  // only from below, yet the engine draws it every frame ($nocull: HL:Source
+  // undertow's moving water, liquids/water_tentacle_beneath, the inside of its
+  // whole box, one face on its top's plane): blended in the game, coplanar
+  // here, they z-fought. By the VMT (bsp::waterBottomMaterial).
+  // OPENREMIX_PROXY_WATER_BOTTOMS=1 keeps them.
+  static const bool waterBottoms = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_BOTTOMS", v, sizeof(v)) && v[0] == '1';
+  }();
+  if (!waterBottoms && !g_cameraInWater && engine_materials::bound().known &&
+      bsp::waterBottomMaterial(engine_materials::currentName())) {
+    ++g_stats.waterBottomsDropped;
+    return;
+  }
   uint64_t instanceView = viewKey;
   const float (*cameraToWorld)[4] = nullptr;
   if (view.cameraSpace) {
@@ -3587,9 +6371,16 @@ void onDraw(const Draw &d) {
   // Particles leave here: before the flashlight-pass filter (an additive
   // Spritecard or unlit draw is never that pass, whatever texture it holds),
   // and outside the decal, emissive and mesh-cache logic below.
+#if defined(PROXY_GAME_EZ2)
+  if (particle != kNotParticle) {
+    submitParticles(d, particle, instanceView, cameraToWorld, categories & ~kDecalCategories, eye, view.projection);
+    return;
+  }
+#else
   if (particle != kNotParticle &&
       submitParticles(d, particle, instanceView, cameraToWorld, categories & ~kDecalCategories, eye, view.projection))
     return;
+#endif
   // What else is blended and rebuilt every frame, for the statistics: the
   // candidates the particle rules above did not take.
   if (particle == kNotParticle && particlesEnabled() && d.blend && !skinnedDraw && dynamicDraw) {
@@ -3605,9 +6396,13 @@ void onDraw(const Draw &d) {
       left.dstBlend = d.dstBlend;
     }
   }
+#if defined(PROXY_GAME_EZ2)
+  if (!skinnedDraw && !d.blend && bsp::isStaticProp(d.vsConstants + kRegModel * 4, eye)) {
+#else
   if (!d.blend && bsp::isStaticProp(d.vsConstants + kRegModel * 4, eye)) {
+#endif
     // Their ambient cubes still feed the sky light estimate (onPresent).
-    if (findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0))
+    if (findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) && !d.fixedFunction) // (no ambient cube there)
       view.ambientUp.push_back({d.vsConstants[kRegAmbientUp * 4], d.vsConstants[kRegAmbientUp * 4 + 1],
                                 d.vsConstants[kRegAmbientUp * 4 + 2]});
     ++g_stats.bspPropsDropped;
@@ -3625,6 +6420,7 @@ void onDraw(const Draw &d) {
   // texture there, the same buffers and range as an opaque draw earlier in
   // the frame (effects are drawn once). Additive is ONE/ONE, or
   // SRCALPHA/ONE for translucent materials (decals).
+  // Not where the engine draws none (game::kEngineFlashlightPasses: Portal 2).
   struct {
     const void *vertices, *indexBuffer;
     uint32_t offset, startIndex, primCount, minIndex;
@@ -3641,13 +6437,38 @@ void onDraw(const Draw &d) {
   const uint64_t geometryKey = fnv(&drawRange, sizeof(drawRange));
   if (!d.blend && !ps.dynamic)
     opaqueDrawn.insert(geometryKey);
-  if (d.blend && d.dstBlend == D3DBLEND_ONE && (d.srcBlend == D3DBLEND_ONE || d.srcBlend == D3DBLEND_SRCALPHA)) {
+  // Fixed-function materials draw in passes: an opaque one (the base texture
+  // with the lightmap on stage 1), then blended layers over the same
+  // vertices ($detail as a mod2x pass, a self-illumination or environment
+  // pass added). The surface is the first pass's, as the material makes it
+  // (engine_materials); the layers go, unless they are decals.
+  if (g_ffDraw && d.blend && !lifted && !ps.dynamic && opaqueDrawn.count(geometryKey)) {
+    ++g_ffStats.layers;
+    return;
+  }
+  if (game::kEngineFlashlightPasses && d.blend && d.dstBlend == D3DBLEND_ONE &&
+      (d.srcBlend == D3DBLEND_ONE || d.srcBlend == D3DBLEND_SRCALPHA)) {
     static std::unordered_set<const void *> cookies; // render thread only
     static uint32_t cookieEpoch = ~0u;
     if (cookieEpoch != g_skyEpoch) { // a new map: texture pointers are reused
       cookies.clear();
       cookieEpoch = g_skyEpoch;
     }
+#if defined(PROXY_GAME_EZ2)
+    // Lit surface materials are not additive; an additive pass over one is an engine
+    // lighting or flashlight pass. Likewise any static geometry already drawn opaque earlier.
+    const bool litPass = engine_materials::currentIsLitOpaque();
+    if (litPass || (!ps.dynamic && opaqueDrawn.count(geometryKey))) {
+      ++g_stats.flashlightPasses;
+      g_stats.flashlightLitPasses += litPass;
+      return;
+    }
+    if (const auto lights = engine_lights::current(); lights && !lights->projected.empty()) {
+      if (g_worldLists > 0 && d.texture0)
+        cookies.insert(d.texture0);
+      if (g_worldLists > 0 || cookies.count(d.texture0)) {
+        ++g_stats.flashlightPasses;
+#else
     if (const auto lights = engine_lights::current(); lights && !lights->projected.empty()) {
       if (g_worldLists > 0 && d.texture0)
         cookies.insert(d.texture0);
@@ -3660,6 +6481,7 @@ void onDraw(const Draw &d) {
       if (g_worldLists > 0 || cookies.count(d.texture0) || (!ps.dynamic && opaqueDrawn.count(geometryKey)) || litPass) {
         ++g_stats.flashlightPasses;
         g_stats.flashlightLitPasses += litPass;
+#endif
         return;
       }
     }
@@ -3674,6 +6496,28 @@ void onDraw(const Draw &d) {
       std::lock_guard<std::mutex> lock(g_transientSampleLock);
       ++g_keptWorldTextures[baseTextureHash];
     }
+  } else if (!d.blend && !ps.dynamic && bsp::active() && d.primCount) {
+    // A func_lod brush, which the BSP world bakes (bsp::isBakedBrushEntity):
+    // its first triangle's corners are the baked faces' corners. (Static
+    // vertices like the world's; the index buffer is rebuilt per frame. A
+    // fading one is blended and stays: the baked copy is opaque.)
+    const float *corner[3] = {};
+    for (uint32_t k = 0; k < 3; ++k) {
+      const size_t at = size_t(d.startIndex + k) * (d.indices.is32 ? 4 : 2);
+      if (at + (d.indices.is32 ? 4 : 2) > d.indices.size)
+        break;
+      uint32_t index = 0;
+      std::memcpy(&index, d.indices.data + at, d.indices.is32 ? 4 : 2);
+      const int64_t vertex = int64_t(d.baseVertex) + index;
+      const size_t offset = size_t(ps.offset) + size_t(vertex) * ps.stride + pos->Offset;
+      if (vertex < 0 || offset + 12 > ps.size)
+        break;
+      corner[k] = reinterpret_cast<const float *>(ps.data + offset);
+    }
+    if (corner[2] && bsp::isBakedBrushEntity(corner[0], corner[1], corner[2])) {
+      ++g_stats.bspBrushEntitiesDropped;
+      return;
+    }
   }
 
   // What the Source material bound for this draw does with its texture
@@ -3683,10 +6527,48 @@ void onDraw(const Draw &d) {
   engine_materials::Shading shading;
   if (!additiveDraw && !multiply)
     shading = shadingFor(d.texture0, engine_materials::current());
+  if (shatteredEdge)
+    std::copy_n(shatteredTint, 3, shading.albedo);
+  probeMaterialDraw(d.texture0, engine_materials::current(), shading, additiveDraw, multiply);
+  probeShaderDraw(d, shading);
+  if (shading.mode == engine_materials::Shading::Unlit)
+    vb_origins::countUnlit(d.streams[0].buffer);
+  // Lua-built meshes (a Lua Mesh(): InfMap terrain and scripted maps) are
+  // static buffers made outside every engine allocation bracket
+  // (vb_origins). Their unlit materials are lit as surfaces: such maps bake
+  // their shading into vertex colours for want of lighting, which the path
+  // tracer provides. Model sprites, screens and 3D2D panels (engine buffers)
+  // stay unlit. OPENREMIX_PROXY_LUA_MESHES_LIT=0 keeps them unlit.
+  static const bool litLuaMeshes = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_LUA_MESHES_LIT", v, sizeof(v)) && v[0] == '0');
+  }();
+  bool luaLit = false, luaColors = false;
+  if (litLuaMeshes && shading.mode == engine_materials::Shading::Unlit) {
+    vb_origins::Origin origin;
+    luaLit = vb_origins::find(d.streams[0].buffer, origin) && !origin.allocator && !origin.dynamic;
+    if (luaLit) {
+      luaColors = shading.vertexColor;
+      shading = {};
+      shading.base = engine_materials::current().base;
+      ++g_stats.luaLitDraws;
+    }
+  }
+  // Detail sprites (the map's grass, bushes, ...): UnlitGeneric only because
+  // the engine lights them itself, with the lighting the map compiler baked at
+  // each sprite as its vertex colours. Emitted, that light glowed in the dark.
+  // Lit as surfaces, those colours dropped: the path tracer lights them.
+  if (shading.mode == engine_materials::Shading::Unlit &&
+      bsp::isDetailSpriteMaterial(engine_materials::currentName())) {
+    shading = {};
+    shading.base = engine_materials::current().base;
+    ++g_stats.detailSpriteDraws;
+  }
   // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
   // panels, sprites). Other COLOR0 streams (baked prop lighting) do not.
   const bool hasColors = findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr;
   const bool unlitColors = shading.mode == engine_materials::Shading::Unlit && shading.vertexColor && hasColors;
+  const bool hueColors = luaColors && hasColors; // a lit Lua mesh's $vertexcolor: its hue
   // An alpha decal's vertices carry its colour and its fade ($vertexcolor,
   // $vertexalpha: scorch marks and sprays fade out through vertex alpha; the
   // world shaders read both with $vertexcolor alone). mod2x and multiply
@@ -3703,6 +6585,12 @@ void onDraw(const Draw &d) {
                               (bound.vertexAlpha || (bound.lightmapped && bound.vertexColor));
   const bool decalColors = decalColorsEnabled && !unlitColors && decalKind == kDecalAlpha && decalMaterial && hasColors &&
                            (bound.vertexColor || decalAlphaFade);
+  // Vertex colours the mesh carries (texture x vertex colour by default).
+  const bool meshColors = unlitColors || decalColors || hueColors;
+  struct HueScope {
+    explicit HueScope(bool on) { g_hueColors = on; }
+    ~HueScope() { g_hueColors = false; }
+  } hueScope(hueColors);
   if (decalKind == kDecalMod2x && decalMaterial && bound.vertexColor && bound.vertexAlpha)
     ++g_stats.decalModulateFade;
   // Decals over decals: all at one height they were coplanar, and which one a
@@ -3711,18 +6599,43 @@ void onDraw(const Draw &d) {
   // within a draw (a batch of one material's decals) each vertex a little
   // above the one before it; the next draw starts above the last. Above the
   // map's overlays (0.1) and its second layers (0.05); in all under the
-  // runtime's attach distance (~2 inches): past kDecalRise they share a height.
-  constexpr float kDecalOffset = 0.15f, kDecalVertexStep = 0.001f, kDecalDrawGap = 0.004f, kDecalRise = 1.2f; // inches
+  // runtime's attach distance (~2 inches): past the rise cap they share a height.
+  // Model decals (drawn outside the world lists: props, NPCs) have no
+  // overlays under them and stack on their own, a fiftieth as high: lifted
+  // along a curved model's normals, paint at its silhouette stood out past it,
+  // where rays that miss the model met it unattached (a bullet hole as a dark
+  // disc beside a barrel, a grey strip off its edge; issue #104), and seen
+  // at an angle it slid off the hole it marks. The runtime finds the receiver
+  // with paint left out, so the lift only orders overlapping paint.
+  // studiorender itself places model decals 0.1 off the model, along its
+  // normals, and hides that with depth bias: a blood decal stood as a shell
+  // over G-Man's face (every vertex measured 0.099-0.101 out). They come
+  // back down by that much first.
+  // OPENREMIX_PROXY_MODEL_DECAL_LIFT scales the model lift (0: none).
+  constexpr float kStudioDecalOffset = 0.1f; // inches
+  struct DecalLift { float offset, vertexStep, vertexCap, drawGap, riseCap; }; // inches
+  static const DecalLift kWorldLift = {0.15f, 0.001f, 0.3f, 0.004f, 1.2f}, kModelLift = [] {
+    char v[32] = {};
+    const float scale = GetEnvironmentVariableA("OPENREMIX_PROXY_MODEL_DECAL_LIFT", v, sizeof(v))
+                            ? std::max(0.0f, float(std::atof(v)))
+                            : 1.0f;
+    return DecalLift{0.01f * scale, 0.00005f * scale, 0.005f * scale, 0.0005f * scale, 0.015f * scale};
+  }();
+  const bool modelDecal = g_worldLists == 0;
+  const DecalLift &lifting = modelDecal ? kModelLift : kWorldLift;
   static uint64_t decalFrame = ~0ull;
-  static float decalRise = 0; // how far this frame's decals have stacked up
+  static float decalRise[2] = {}; // how far this frame's world and model decals have stacked up
   if (decalFrame != g_frame) {
     decalFrame = g_frame;
-    decalRise = 0;
+    decalRise[0] = decalRise[1] = 0;
   }
-  const float lift = lifted ? kDecalOffset + decalRise : 0;
+  float &rise = decalRise[modelDecal];
+  const float lift = lifted ? lifting.offset + rise - (studioDecal ? kStudioDecalOffset : 0) : 0;
   if (lifted) // the next draw starts above this one's last vertex
-    decalRise = std::min(decalRise + std::min(float(d.numVertices) * kDecalVertexStep, 0.3f) + kDecalDrawGap, kDecalRise);
-  g_liftVertexStep = lifted ? kDecalVertexStep : 0;
+    rise = std::min(rise + std::min(float(d.numVertices) * lifting.vertexStep, lifting.vertexCap) + lifting.drawGap,
+                    lifting.riseCap);
+  g_liftVertexStep = lifted ? lifting.vertexStep : 0;
+  g_liftVertexCap = lifting.vertexCap;
   const float windingSign = lifted ? faceNormalSign(d.cullMode) : 1;
 
   struct Key {
@@ -3740,13 +6653,44 @@ void onDraw(const Draw &d) {
   } key = {ps.buffer, d.indices.buffer, d.declaration, ps.version, d.indices.version, ps.offset, ps.stride,
            d.baseVertex, d.minIndex, d.numVertices, d.startIndex, d.primCount, uint32_t(d.type), bonesPerVertex, 0};
   static_assert(sizeof(Key) == 3 * sizeof(void *) + 12 * sizeof(uint32_t), "Key must have no padding: it is hashed as bytes");
-  uint64_t hash = fnv(&key, sizeof(key)) ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^
-                  (unlitColors ? 0xc0105c0105c0105ull : 0) ^ (decalColors ? 0x0decac0105c0105ull : 0) ^
-                  (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+  // The mesh's name: its buffers' place (or its contents, see contentCache
+  // below) and how it is built.
+  const auto meshName = [&](uint64_t geometryName) {
+    uint64_t h = geometryName ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^ (unlitColors ? 0xc0105c0105c0105ull : 0) ^
+                 (decalColors ? 0x0decac0105c0105ull : 0) ^ (hueColors ? 0x4e0c0105c0105ull : 0) ^
+                 (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+    if (g_screenUv)
+      h = fnv(g_screenUv, 8 * sizeof(float), h);
+    if (g_ffUv)
+      h = fnv(g_ffUv, 8 * sizeof(float), h);
+    return h;
+  };
+  uint64_t hash = meshName(fnv(&key, sizeof(key)));
   // A flexed draw (see flexScale) changes every frame although its own
   // buffers are static. `flexContent` names this frame's deltas: the flex
   // mesh's place and version (0: at rest).
-  const float flex = particle == kNotParticle ? flexScale(d) : 0;
+  // Left 4 Dead 2's common infected (l4d2::infected): their gradient-mapped
+  // material and wounds. Their vertex shader reads no flex stream: the mesh
+  // is the bind pose it sees (c3, the flex scale elsewhere, is a light count there).
+  // Blended, they are taken only fading: alpha blending by the alpha the
+  // pixel shader writes, g_DiffuseModulation's (the material's opacity).
+#ifdef PROXY_GAME_L4D2
+  l4d2::infected::Params infected;
+  const bool alphaBlended = d.blend && d.blendOp == D3DBLENDOP_ADD && d.srcBlend == D3DBLEND_SRCALPHA &&
+                            d.dstBlend == D3DBLEND_INVSRCALPHA;
+  const bool infectedShader = l4d2::infected::enabled() &&
+                              l4d2::infected::classify(d.pixelShader, d.vertexShader, d.psConstants, d.vsConstants,
+                                                       alphaBlended, infected);
+  const bool infectedFade = infectedShader && alphaBlended && infected.fadeable;
+  const bool infectedDraw = infectedShader && (!d.blend || infectedFade) && !d.alphaTest && !lifted &&
+                            particle == kNotParticle;
+  const bool flexIgnored = infectedDraw && flexScale(d) != 0;
+  if (infectedShader && !infectedDraw)
+    refuseInfected(d, infected, lifted, particle != kNotParticle);
+#else
+  constexpr bool infectedDraw = false, infectedFade = false;
+#endif
+  const float flex = particle == kNotParticle && !infectedDraw ? flexScale(d) : 0;
   uint64_t flexContent = 0;
   if (flex != 0) {
     const auto &fs = d.streams[findElement(d.elements, D3DDECLUSAGE_POSITION, 1)->Stream];
@@ -3763,86 +6707,137 @@ void onDraw(const Draw &d) {
   // on a flexed face and flexed draws from dynamic buffers stay per frame,
   // named by their deltas.
   const bool dynamicBuffers = ps.dynamic || d.indices.dynamic;
-  // Models without delta flexes (older ones: Breen, the fisherman, gman.mdl)
-  // are flexed, and some skinned, on the CPU: studiorender rewrites their
-  // vertices into the dynamic vertex buffer every frame and draws them with
-  // the model's own static index buffer (R_StudioDrawDynamicMesh). Built and
-  // dropped every frame, such a face was a new object to the runtime each
-  // time, with no motion vectors: smeared while the head turned. Named by
-  // its index range instead (and its place among this frame's draws of the
-  // same range, for several characters of one model), it is one mesh,
-  // refreshed in place like a delta-flexed face.
-  const bool cpuDeformed =
-      ps.dynamic && !d.indices.dynamic && skinnedDraw && !lifted && particle == kNotParticle;
-  uint64_t cpuHash = 0;
-  if (cpuDeformed) {
-    const struct {
-      const void *indices, *declaration;
-      uint32_t indicesVersion, startIndex, primCount, numVertices, type, bonesPerVertex;
-    } range = {d.indices.buffer, d.declaration, d.indices.version, d.startIndex, d.primCount, d.numVertices,
-               uint32_t(d.type), bonesPerVertex};
-    static_assert(sizeof(range) == 2 * sizeof(void *) + 6 * sizeof(uint32_t), "hashed as bytes: no padding");
-    // This frame's vertices: where the engine wrote them.
-    const struct {
-      const void *buffer;
-      uint32_t version, offset;
-      int baseVertex;
-    } written = {ps.buffer, ps.version, ps.offset, d.baseVertex};
-    flexContent = fnv(&written, sizeof(written)) | 1;
-    // Characters of one model are told apart by the order of their vertex
-    // writes this frame, not of their draws: the engine draws one write more
-    // than once (a pass per material pass), and a copy per draw laid a second
-    // face exactly over the first (rays leaving one met the other: black
-    // speckles, z-fighting at the edges). Draws of one write share a mesh and
-    // are dropped as duplicates, as before.
-    static uint64_t ordinalFrame = ~0ull;
-    static std::unordered_map<uint64_t, std::vector<uint64_t>> writes; // per range, this frame's writes in order
-    if (ordinalFrame != g_frame) {
-      ordinalFrame = g_frame;
-      writes.clear();
+  // A model studiorender flexed or skinned on the CPU (a face): its vertices
+  // are written to a dynamic buffer every frame, at a new offset, over a
+  // static index range. Named by that range and matched to last frame's
+  // draws of it by place (bone 0, or the first vertex of one skinned on the
+  // CPU: the order of several characters' draws changes as they move), it
+  // keeps one mesh refreshed in place like a flexed face: one instance whose
+  // previous vertices give motion vectors, where a mesh per frame had none.
+  const bool dynamicModel = ps.dynamic && !d.indices.dynamic && !d.blend && !lifted && flex == 0 &&
+                            particle == kNotParticle;
+  uint64_t lineage = 0;
+  if (dynamicModel) {
+    struct Slot {
+      float at[3];
+      uint64_t id;
+      bool taken;
+    };
+    // Render thread: last frame's and this frame's draws of each range.
+    static std::unordered_map<uint64_t, std::vector<Slot>> previous, current;
+    static uint64_t slotsFrame = ~0ull, nextLineage = 1;
+    if (slotsFrame != g_frame) {
+      previous.swap(current);
+      current.clear();
+      slotsFrame = g_frame;
     }
-    const uint64_t rangeHash = fnv(&range, sizeof(range)) ^ 0xc9f1e8c9f1e8c9f1ull;
-    auto &seen = writes[rangeHash];
-    auto found = std::find(seen.begin(), seen.end(), flexContent);
-    if (found == seen.end())
-      found = seen.insert(seen.end(), flexContent);
-    const uint32_t ordinal = uint32_t(found - seen.begin());
-    cpuHash = fnv(&ordinal, sizeof(ordinal), rangeHash);
+    const struct {
+      const void *indices, *declaration, *texture;
+      uint32_t startIndex, primCount, numVertices, bones;
+    } range = {d.indices.buffer, d.declaration, d.texture0, d.startIndex, d.primCount, d.numVertices, bonesPerVertex};
+    const uint64_t key = fnv(&range, sizeof(range), 0x6c696e65616765ull);
+    float at[3] = {d.vsConstants[kRegModel * 4 + 3], d.vsConstants[kRegModel * 4 + 7], d.vsConstants[kRegModel * 4 + 11]};
+    if (!bonesPerVertex && pos->Type == D3DDECLTYPE_FLOAT3) {
+      const uint64_t first = uint64_t(ps.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * ps.stride + pos->Offset;
+      if (ps.data && first + 12 <= ps.size)
+        std::memcpy(at, ps.data + first, 12);
+    }
+    Slot *best = nullptr;
+    float bestDistance = 64.0f * 64.0f; // units: a part moves less than this in a frame
+    for (auto &slot : previous[key]) {
+      float distance = 0;
+      for (int i = 0; i < 3; ++i)
+        distance += (slot.at[i] - at[i]) * (slot.at[i] - at[i]);
+      if (!slot.taken && distance < bestDistance) {
+        bestDistance = distance;
+        best = &slot;
+      }
+    }
+    if (best)
+      best->taken = true;
+    lineage = fnv(&key, sizeof(key), best ? best->id : nextLineage++);
+    current[key].push_back({{at[0], at[1], at[2]}, best ? best->id : (nextLineage - 1), false});
   }
-  // From buffers rewritten every frame and not tracked as above: per frame.
-  const bool rewritten = dynamicBuffers && !cpuDeformed;
-  const uint64_t flexHash = cpuDeformed ? cpuHash : hash ^ 0xf1e8f1e8f1e8f1e8ull;
+  const uint64_t flexHash = dynamicModel ? lineage : hash ^ 0xf1e8f1e8f1e8f1e8ull;
   const bool flexTracked =
-      !rewritten && !lifted && (cpuDeformed || flex != 0 || g_flexMeshes.count(flexHash) != 0);
+      dynamicModel || (!dynamicBuffers && !lifted && (flex != 0 || g_flexMeshes.count(flexHash) != 0));
   if (flex != 0 && !flexTracked)
     hash = fnv(&flexContent, sizeof(flexContent), hash);
-  const bool transientDraw = rewritten || (flex != 0 && !flexTracked);
+  if (dynamicModel)
+    flexContent = g_frame << 1 | 1; // new vertices every frame (g_frame | 1 named two frames alike)
+  // (Coordinates projected from the camera change with it: per frame.)
+  bool transientDraw = (dynamicBuffers && !dynamicModel) || (flex != 0 && !flexTracked) ||
+                       (g_ffGenerated && !flexTracked);
+  // A fixed-function engine (HL2 RTX) writes world batches, decals and
+  // overlays into dynamic buffers every frame, mostly with the same contents
+  // at another place: named by their contents they are cached like static
+  // draws (no mesh a frame built, sent and its acceleration structure made
+  // anew). A model the CPU deforms keeps its refreshed mesh, refreshed only
+  // when its contents change. OPENREMIX_PROXY_CONTENT_CACHE=0: per frame.
+  // Other games: off unless OPENREMIX_PROXY_CONTENT_CACHE=1 (measured case by case).
+  static const bool contentCache = envScale("OPENREMIX_PROXY_CONTENT_CACHE", game::kFixedFunction ? 1 : 0) > 0;
+  // So is Portal 2's light bridge (SolidEnergy, below), rewritten every frame
+  // with the same contents: one mesh while it stands, one instance, so its
+  // light stays in the light tree (refit, not rebuilt) and its estimate is
+  // made once (a new mesh only while it extends).
+#ifdef PROXY_GAME_PORTAL2
+  const bool energyDraw = portal2::enabled() && additiveDraw && bound.known && nameStarts(bound.shader, "solidenergy") &&
+                          _stricmp(engine_materials::currentName(), "effects/projected_wall") == 0;
+#else
+  constexpr bool energyDraw = false;
+#endif
+  if ((contentCache || energyDraw) && dynamicBuffers && flex == 0 && !g_ffGenerated && particle == kNotParticle) {
+    if (const uint64_t content = contentHash(d)) {
+      if (dynamicModel) {
+        flexContent = content;
+      } else if (transientDraw) {
+        struct Named {
+          uint64_t content, decl;
+          uint32_t stride, type, bonesPerVertex;
+          float lift;
+        } named = {content, uint64_t(uintptr_t(d.declaration)), ps.stride, uint32_t(d.type), bonesPerVertex, lift};
+        static_assert(sizeof(Named) == 4 * sizeof(uint64_t), "hashed as bytes: no padding");
+        hash = meshName(fnv(&named, sizeof(named), 0x636f6e74656e74ull));
+        transientDraw = false;
+        ++g_stats.contentNamed;
+        g_stats.energyMeshes += energyDraw && !g_meshes.count(hash);
+      }
+    }
+  }
+  // Eyes of such a model follow its lineage too.
+  const bool eyesPerFrame = dynamicBuffers && !dynamicModel;
 
   remixapi_MeshHandle mesh = nullptr;
   uint32_t boneCount = 0;
   uint64_t geometry = 0;
   bool faceNormals = false, meshBuilt = false;
+  uint64_t meshBuiltFrame = ~0ull;
   if (flexTracked) {
     FlexMesh &f = g_flexMeshes[flexHash];
     if (!f.handle || f.content != flexContent) {
+      g_buildKind = kBuildFlex;
       const remixapi_MeshHandle refreshed =
-          buildMesh(d, flexHash, bonesPerVertex, &boneCount, 0, unlitColors || decalColors, unlitColors || decalColors,
-                    windingSign, &faceNormals, flex, nullptr, true);
+          buildMesh(d, flexHash, bonesPerVertex, &boneCount, 0, meshColors, meshColors, windingSign, &faceNormals, flex,
+                    nullptr, true, 1, &f.topology);
       if (refreshed) {
         f.handle = refreshed;
         f.content = flexContent;
         f.bones = boneCount;
+        f.builtFrame = g_frame;
         if (!f.geometry)
-          f.geometry = dxvk::geometryHash(d);
+          f.geometry = timedGeometryHash(d);
         ++g_stats.flexRefreshed;
       } else if (!f.handle) {
         g_flexMeshes.erase(flexHash);
         return;
       }
+    } else if (dynamicModel) {
+      ++g_stats.contentRefreshSkipped; // rewritten unchanged (contentCache)
     }
     f.lastFrame = g_frame;
     mesh = f.handle;
     boneCount = f.bones;
+    meshBuiltFrame = f.builtFrame;
     geometry = f.geometry;
   } else if (transientDraw) {
     // Dynamic buffers are rewritten every frame: build, draw once, destroy.
@@ -3854,8 +6849,9 @@ void onDraw(const Draw &d) {
       ++g_transientDecls[d.declaration];
     }
     // Additive as onPresent classifies it (destination factor ONE): raster only.
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, additiveDraw || unlitColors || decalColors,
-                     unlitColors || decalColors, windingSign, &faceNormals, flex);
+    g_buildKind = kBuildTransient;
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, additiveDraw || meshColors, meshColors, windingSign,
+                     &faceNormals, flex);
     if (!mesh) {
       g_stats.decalNoMesh += lifted;
       return;
@@ -3864,7 +6860,7 @@ void onDraw(const Draw &d) {
     g_transient.push_back(mesh);
     // The replacement key only matters to mods.
     if (g_modsResult == REMIXAPI_ERROR_CODE_SUCCESS)
-      geometry = dxvk::geometryHash(d);
+      geometry = timedGeometryHash(d);
   } else if (auto it = g_meshes.find(hash); it != g_meshes.end()) {
     mesh = it->second.handle;
     boneCount = it->second.bones;
@@ -3872,14 +6868,14 @@ void onDraw(const Draw &d) {
     it->second.lastFrame = g_frame;
     ++g_stats.cacheHits;
   } else {
-    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, unlitColors || decalColors, unlitColors || decalColors,
-                     windingSign, &faceNormals);
+    g_buildKind = kBuildCached;
+    mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, meshColors, meshColors, windingSign, &faceNormals);
     if (!mesh) {
       g_stats.decalNoMesh += lifted;
       return;
     }
     meshBuilt = true;
-    geometry = dxvk::geometryHash(d);
+    geometry = timedGeometryHash(d);
     g_meshes[hash] = {mesh, g_frame, boneCount, geometry};
     {
       std::lock_guard<std::mutex> lock(g_transientSampleLock);
@@ -3921,6 +6917,12 @@ void onDraw(const Draw &d) {
 
   Instance inst;
   inst.mesh = mesh;
+#ifdef PROXY_GAME_PORTAL2
+  if (portal2::enabled())
+    if (const char *name = engine_materials::currentName())
+      inst.playerModel = _strnicmp(name, "models/player/chell", 19) == 0 ||
+                         _strnicmp(name, "models/weapons/w_models/portalgun/", 34) == 0;
+#endif
   // Ropes and cables (keyframe_rope, move_rope: the Cable shader) sample their
   // $bumpmap on sampler 0 and their $basetexture on sampler 1: texture 0 is
   // cable/cablenormalmap, which as albedo painted every rope in the normal
@@ -3929,15 +6931,84 @@ void onDraw(const Draw &d) {
   // that is uploaded a rope goes untextured rather than normal-mapped. Their
   // COLOR0 is the lighting the engine sampled along the rope on the CPU, so
   // it is not forwarded: the path tracer lights them.
-  if (bound.known && nameStarts(bound.shader, "cable")) {
-    inst.material = materialForName(engine_materials::current().base);
+  const bool nearest = isPointSampler(d.samplerStates, 0);
+#if defined(PROXY_GAME_EZ2)
+  const bool isDecalDraw = lifted || decal || (bound.known && (bound.decal || bound.decalShader || bound.modulate));
+  if (isDecalDraw) {
+    const std::string &base = engine_materials::current().base;
+    const uint64_t wanted = base.empty() ? 0 : maskTextureHash(base, false);
+    const void *decalTex = d.texture0;
+    if (wanted && d.stageTextures[0] && textureHash(d.stageTextures[0]) != wanted) {
+      for (int s = 1; s < 8; ++s) {
+        if (d.stageTextures[s] && textureHash(d.stageTextures[s]) == wanted) {
+          decalTex = d.stageTextures[s];
+          break;
+        }
+      }
+    }
+    if (decalTex)
+      inst.material = materialFor(decalTex, shading, nearest);
+    if (!inst.material) {
+      for (int s = 0; s < 8; ++s) {
+        if (d.stageTextures[s] && d.stageTextures[s] != decalTex) {
+          inst.material = materialFor(d.stageTextures[s], shading, nearest);
+          if (inst.material)
+            break;
+        }
+      }
+    }
+    if (!inst.material && !base.empty()) {
+      inst.material = materialForName(base, nearest);
+    }
+    if (!inst.material && engine_materials::currentName() && *engine_materials::currentName()) {
+      inst.material = materialForName(engine_materials::currentName(), nearest);
+    }
+    if (!inst.material) {
+      ++g_stats.decalNoBase;
+      return;
+    }
+  } else if (bound.known && nameStarts(bound.shader, "cable")) {
+    inst.material = materialForName(engine_materials::current().base, nearest);
     ++(inst.material ? g_stats.cableDraws : g_stats.cableNoBase);
   } else {
-    inst.material = d.texture0 ? materialFor(d.texture0, shading) : nullptr;
+    inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest, skinnedDraw) : nullptr;
+    if (!inst.material && d.texture0 == nullptr) {
+      for (int s = 1; s < 8; ++s) {
+        if (d.stageTextures[s] && !(d.textureTargets >> s & 1)) {
+          inst.material = materialFor(d.stageTextures[s], shading, nearest, skinnedDraw);
+          if (inst.material)
+            break;
+        }
+      }
+      if (!inst.material && !engine_materials::current().base.empty())
+        inst.material = materialForName(engine_materials::current().base, nearest);
+    }
+#else
+  if (bound.known && nameStarts(bound.shader, "cable")) {
+    inst.material = materialForName(engine_materials::current().base, nearest);
+    ++(inst.material ? g_stats.cableDraws : g_stats.cableNoBase);
+  } else {
+    inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest) : nullptr;
+#endif
+  }
+#ifdef PROXY_GAME_L4D2
+  if (infectedDraw)
+    applyInfected(d, infected, inst, nearest, bonesPerVertex, boneCount, skinnedDraw, ps.dynamic, flexIgnored);
+#endif
+  // Reflective glass (LightmappedReflective, a func_reflective_glass mirror):
+  // a path-traced mirror (bsp::mirrorMaterial), not the engine's reflection
+  // render target, sampled as a texture, which showed that view tiled over
+  // the glass.
+  const remixapi_MaterialHandle mirror = bound.known && nameStarts(bound.shader, "lightmappedreflective")
+                                             ? bsp::mirrorMaterial(engine_materials::currentName())
+                                             : nullptr;
+  if (mirror) {
+    inst.material = mirror;
+    ++g_stats.mirrorDraws;
   }
   if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
     ++g_stats.emissiveNoTexture;
-  if (d.texture0Target)
+  if (d.texture0Target && screenSlot(d.texture0) < 0 && !mirror)
     d3d::requestTargetContents(d.texture0);
   inst.blend = blendState(d);
   // The modulation colour: the entity's render colour and alpha (a tinted
@@ -3949,7 +7020,7 @@ void onDraw(const Draw &d) {
   // is not it: 16, 16, 16, 1 under UnlitTwoTexture.) A mesh drawn with its own
   // COLOR0 keeps that (the colour stage has two arguments), and so does a
   // draw whose modulation is white.
-  if (d.psConstants && bound.known && !multiply && !hasColors && !decalKind &&
+  if (d.psConstants && !d.fixedFunction && bound.known && !multiply && !hasColors && !decalKind &&
       (nameStarts(bound.shader, "vertexlitgeneric") || nameStarts(bound.shader, "unlitgeneric") ||
        nameStarts(bound.shader, "unlittwotexture") || nameStarts(bound.shader, "wireframe"))) {
     const float *m = d.psConstants + 1 * 4;
@@ -4002,6 +7073,25 @@ void onDraw(const Draw &d) {
       }
     }
   }
+  // A fixed-function stage that takes D3DRS_TEXTUREFACTOR (Source's $color
+  // and $alpha modulation there): the texture factor, as above.
+  if (g_ffDraw && g_ffDraw->textureFactor && g_ffDraw->factor != 0xffffffffu && !multiply && !hasColors && !decalKind) {
+    const uint32_t factor = g_ffDraw->factor | (d.blend ? 0u : 0xff000000u);
+    ++g_ffStats.textureFactor;
+    if (additiveDraw && (!(factor & 0xffffff) || (d.srcBlend == D3DBLEND_SRCALPHA && !(factor >> 24)))) {
+      ++g_stats.modulatedBlack;
+      return;
+    }
+    inst.blend.tFactor = factor;
+    inst.blend.textureColorOperation = 3;
+    inst.blend.textureColorArg1Source = 1;
+    inst.blend.textureColorArg2Source = 3;
+    if (d.blend) {
+      inst.blend.textureAlphaOperation = 3;
+      inst.blend.textureAlphaArg1Source = 1;
+      inst.blend.textureAlphaArg2Source = 3;
+    }
+  }
   if (unlitColors) {
     ++g_stats.unlitVertexColorDraws;
     // $vertexalpha: the vertices' alpha fades the texture's (the runtime's
@@ -4033,7 +7123,21 @@ void onDraw(const Draw &d) {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_CULL_BLENDED", v, sizeof(v)) && v[0] == '1';
   }();
-  inst.singleSided = cullBlended && d.blend && d.cullMode != D3DCULL_NONE;
+  // Opaque models D3D draws with back faces culled (D3DCULL_CCW, Source's
+  // default; $nocull draws are D3DCULL_NONE) are one-sided for every ray, as
+  // dxvk-remix's rtx.enableCullingInSecondaryRays: their back faces are
+  // authored never to be seen. Two-sided, a collar's inside a hair over the
+  // neck and folds in a nose took every bounce leaving the skin under them
+  // (G-Man: solid black in indirect light). OPENREMIX_PROXY_TWO_SIDED_MODELS=1
+  // keeps them two-sided.
+  static const bool twoSidedModels = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_TWO_SIDED_MODELS", v, sizeof(v)) && v[0] == '1';
+  }();
+  // (A fading infected is culled as the opaque one it was.)
+  const bool culledOpaque = !d.blend || (infectedDraw && infectedFade);
+  inst.singleSided = (cullBlended && !culledOpaque && d.cullMode != D3DCULL_NONE) ||
+                     (!twoSidedModels && culledOpaque && d.cullMode == D3DCULL_CCW);
   // Opt-in (OPENREMIX_PROXY_CULL_BACKFACES_MODELS=1), not verified in game:
   // engine-drawn models hide from the camera the back faces D3D culls
   // (remixapi_InstanceInfoCameraCullingEXT; shadows and bounces still meet
@@ -4053,7 +7157,7 @@ void onDraw(const Draw &d) {
   if (boneCount > 1) {
     // Bone matrices map the bind pose straight to world space.
     inst.bones.resize(boneCount);
-    std::memcpy(inst.bones.data(), d.vsConstants + kRegModel * 4, boneCount * sizeof(remixapi_Transform));
+    std::memcpy(inst.bones.data(), boneRows(d), boneCount * sizeof(remixapi_Transform));
     static const float identity[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
     std::memcpy(inst.transform, identity, sizeof(inst.transform));
   } else {
@@ -4062,6 +7166,12 @@ void onDraw(const Draw &d) {
     g_stats.rigidModels += boneCount == 1;
   }
   inst.view = instanceView;
+  inst.offTarget = !d.mainTarget;
+  inst.primitives = d.primCount;
+  inst.firstIndex = d.startIndex;
+  inst.skinned = skinnedDraw;
+  inst.deforming = flexTracked;
+  inst.builtFrame = meshBuiltFrame;
   if (cameraToWorld) { // see CameraSpace
     if (inst.bones.empty())
       premultiply(cameraToWorld, inst.transform);
@@ -4081,17 +7191,29 @@ void onDraw(const Draw &d) {
   // its size. The eyeball
   // is submitted with that texture and those coordinates: a mesh of its own,
   // refreshed in place as the gaze and the head move (g_flexMeshes).
-  if (!d.blend && d.texture1 && bound.known && nameStarts(bound.shader, "eyerefract")) {
+  // (Fixed-function eyes: with stage 1's projection only, fixed_function.h.)
+  const EyeShader eyeShader =
+      d.blend || !d.texture1 || (g_ffDraw && !g_ffDraw->iris) ? kNotEyes
+      : bound.known          ? nameStarts(bound.shader, "eyerefract") ? kEyeRefractShader
+                               : nameStarts(bound.shader, "eyes")     ? kEyesShader
+                                                                      : kNotEyes
+                             : modelShader(d).eye;
+  // The iris projection's registers, as the vertex shader names them.
+  const int irisNamed = eyeShader != kNotEyes ? modelShader(d).irisU : -1;
+  const float *irisProjection = d.vsConstants + (irisNamed >= 0 ? unsigned(irisNamed) : kRegEyeIrisU) * 4;
+  g_stats.eyesByShader += eyeShader != kNotEyes && !bound.known;
+  if (eyeShader == kEyeRefractShader) {
     ++g_stats.eyes;
     uint32_t eyeBones = 0;
     g_liftVertexStep = 0;
-    const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1);
-    const uint64_t eyeHash = (rewritten ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
+    const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
+    const uint64_t eyeHash = (eyesPerFrame ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
+    g_buildKind = kBuildEye;
     remixapi_MeshHandle eyeMesh =
         eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
-                                d.vsConstants + kRegEyeIrisU * 4, !rewritten, 0.5f)
+                                irisProjection, !eyesPerFrame, 0.5f)
                     : nullptr;
-    if (rewritten) {
+    if (eyesPerFrame) {
       if (eyeMesh)
         g_transient.push_back(eyeMesh);
     } else if (eyeMaterial) {
@@ -4107,20 +7229,58 @@ void onDraw(const Draw &d) {
       inst.mesh = eyeMesh;
       inst.material = eyeMaterial;
       inst.texture0 = d.texture1;
-      inst.persistent = !rewritten;
+      inst.persistent = !eyesPerFrame;
+      inst.deforming = true; // refreshed as the gaze moves
       inst.replacementHash = 0;
       ++g_stats.eyeRefracts;
     }
   }
-  if (!stencilRole(d, inst))
+  // A portal view's draws pass the stencil of its portal's hole: not emulated
+  // (the view's instances are the scene's, see View::portal).
+  if (!view.portal && !stencilRole(d, inst))
     return;
+#if defined(PROXY_GAME_EZ2)
+  if (g_glowHalo) {
+    // A glow's source (see onDraw): one halo group per colour, seen through
+    // walls as the glow image is drawn without a depth test.
+    float color[3];
+    for (int c = 0; c < 3; ++c)
+      color[c] = std::clamp(g_glowHalo[c] * g_glowHalo[3], 0.0f, 1.0f);
+    auto group = std::find_if(g_stencilGroups.begin(), g_stencilGroups.end(), [&](const StencilGroup &g) {
+      return g.value == kGlowGroup && std::equal(color, color + 3, g.color);
+    });
+    if (group == g_stencilGroups.end()) {
+      group = g_stencilGroups.emplace(g_stencilGroups.end());
+      group->value = kGlowGroup;
+      group->halo = group->fill = group->ignoreZ = true;
+      group->passes = 1;
+      std::copy_n(color, 3, group->color);
+    }
+    ++group->sources;
+    ++g_stats.glowSources;
+    inst.stencilGroup = int(group - g_stencilGroups.begin());
+    inst.stencilRole = kStencilSource;
+  }
+#endif
+  if (portalSurface) {
+    if (d.blend) {
+      inst.rasterOnly = true;
+      ++g_portalViewStats.surfaceOverlays;
+    } else if (inst.stencilRole == kStencilSource || inst.stencilRole == kStencilSourceOnly) {
+      inst.stencilRole = kStencilSourceOnly;
+      ++g_portalViewStats.surfaceMarks;
+    } else {
+      ++g_portalViewStats.surfacesDropped;
+      return;
+    }
+  }
   // D3DFILL_WIREFRAME (the Wireframe shader; any material with $wireframe):
   // the edges of its triangles, unlit, in its colour (texture x modulation x
   // vertex colour, as the draw's), with the draw's depth state. Not traced: a
   // line has no surface.
   if (d.fillMode == D3DFILL_WIREFRAME) {
     inst.wireframe = inst.rasterOnly = true;
-    inst.material = d.texture0 ? materialFor(d.texture0) : nullptr;
+    inst.material = d.texture0 ? materialFor(d.texture0, 0, nearest) : nullptr;
     inst.persistent = false;
     inst.depthTest = d.depthTest && inst.depthTest;
     inst.depthWrite = d.zWrite;
@@ -4128,6 +7288,41 @@ void onDraw(const Draw &d) {
                          REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET);
     ++g_stats.wireframeDraws;
   }
+#ifdef PROXY_GAME_PORTAL2
+  // Portal 2's light bridges (SolidEnergy, effects/projected_wall): additive,
+  // which as a raster overlay over the frame rays through ray portals and
+  // reflections never met. Traced instead, seen by the camera too: the
+  // runtime evaluates the shader (remixapi_MaterialSolidEnergyEXT), a sheet
+  // adding its glow over what is behind (source alpha over, its coverage the
+  // material's). Its texture stages' alpha is the factor's 2/255: candidate
+  // rays take it, and light rays pass it (the game's bridge casts no shadow).
+  // Other SolidEnergy materials (excursion funnels) stay raster overlays.
+  // OPENREMIX_PROXY_SOLID_ENERGY=0: the engine's overlay for the bridge too.
+  if (portal2::enabled() && additiveDraw && !inst.rasterOnly && !inst.offTarget && bound.known &&
+      nameStarts(bound.shader, "solidenergy") && d.psConstants)
+    if (const remixapi_MaterialHandle energy =
+            portal2::solidEnergyMaterial(g_api, engine_materials::currentName(), d.psConstants[6 * 4 + 3])) {
+      inst.material = energy;
+      inst.blend = {};
+      inst.blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+      inst.blend.alphaTestCompareOp = 7; // always (no alpha test)
+      inst.blend.alphaBlendEnabled = 1;
+      inst.blend.srcColorBlendFactor = inst.blend.srcAlphaBlendFactor = 6; // SRC_ALPHA
+      inst.blend.dstColorBlendFactor = inst.blend.dstAlphaBlendFactor = 7; // ONE_MINUS_SRC_ALPHA
+      inst.blend.writeMask = 15;
+      inst.blend.textureColorOperation = inst.blend.textureAlphaOperation = 1; // select arg 1
+      inst.blend.textureColorArg1Source = inst.blend.textureAlphaArg1Source = 3; // texture factor
+      inst.blend.tFactor = 0x02ffffffu;
+      inst.replacementHash = 0;
+      inst.singleSided = false; // $nocull
+      inst.cameraCullBack = false;
+      ++g_stats.tracedEnergy;
+      if (portal2::solidEnergyLight() > 0) {
+        ++g_stats.energyLit;
+        g_stats.energyTriangles += d.primCount;
+      }
+    }
+#endif
   g_instances.push_back(inst);
   // Eyes (Source's Eyes shader; not EyeRefract): the draw above is the eyeball
   // with its sclera texture, sampler 0. The iris and pupil are a second
@@ -4139,19 +7334,24 @@ void onDraw(const Draw &d) {
   // coordinates change every frame: one mesh per eye, refreshed in place like
   // a flexed face (g_flexMeshes), which the tracer refits instead of building
   // anew and which stays one instance from frame to frame.
-  if (!d.blend && d.texture1 && bound.known && nameStarts(bound.shader, "eyes")) {
+  if (eyeShader == kEyesShader) {
     constexpr float kIrisLift = 0.03f; // inches; an eye is about one across
     ++g_stats.eyes;
     uint32_t irisBones = 0;
     g_liftVertexStep = 0;
-    const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1);
+    const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
     // From buffers the engine rewrites (not seen for eyes) it stays per frame.
-    const uint64_t irisHash = (rewritten ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
+    const uint64_t irisHash = (eyesPerFrame ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
+    g_buildKind = kBuildIris;
     remixapi_MeshHandle irisMesh =
-        irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false, 1, nullptr, flex,
-                                 d.vsConstants + kRegEyeIrisU * 4, !rewritten)
+        // Lifted out of the eyeball: by face normals (an eye has no vertex
+        // normals) these wind as the model's do (faceNormalSign; 1 put the
+        // iris inside it, where only a decal's attachment still found it).
+        irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false,
+                                 faceNormalSign(d.cullMode), nullptr, flex,
+                                 irisProjection, !eyesPerFrame)
                      : nullptr;
-    if (rewritten) {
+    if (eyesPerFrame) {
       if (irisMesh)
         g_transient.push_back(irisMesh);
     } else if (irisMaterial) {
@@ -4176,15 +7376,17 @@ void onDraw(const Draw &d) {
       over.separateAlpha = over.alphaTest = false;
       iris.blend = blendState(over);
       iris.categories = categories | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
-      iris.persistent = !rewritten;
+      iris.persistent = !eyesPerFrame;
+      iris.deforming = true;
       iris.replacementHash = 0;
+      iris.modelLayer = true; // its eye may be skinned on the CPU: world-space vertices, no transform
       g_instances.push_back(iris);
       ++g_stats.eyeIrises;
     }
   }
   if (inst.stencilRole == kStencilSourceOnly || inst.stencilRole == kStencilInside)
     return; // marks and overlays: no part in lighting estimates
-  if (boneCount) // studio models: their ambient cube samples the surrounding (sky) light
+  if (boneCount && !d.fixedFunction) // studio models: their ambient cube samples the surrounding (sky) light
     view.ambientUp.push_back({d.vsConstants[kRegAmbientUp * 4], d.vsConstants[kRegAmbientUp * 4 + 1],
                               d.vsConstants[kRegAmbientUp * 4 + 2]});
   ++g_stats.accepted;
@@ -4195,8 +7397,8 @@ void onSetLights(int count, const void *lights) {
     return;
   std::lock_guard<std::mutex> lock(g_lightLock);
   for (int i = 0; i < count; ++i) {
-    SourceLight l;
-    std::memcpy(&l, static_cast<const uint8_t *>(lights) + i * kLightDescSize, sizeof(l));
+    SourceLight l = {};
+    std::memcpy(&l, static_cast<const uint8_t *>(lights) + i * kLightDescSize, kLightDescPart);
     if (l.type < 1 || l.type > 3 || bsp::providesLight(l.type, l.position, l.direction))
       continue;
     // Identity: type, color, position, direction and falloff (not derived
@@ -4227,7 +7429,7 @@ void sampleGpuPasses() {
   if (!enabled)
     return;
   static auto get = reinterpret_cast<decltype(&remixapi_GetGpuPassTimingsEXT)>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetGpuPassTimingsEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetGpuPassTimingsEXT"));
   static remixapi_GpuPassTimingsEXT t;
   t = {};
   t.structSize = sizeof(t);
@@ -4264,9 +7466,9 @@ struct SlowFrame {
 } g_slowFrame;
 void sampleFramePerformance() {
   static auto getPerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT"));
   static auto getBreakdown = reinterpret_cast<PFN_remixapi_GetFrameBreakdownEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFrameBreakdownEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFrameBreakdownEXT"));
   remixapi_FramePerformanceEXT performance = {};
   performance.structSize = sizeof(performance);
   if (!getPerformance || getPerformance(&performance) != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -4309,9 +7511,9 @@ void noteStatisticsDump(bool begin) { (begin ? g_statisticsBegan : g_statisticsE
 // are), the engine's frame and this proxy's draw handling within it.
 void logFrameSpike() {
   static auto getPerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT"));
   static auto getBreakdown = reinterpret_cast<PFN_remixapi_GetFrameBreakdownEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFrameBreakdownEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFrameBreakdownEXT"));
   static uint32_t last[5] = {}, frames = 0, logged = 0, sinceSpike = 0;
   static double average = 0;
   static const ULONGLONG started = GetTickCount64();
@@ -4381,7 +7583,7 @@ void logWindowState(uint32_t presents) {
   if (presents % 30 != 0 && presents > 3)
     return;
   static auto framePerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT")));
+      reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT")));
   remixapi_FramePerformanceEXT performance = {};
   performance.structSize = sizeof(performance);
   if (framePerformance)
@@ -4433,7 +7635,7 @@ void logWindowState(uint32_t presents) {
 void logRendererState(uint32_t presents, size_t instances) {
   if (presents % 30 != 0 && presents > 3)
     return;
-  auto stat = [](const char *name) { return reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), name)); };
+  auto stat = [](const char *name) { return reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), name)); };
   static auto getBackend = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(stat("remixapi_GetBackendCapabilitiesEXT"));
   static auto getTracing = reinterpret_cast<PFN_remixapi_GetTracingStatisticsEXT>(stat("remixapi_GetTracingStatisticsEXT"));
   static auto getDenoising = reinterpret_cast<PFN_remixapi_GetDenoisingStatisticsEXT>(stat("remixapi_GetDenoisingStatisticsEXT"));
@@ -4504,9 +7706,10 @@ void onPresent() {
   // the main rotation are: the same camera with other depth planes (world),
   // the 3D skybox (same field of view, sky-space position) or the view model
   // (another field of view). Other views (monitors, reflections) are skipped.
+  // (A portal view, Portal 2's, is never the main view: View::portal.)
   std::unordered_map<int, uint32_t> fovDraws;
   for (auto &[key, v] : g_views)
-    if (v.perspective && !v.cameraSpace)
+    if (v.perspective && !v.cameraSpace && !v.portal)
       fovDraws[int(std::lround(v.projection[5] * 1000))] += v.draws;
   int worldFov = 0;
   uint32_t best = 0;
@@ -4518,7 +7721,7 @@ void onPresent() {
   const View *main = nullptr;
   uint64_t mainKey = 0;
   for (auto &[key, v] : g_views) {
-    if (v.perspective && !v.cameraSpace && int(std::lround(v.projection[5] * 1000)) == worldFov &&
+    if (v.perspective && !v.cameraSpace && !v.portal && int(std::lround(v.projection[5] * 1000)) == worldFov &&
         (!main || v.draws > main->draws)) {
       main = &v;
       mainKey = key;
@@ -4551,7 +7754,7 @@ void onPresent() {
     worldFov = int(std::lround(chosen->projection[5] * 1000));
     main = nullptr;
     for (auto &[key, v] : g_views)
-      if (v.perspective && int(std::lround(v.projection[5] * 1000)) == worldFov &&
+      if (v.perspective && !v.portal && int(std::lround(v.projection[5] * 1000)) == worldFov &&
           samePlacement(v.view, chosen->view) && (!main || v.draws > main->draws)) {
         main = &v;
         mainKey = key;
@@ -4582,7 +7785,7 @@ void onPresent() {
     float mainEye[3];
     eyeOf(*main, mainEye);
     for (auto &[key, v] : g_views) {
-      if (&v == main || !v.perspective || int(std::lround(v.projection[5] * 1000)) != worldFov ||
+      if (&v == main || !v.perspective || v.portal || int(std::lround(v.projection[5] * 1000)) != worldFov ||
           !sameRotation(v.view, main->view))
         continue;
       float eye[3], distance2 = 0;
@@ -4604,13 +7807,28 @@ void onPresent() {
     // The 3D skybox keeps its own camera: the runtime draws SKY instances with
     // the sky camera behind the world (raster layer 0, path-traced
     // background), as Source does.
-    enum class Role { Skip, Main, Sky, ViewModel };
+    // Portal 2's portal views (View::portal) add what only they show, as Screen
+    // views do, without a camera of their own (the runtime's ray portals see
+    // through the portals).
+    enum class Role { Skip, Main, Sky, ViewModel, Screen, Portal };
     std::unordered_map<uint64_t, Role> roles;
     const View *viewModel = nullptr, *sky = nullptr;
     for (auto &[key, v] : g_views) {
       Role role = Role::Skip;
-      if (key == mainKey) {
+      if (v.screenTarget && key != mainKey && !samePlacement(v.view, main->view)) {
+        // Its camera's own view (not the skybox view drawn into it first, nor
+        // the main camera's scene drawn again into a texture by an effect).
+        const auto it = g_screenViews.find(v.screenTarget);
+        if (it != g_screenViews.end() && v.perspective &&
+            std::equal(v.view, v.view + 16, it->second.view, [](float a, float b) { return std::fabs(a - b) < 1e-3f; }))
+          role = Role::Screen;
+      } else if (key == mainKey) {
         role = Role::Main;
+      } else if (v.portal) {
+        // Never a view of the main camera's rotation (the sky or view model
+        // below): a portal pair that keeps the rotation (opposite walls) would
+        // have made one of those.
+        role = samePlacement(v.view, main->view) ? Role::Main : Role::Portal;
       } else if (v.perspective && samePlacement(v.view, main->view) &&
                  int(std::lround(v.projection[5] * 1000)) == worldFov) {
         role = Role::Main; // drawn with the main camera
@@ -4628,11 +7846,19 @@ void onPresent() {
     g_viewSummary.clear();
     for (auto &[key, v] : g_views) {
       char line[160];
-      static const char *const names[] = {"skip", "main", "sky", "viewmodel"};
+      static const char *const names[] = {"skip", "main", "sky", "viewmodel", "screen", "portal"};
       snprintf(line, sizeof(line), "    view order %u draws %u persp %d P0 %.3f P5 %.3f P14 %.3f T %.0f %.0f %.0f -> %s\n",
                v.order, v.draws, v.perspective, v.projection[0], v.projection[5], v.projection[14], v.view[12],
                v.view[13], v.view[14], names[int(roles[key])]);
       g_viewSummary += line;
+      if (v.fixedFunction)
+        ++(v.perspective ? g_ffStats.views : g_ffStats.flatViews);
+    }
+    g_ffStats.mainFrames += main->fixedFunction;
+    if (g_ffProbe.out && g_ffProbe.frame == g_frame) {
+      fprintf(g_ffProbe.out, "== f%llu views (order as above):\n%s", static_cast<unsigned long long>(g_frame),
+              g_viewSummary.c_str());
+      fflush(g_ffProbe.out);
     }
 
     // Sky light: the path tracer's environment radiance follows the upward
@@ -4666,20 +7892,37 @@ void onPresent() {
     static const bool underwater = envScale("OPENREMIX_PROXY_UNDERWATER", 1) > 0;
     remixapi_CameraMediumEXT medium = {};
     medium.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_EXT;
+    // Water that fades as Source's water fog (bsp waterFogEnd) does so here too.
+    remixapi_CameraMediumFogEXT mediumFog = {};
+    mediumFog.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_FOG_EXT;
+    const void **mediumNext = &medium.pNext;
     {
-      float eye[3], color[3], distance = 0;
+      float eye[3], color[3], distance = 0, fogEnd = 0;
       for (int i = 0; i < 3; ++i)
         eye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
                    main->view[14] * main->view[i * 4 + 2]);
-      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance);
+      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance, &fogEnd);
       if (g_cameraInWater) {
         medium.inside = 1;
         medium.transmittanceColor = {color[0], color[1], color[2]};
         medium.transmittanceMeasurementDistance = distance;
+        if (fogEnd > 0) {
+          mediumFog.fogEnd = fogEnd;
+          medium.pNext = &mediumFog;
+          mediumNext = &mediumFog.pNext;
+        }
         ++g_stats.underwaterFrames;
       }
     }
     environment.pNext = &medium;
+    // The screen cameras the monitors in view show (noteScreenView).
+    const std::vector<remixapi_ScreenCameraEXT> screens = screenCameras();
+    remixapi_CameraScreensEXT screenList = {};
+    screenList.sType = REMIXAPI_STRUCT_TYPE_CAMERA_SCREENS_EXT;
+    screenList.count = uint32_t(screens.size());
+    screenList.cameras = screens.data();
+    if (!screens.empty())
+      *mediumNext = &screenList;
     remixapi_CameraInfo camera = {};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
     auto setup = [&](remixapi_CameraType type, const View &v) {
@@ -4756,13 +7999,19 @@ void onPresent() {
     // their previous transforms and bones (motion vectors, denoiser history).
     // Source does not say which entity a draw belongs to: every instance of a
     // cached mesh takes over the id of the nearest instance of that mesh in
-    // the previous frame (root bone or transform translation, within 64
-    // units); the rest get new ids.
+    // the previous frames (root bone or transform translation, within 64
+    // units); the rest get new ids. Instances not drawn are remembered for
+    // kTrackedKeep frames: a prop that leaves the view (Source's culling) and
+    // comes back keeps its id, and with it the runtime's light tree slots of
+    // its emissive triangles (a new id rebuilt part of the tree, ~30 ms with
+    // a pile of emissive props at the edge of the view, every frame).
     struct Tracked {
       uint64_t id;
       float position[3];
       bool taken;
+      uint32_t age; // frames since it was drawn
     };
+    constexpr uint32_t kTrackedKeep = 600;
     static std::unordered_map<uint64_t, std::vector<Tracked>> tracked;
     static uint64_t nextTrackedId = 1;
     std::unordered_map<uint64_t, std::vector<Tracked>> nextTracked;
@@ -4778,6 +8027,9 @@ void onPresent() {
           float d2 = 0;
           for (int i = 0; i < 3; ++i)
             d2 += (candidate.position[i] - position[i]) * (candidate.position[i] - position[i]);
+          // Those drawn last frame first: a remembered one counts at twice its distance.
+          if (candidate.age)
+            d2 *= 4;
           if (d2 < bestDistance2) {
             bestDistance2 = d2;
             best = &candidate;
@@ -4790,7 +8042,7 @@ void onPresent() {
       } else {
         id = 0x7000000000000000ull | nextTrackedId++; // static ids are 64-bit hashes: collisions are negligible
       }
-      nextTracked[group].push_back({id, {position[0], position[1], position[2]}, false});
+      nextTracked[group].push_back({id, {position[0], position[1], position[2]}, false, 0});
       return id;
     };
     std::unordered_map<uint64_t, bool> seen; // multipass draws: the first pass wins
@@ -4800,10 +8052,113 @@ void onPresent() {
       if (inst.stencilRole == kStencilInside && inst.depthTest && roles[inst.view] == Role::ViewModel &&
           g_stencilGroups[inst.stencilGroup].glassSources)
         g_stencilGroups[inst.stencilGroup].throughGlass = true;
+    // Screen views add what the scene lacks: models and brushes not already
+    // placed by the main view or another screen (placement: a flexed face's
+    // mesh is rebuilt per draw, so its handle names nothing). Effects, world
+    // decals and particles are the main view's alone; of blended draws only
+    // the layers of models.
+    auto placement = [](const Instance &inst) {
+      const float(*m)[4] = inst.bones.empty() ? inst.transform : inst.bones[0].matrix;
+      // A cached mesh is the same handle in every view; a rebuilt one is named
+      // by its texture (two eyes may share theirs: their meshes differ).
+      // The first index tells a model's parts apart where the place does not
+      // (both eyes of a model skinned on the CPU: world-space, no transform).
+      int64_t at[6] = {int64_t(inst.persistent ? reinterpret_cast<uintptr_t>(inst.mesh)
+                                               : reinterpret_cast<uintptr_t>(inst.texture0)),
+                       int64_t(inst.primitives), int64_t(inst.firstIndex)};
+      for (int r = 0; r < 3; ++r)
+        at[r + 3] = std::isfinite(m[r][3]) ? std::llround(m[r][3] * 4) : 0;
+      return fnv(at, sizeof(at));
+    };
+    std::unordered_set<uint64_t> placed;
+    for (const auto &inst : g_instances)
+      if (roles[inst.view] == Role::Main && !inst.offTarget)
+        placed.insert(placement(inst));
+    float mainEye[3]; // where the main camera stands (a portal view's player model)
+    for (int i = 0; i < 3; ++i)
+      mainEye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
+                     main->view[14] * main->view[i * 4 + 2]);
+    g_portalViewStats.frames += !g_portalViews.empty();
+    // Whether a model's root (a skinned one's first bone, a rigid one's
+    // transform: the gun in its hands) is within portalBodyRadius of the main
+    // camera's eye.
+    static const float bodyRadius = envScale("OPENREMIX_PROXY_PORTAL_BODY_RADIUS", 80.0f);
+    auto nearEye = [&](const Instance &inst) {
+      float d2 = 0;
+      for (int r = 0; r < 3; ++r) {
+        const float d = (inst.bones.empty() ? inst.transform[r][3] : inst.bones[0].matrix[r][3]) - mainEye[r];
+        d2 += d * d;
+      }
+      return d2 < bodyRadius * bodyRadius;
+    };
+    // The player's parts skinned on the CPU (Chell's eyes and their irises:
+    // world-space vertices, no transform) have no place of their own: they
+    // go with the rest of the player's model, near the eye if a placed part
+    // is.
+    static const float worldSpace[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    auto worldSpaced = [&](const Instance &inst) {
+      return inst.bones.empty() && std::memcmp(inst.transform, worldSpace, sizeof(worldSpace)) == 0;
+    };
+    bool playerNear = false;
+    for (const auto &inst : g_instances)
+      playerNear |= inst.playerModel && !worldSpaced(inst) && nearEye(inst);
+    auto playerBody = [&](const Instance &inst) {
+      return inst.playerModel && (worldSpaced(inst) ? playerNear : nearEye(inst));
+    };
     for (auto &inst : g_instances) {
       const Role role = roles[inst.view];
-      if (role == Role::Skip)
+      if (role == Role::Skip || (inst.offTarget && role != Role::Screen))
         continue;
+      if (inst.deforming && inst.builtFrame != ~0ull)
+        ++(inst.builtFrame == g_frame ? g_deformFresh : g_deformStale);
+      if (role == Role::Screen) {
+        // Blended layers of a model (an eye's iris over its eyeball: skinned,
+        // or rigid with a model transform) come too; world decals and other
+        // blended draws in world space do not.
+        static const float worldSpace[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+        const bool modelLayer = inst.modelLayer || inst.skinned || !inst.bones.empty() ||
+                                std::memcmp(inst.transform, worldSpace, sizeof(worldSpace)) != 0;
+        const int reason = inst.rasterOnly ? 0 : inst.blend.alphaBlendEnabled && !modelLayer ? 1
+                         : inst.stencilGroup >= 0 ? 2 : !placed.insert(placement(inst)).second ? 3 : -1;
+        if (reason >= 0) {
+          ++g_screenSkipped[reason];
+          if (inst.texture0) {
+            char hex[24];
+            std::snprintf(hex, sizeof(hex), "%016llX", (unsigned long long)textureHash(inst.texture0));
+            g_screenSkippedExample[reason] = hex;
+          }
+          continue;
+        }
+        ++g_stats.screenInstances;
+      }
+      // A portal view's instances (Portal 2): what the main view and the
+      // other views did not place already, by the screen views' rules. The
+      // player's own model (Portal 2 draws it in portal views only, and it
+      // is where the main camera stands) is reflection-only: the main camera
+      // does not see it, the rays through a portal and bounces do. Told by
+      // place: a model near the main camera's eye (nearEye). So is it in the
+      // main view, where Portal 2 draws it too while the player stands in a
+      // portal (clipped at the portal's plane: its other half shows out of the
+      // partner), told by its materials as well (Chell's, her gun's: not
+      // Wheatley or a cube carried as close).
+      bool portalBody = false;
+      if (role == Role::Portal) {
+        static const float worldSpace[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+        const bool modelLayer = inst.modelLayer || inst.skinned || !inst.bones.empty() ||
+                                std::memcmp(inst.transform, worldSpace, sizeof(worldSpace)) != 0;
+        const int reason = inst.rasterOnly ? 0 : inst.blend.alphaBlendEnabled && !modelLayer ? 1
+                         : inst.stencilGroup >= 0 ? 2 : !placed.insert(placement(inst)).second ? 3 : -1;
+        if (reason >= 0) {
+          ++g_portalViewStats.skipped[reason];
+          continue;
+        }
+        portalBody = ((!inst.bones.empty() || modelLayer) && nearEye(inst)) || playerBody(inst);
+        ++g_portalViewStats.instances;
+        g_portalViewStats.bodies += portalBody;
+      } else if (role == Role::Main && playerBody(inst)) {
+        portalBody = true;
+        ++g_portalViewStats.mainBodies;
+      }
       if ((role == Role::ViewModel && &g_views[inst.view] != viewModel) ||
           (role == Role::Sky && (&g_views[inst.view] != sky || skyTraced)))
         continue;
@@ -4930,7 +8285,11 @@ void onPresent() {
       identity.instanceId = idHash ? idHash : 1;
       identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
       identity.rasterVisible = 1;
-      const bool isStatic = staticWorld && role == Role::Main && inst.persistent && inst.bones.empty() &&
+      // (A mesh refreshed every frame is not: a part studiorender skins on
+      // the CPU has world-space vertices and no transform, and as part of the
+      // static set it was drawn a frame behind its body.)
+      const bool isStatic = staticWorld && role == Role::Main && inst.persistent && !inst.deforming &&
+                            inst.bones.empty() &&
                             !inst.blend.alphaBlendEnabled && !inst.categories &&
                             std::memcmp(inst.transform, identityTransform, sizeof(identityTransform)) == 0;
       // Additive draws (destination factor ONE: glows, lens flares, sparks)
@@ -4948,7 +8307,9 @@ void onPresent() {
         float position[3];
         for (int r = 0; r < 3; ++r)
           position[r] = inst.bones.empty() ? inst.transform[r][3] : inst.bones[0].matrix[r][3];
-        const uint64_t group = fnv(&inst.mesh, sizeof(inst.mesh), uint64_t(role) + 1);
+        // (A portal view's instance is the main view's when it comes into
+        // view there: one identity.)
+        const uint64_t group = fnv(&inst.mesh, sizeof(inst.mesh), uint64_t(role == Role::Portal ? Role::Main : role) + 1);
         identity.instanceId = trackedId(group, position);
         identity.classification = REMIXAPI_INSTANCE_DYNAMIC_EXT;
       }
@@ -4959,6 +8320,13 @@ void onPresent() {
                                           : static_cast<void *>(&blend);
       info.mesh = inst.mesh;
       info.categoryFlags = inst.categories;
+      // What only a screen camera sees (Breen in his studio, the player's own
+      // body): reflection-only, so the main camera does not see it and the
+      // screen's rays and bounces do (the runtime's camera rays of a screen
+      // include reflection-only instances; its paint, an eye's iris, coats
+      // only reflection-only receivers).
+      if (role == Role::Screen || portalBody)
+        info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY;
       if (role == Role::ViewModel && rasterViewModel)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
       else if (role == Role::Sky)
@@ -5024,14 +8392,41 @@ void onPresent() {
           ++g_stats.maskCuts;
         }
       }
+#ifdef PROXY_GAME_L4D2
+      remixapi_InstanceInfoWoundCutEXT wound = {};
+      if (inst.woundCut) {
+        wound = inst.wound;
+        wound.cutTexture = inst.woundTexture;
+        wound.pNext = info.pNext;
+        info.pNext = &wound;
+      }
+#endif
       g_api.DrawInstance(&info);
       ++g_stats.submitted;
     }
+    for (auto &[group, list] : tracked)
+      for (auto &entry : list)
+        if (!entry.taken && entry.age + 1 < kTrackedKeep) {
+          entry.age++;
+          nextTracked[group].push_back(entry);
+        }
     tracked = std::move(nextTracked);
     {
       Timer bspTimer(g_usBsp, &g_totalUs[3]);
       bsp::submit(materialForHash);
     }
+#ifdef PROXY_GAME_PORTAL2
+    {
+      // The ray portals' meshes (sampled on the main thread) and effects; the
+      // main view's eye (the frame's last world view) fades the ghosts.
+      float eye[3];
+      const float *view = g_worldViews.empty() ? nullptr : g_worldViews.back().view;
+      if (view)
+        for (int i = 0; i < 3; ++i)
+          eye[i] = -(view[12] * view[i * 4] + view[13] * view[i * 4 + 1] + view[14] * view[i * 4 + 2]);
+      portal2::submit(g_api, view ? eye : nullptr);
+    }
+#endif
   }
   {
     std::lock_guard<std::mutex> lock(g_lightLock);
@@ -5119,6 +8514,17 @@ void onPresent() {
           l.attenuation2 = e.attenuation[2];
           l.thetaDot = e.thetaDot;
           l.phiDot = e.phiDot;
+          // The cookie once the runtime has its texture (until then a cone;
+          // the definition changes when it arrives).
+          if (!e.cookie.empty())
+            if (const uint64_t cookie = maskTextureHash(e.cookie, false, uint32_t(e.cookieFrame))) {
+              l.cookie = cookie;
+              std::memcpy(l.cookieUp, e.up, 12);
+              l.cookieFov = e.fov;
+              ++g_stats.lightCookies;
+              if (uint32_t(e.cookieFrame) > g_stats.lightCookieFrameMax)
+                g_stats.lightCookieFrameMax = uint32_t(e.cookieFrame);
+            }
           addDefined(e.hash, l);
         }
     engine_lights::report(styled, styledOff, duplicates);
@@ -5139,6 +8545,9 @@ void onPresent() {
       g_api.DrawLightInstance(cached.handle);
       ++g_stats.lights;
     }
+#ifdef PROXY_GAME_L4D2
+    l4d2::submitLights(g_api); // the survivors' flashlights (their own Remix lights)
+#endif
     if (g_skyDome)
       g_api.DrawLightInstance(g_skyDome); // the captured 2D skybox (setSkyFaces)
     g_lastLights.swap(g_frameLights);
@@ -5188,17 +8597,45 @@ void onPresent() {
   }
   ui.pCommands = g_uiCommands.data();
   ui.commandCount = uint32_t(g_uiCommands.size());
+#if defined(PROXY_GAME_EZ2)
+  const auto uiResult = g_api.SubmitUIDrawList(&ui);
+  if (uiResult != REMIXAPI_ERROR_CODE_SUCCESS && ui.commandCount > 0) {
+    static uint64_t s_lastLog = 0;
+    if (g_frame - s_lastLog > 60) {
+      s_lastLog = g_frame;
+      diag::stage("SubmitUIDrawList failed: error %d, commands %u, verts %zu, indices %zu",
+                  int(uiResult), ui.commandCount, g_uiVertices.size(), g_uiIndices.size());
+    }
+  }
+  if (g_dumpFlat) {
+    fprintf(g_dumpFlat, "f%llu onPresent UI: commands=%u verts=%zu indices=%zu submitResult=%d\n",
+            (unsigned long long)g_frame, ui.commandCount, g_uiVertices.size(), g_uiIndices.size(), int(uiResult));
+  }
+#else
   g_api.SubmitUIDrawList(&ui);
+#endif
   g_uiVertices.clear();
   g_uiIndices.clear();
   g_uiCommands.clear();
   g_uiCommandMasks.clear();
+#if defined(PROXY_GAME_EZ2)
+  g_uiLayers.clear();
+#endif
 
   applyTargetPixels();
   sampleFramePerformance();
   logFrameSpike();
   serviceScreenshotRequest();
   serviceFlatDumpRequest();
+  serviceMaterialProbeRequest();
+  serviceShaderProbeRequest();
+#if defined(PROXY_GAME_EZ2)
+  serviceParticleDumpRequest();
+#endif
+  serviceFixedFunctionProbeRequest();
+#ifdef PROXY_GAME_L4D2
+  l4d2::infected::servicePresent(g_moduleDir.c_str(), g_frame);
+#endif
   // The first frames, for the diagnostics log: a crash while rendering shows
   // how far the game got.
   static uint32_t presents = 0;
@@ -5253,6 +8690,7 @@ void onPresent() {
   g_views.clear();
   g_cameraSpace.valid = false;
   g_worldViews.clear();
+  g_portalViews.clear();
   g_viewOrder = 0;
 
   for (auto mesh : g_transient)
@@ -5260,9 +8698,14 @@ void onPresent() {
   g_stats.transient += g_transient.size();
   g_transient.clear();
   evictEmissiveMaterials();
+#ifdef PROXY_GAME_L4D2
+  evictInfectedMaterials();
+#endif
   // Static meshes keyed by buffer version: a rewritten buffer never matches
   // again, so old entries age out.
   ++g_frame;
+  if (game::kFixedFunction)
+    ff::newFrame();
   for (auto it = g_meshes.begin(); it != g_meshes.end();) {
     if (g_frame - it->second.lastFrame > 600) {
       g_api.DestroyMesh(it->second.handle);
@@ -5282,6 +8725,8 @@ void onPresent() {
   }
 }
 
+#if defined(PROXY_GAME_EZ2)
+#else
 // Caller holds g_textureLock.
 void storeCpuCopy(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, std::vector<uint8_t> pixels) {
   if (!keepCpuCopy(format, width, height))
@@ -5315,6 +8760,7 @@ bool textureLayout(D3DFORMAT format, uint32_t width, uint32_t height, remixapi_F
     rowBytes = blocksW * 8;
     rows = blocksH;
     break;
+  case D3DFMT_DXT3: // transcoded to BC3 (formats::transcodeBC2toBC3)
   case D3DFMT_DXT5:
     remixFormat = REMIXAPI_FORMAT_BC3_SRGB;
     rowBytes = blocksW * 16;
@@ -5435,21 +8881,61 @@ void flushPendingTextures() {
 }
 } // namespace
 
+#endif
 void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *data,
                      uint32_t pitch, uint32_t levels) {
   if (!g_ready || !data || !width || !height)
     return;
+  Timer uploadTimer(g_usTextureUpload);
   remixapi_Format remixFormat;
   uint32_t rowBytes, rows;
   if (!textureLayout(format, width, height, remixFormat, rowBytes, rows)) {
+#if defined(PROXY_GAME_EZ2)
+    if (keepCpuCopy(format, width, height) && levelLayout(format, width, height, rowBytes, rows)) {
+      std::vector<uint8_t> pixels = packLevel(data, pitch, rowBytes, rows);
+      std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+      storeCpuCopy(texture, width, height, format, std::move(pixels));
+    } else {
+      ++g_stats.textureSkipped;
+    }
+    return;
+  }
+  std::vector<uint8_t> rawPixels = packLevel(data, pitch, rowBytes, rows);
+  if (keepCpuCopy(format, width, height)) {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    storeCpuCopy(texture, width, height, format, rawPixels);
+  }
+
+  std::vector<uint8_t> pixels = isUnpackFormat(format)
+                                    ? unpackToBgra(format, width, height, rawPixels.data(), rawPixels.size())
+                                    : std::move(rawPixels);
+
+#else
     ++g_stats.textureSkipped;
     return;
   }
+  ++g_textureUploads;
+  g_textureUploadBytes += uint64_t(rowBytes) * rows;
+  const LastUpload upload = {width, height, uint32_t(format), dxvk::rowsHash(data, pitch, rowBytes, rows)};
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    const auto last = g_lastUploads.find(texture);
+    if (last != g_lastUploads.end() && last->second.hash == upload.hash && last->second.width == width &&
+        last->second.height == height && last->second.format == upload.format && g_textures.count(texture) &&
+        !g_pendingTextures.count(texture)) {
+      ++g_textureUploadRepeats;
+      return;
+    }
+    g_lastUploads.erase(texture); // re-recorded once this upload is in
+  }
   std::vector<uint8_t> pixels = packLevel(data, pitch, rowBytes, rows);
+#endif
   // Hashed as the game wrote it, before the X8 channel is made opaque.
   const uint64_t contentHash = dxvk::textureHash(pixels.data(), pixels.size());
   const uint64_t legacyHash = dxvk::legacyTextureHash(pixels.data(), pixels.size());
   noteReplacementKey(contentHash, 'T');
+  if (format == D3DFMT_DXT3)
+    formats::transcodeBC2toBC3(pixels.data(), pixels.size());
   // The X bytes are whatever the engine's conversion left there (unwritten
   // memory for some textures): a texture is also found by its hash with X
   // 0xff, which a file's pixels predict (bsp_world textureHashes).
@@ -5468,9 +8954,22 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     if (shared == g_texturesByHash.end())
       continue;
     if (auto existing = shared->second.lock()) {
+      ++g_textureUploadKnown;
       g_textures[texture] = std::move(existing);
       g_pendingTextures.erase(texture);
+#if defined(PROXY_GAME_EZ2)
+      return;
+    }
+  }
+  auto &p = pendingTexture(texture, width, height, format, levels);
+  p.level[0] = std::move(pixels);
+  p.contentHash = contentHash;
+  p.legacyHash = legacyHash;
+  p.opaqueHash = opaqueHash;
+  p.levelZero = true;
+#else
       storeCpuCopy(texture, width, height, format, std::move(pixels));
+      g_lastUploads[texture] = upload;
       return;
     }
   }
@@ -5481,18 +8980,24 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   p.opaqueHash = opaqueHash;
   p.levelZero = true;
   storeCpuCopy(texture, width, height, format, std::move(pixels));
+#endif
   // Created now with one level or with every level in; else when the last
   // level is written (onTextureLevel) or at the next Present.
   if (levels <= 1 || p.complete()) {
     createPendingTexture(texture, p);
     g_pendingTextures.erase(texture);
   }
+#if !defined(PROXY_GAME_EZ2)
+  g_lastUploads[texture] = upload;
+#endif
 }
 
 void onTextureLevel(const void *texture, uint32_t level, uint32_t width, uint32_t height, uint32_t levelWidth,
                     uint32_t levelHeight, D3DFORMAT format, const uint8_t *data, uint32_t pitch, uint32_t levels) {
   if (!g_ready || !data || !level || level >= levels || !levelWidth || !levelHeight)
     return;
+  Timer levelTimer(g_usTextureLevel);
+  ++g_textureLevels;
   remixapi_Format remixFormat;
   uint32_t rowBytes, rows;
   if (!textureLayout(format, levelWidth, levelHeight, remixFormat, rowBytes, rows))
@@ -5503,9 +9008,15 @@ void onTextureLevel(const void *texture, uint32_t level, uint32_t width, uint32_
     return;
   std::vector<uint8_t> pixels = packLevel(data, pitch, rowBytes, rows);
   ++g_textureLevelsSeen;
+  if (format == D3DFMT_DXT3)
+    formats::transcodeBC2toBC3(pixels.data(), pixels.size());
   if (format == D3DFMT_X8R8G8B8)
     for (size_t i = 3; i < pixels.size(); i += 4)
       pixels[i] = 0xff;
+#if defined(PROXY_GAME_EZ2)
+  if (isUnpackFormat(format))
+    pixels = unpackToBgra(format, levelWidth, levelHeight, pixels.data(), pixels.size());
+#endif
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto &p = pendingTexture(texture, width, height, format, levels);
   p.level[level] = std::move(pixels);
@@ -5529,12 +9040,26 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
   const uint32_t x1 = (uint32_t(rect.right) + unit - 1) / unit, y1 = (uint32_t(rect.bottom) + unit - 1) / unit;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto &cpu = g_cpuTextures[texture];
+#if defined(PROXY_GAME_EZ2)
+  if (!cpu || cpu.use_count() > 1 || cpu->width != width || cpu->height != height || cpu->format != format) {
+    auto newCpu = std::make_shared<CpuTexture>();
+    newCpu->width = width;
+    newCpu->height = height;
+    newCpu->format = format;
+    if (cpu && cpu->data.size() == size_t(rowBytes) * rows)
+      newCpu->data = cpu->data;
+    else
+      newCpu->data.assign(size_t(rowBytes) * rows, 0);
+    newCpu->registeredVersion = 0;
+    cpu = std::move(newCpu);
+#else
   if (!cpu || cpu->width != width || cpu->height != height || cpu->format != format) {
     cpu = std::make_shared<CpuTexture>();
     cpu->width = width;
     cpu->height = height;
     cpu->format = format;
     cpu->data.assign(size_t(rowBytes) * rows, 0);
+#endif
   }
   // GMod rewrites a Chromium page's whole rectangle on every repaint: only
   // the bytes that differ from the copy mark it dirty (the region forwarded
@@ -5561,6 +9086,9 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
     return;
   cpu->touch(changedX0 * unit, changedY0 * unit, changedX1 * unit, changedY1 * unit);
   ++cpu->version;
+#if defined(PROXY_GAME_EZ2)
+  g_textures.erase(texture);
+#endif
 }
 
 // --- Render-target contents ---------------------------------------------------
@@ -5590,7 +9118,7 @@ PFN_remixapi_UpdateTextureEXT targetUpdateEntry() {
     if (GetEnvironmentVariableA("OPENREMIX_PROXY_TARGET_UPDATE", v, sizeof(v)) && v[0] == '0')
       return PFN_remixapi_UpdateTextureEXT(nullptr);
     return reinterpret_cast<PFN_remixapi_UpdateTextureEXT>(
-        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateTextureEXT")));
+        reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_UpdateTextureEXT")));
   }();
   return entry;
 }
@@ -5677,6 +9205,7 @@ bool createTargetTexture(TargetPixels &t) {
   record->width = t.width;
   record->height = t.height;
   ++g_stats.textures;
+  g_lastUploads.erase(t.texture); // its pixels are the target's now
   auto &slot = g_textures[t.texture];
   g_targetRecreated += slot && slot->dynamic;
   ++g_targetCreated;
@@ -5734,23 +9263,167 @@ void onMaterialBound(const engine_materials::Shading &shading, const char *mater
 
 void onTextureCopy(const void *source, const void *destination) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+#if defined(PROXY_GAME_EZ2)
+  // A user-memory texture: what it holds now is in that memory.
+  if (const auto user = g_userMemoryTextures.find(source); user != g_userMemoryTextures.end()) {
+    const UserMemoryTexture u = user->second;
+    uint32_t rowBytes, rows;
+    if (levelLayout(u.format, u.width, u.height, rowBytes, rows))
+      onTextureUpload(source, u.width, u.height, u.format, u.bits, rowBytes, 1);
+  }
+  if (auto t = findOrRealizeTexture(source))
+    g_textures[destination] = t;
+  else
+    g_textures.erase(destination);
+  auto cpu = g_cpuTextures.find(source);
+  if (cpu != g_cpuTextures.end() && cpu->second) {
+    auto copy = std::make_shared<CpuTexture>(*cpu->second);
+    copy->registeredVersion = 0;
+    copy->touch(0, 0, copy->width, copy->height);
+    g_cpuTextures[destination] = std::move(copy);
+  }
+}
+
+void initCpuTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format) {
+  if (!keepCpuCopy(format, width, height))
+    return;
+  uint32_t rowBytes, rows;
+  if (!levelLayout(format, width, height, rowBytes, rows))
+    return;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  auto &cpu = g_cpuTextures[texture];
+  if (!cpu) {
+    cpu = std::make_shared<CpuTexture>();
+    cpu->width = width;
+    cpu->height = height;
+    cpu->format = format;
+    cpu->data.assign(size_t(rowBytes) * rows, 0);
+  }
+}
+
+void onUserMemoryTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *bits) {
+#if defined(PROXY_GAME_EZ2)
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  g_userMemoryTextures[texture] = {bits, width, height, format};
+#endif
+}
+
+void onTextureSubCopy(const void *source, const void *destination, const RECT *srcRect, const POINT *dstPoint) {
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  if (g_textures.find(destination) == g_textures.end()) {
+    if (auto t = findOrRealizeTexture(source))
+      g_textures[destination] = t;
+  }
+
+  auto srcCpuIt = g_cpuTextures.find(source);
+  if (srcCpuIt == g_cpuTextures.end() || !srcCpuIt->second)
+    return;
+  const auto &srcCpu = srcCpuIt->second;
+
+  auto dstCpuIt = g_cpuTextures.find(destination);
+  if (dstCpuIt == g_cpuTextures.end() || !dstCpuIt->second) {
+    initCpuTexture(destination, srcCpu->width, srcCpu->height, srcCpu->format);
+    dstCpuIt = g_cpuTextures.find(destination);
+    if (dstCpuIt == g_cpuTextures.end() || !dstCpuIt->second)
+      return;
+  }
+  auto &dstCpu = dstCpuIt->second;
+  if (dstCpu.use_count() > 1) {
+    dstCpu = std::make_shared<CpuTexture>(*dstCpu);
+    dstCpu->registeredVersion = 0;
+  }
+
+  if (srcCpu->format != dstCpu->format || srcCpu->data.empty() || dstCpu->data.empty())
+    return;
+
+  uint32_t sx0 = 0, sy0 = 0, sw = srcCpu->width, sh = srcCpu->height;
+  if (srcRect) {
+    if (srcRect->left < 0 || srcRect->top < 0 || srcRect->right <= srcRect->left || srcRect->bottom <= srcRect->top)
+      return;
+    sx0 = uint32_t(srcRect->left);
+    sy0 = uint32_t(srcRect->top);
+    sw = uint32_t(srcRect->right - srcRect->left);
+    sh = uint32_t(srcRect->bottom - srcRect->top);
+  }
+  uint32_t dx0 = 0, dy0 = 0;
+  if (dstPoint) {
+    if (dstPoint->x < 0 || dstPoint->y < 0)
+      return;
+    dx0 = uint32_t(dstPoint->x);
+    dy0 = uint32_t(dstPoint->y);
+  }
+
+  if (sx0 + sw > srcCpu->width)
+    sw = (srcCpu->width > sx0) ? (srcCpu->width - sx0) : 0;
+  if (sy0 + sh > srcCpu->height)
+    sh = (srcCpu->height > sy0) ? (srcCpu->height - sy0) : 0;
+  if (dx0 + sw > dstCpu->width)
+    sw = (dstCpu->width > dx0) ? (dstCpu->width - dx0) : 0;
+  if (dy0 + sh > dstCpu->height)
+    sh = (dstCpu->height > dy0) ? (dstCpu->height - dy0) : 0;
+
+  if (sw == 0 || sh == 0)
+    return;
+
+  uint32_t srcRowBytes, srcRows, dstRowBytes, dstRows;
+  if (!levelLayout(srcCpu->format, srcCpu->width, srcCpu->height, srcRowBytes, srcRows) ||
+      !levelLayout(dstCpu->format, dstCpu->width, dstCpu->height, dstRowBytes, dstRows))
+    return;
+
+  const bool blocks = srcCpu->format == D3DFMT_DXT1 || srcCpu->format == D3DFMT_DXT5;
+  const uint32_t unit = blocks ? 4 : 1;
+  const uint32_t unitBytes = srcRowBytes / std::max(1u, blocks ? (srcCpu->width + 3) / 4 : srcCpu->width);
+
+  const uint32_t u_sx0 = sx0 / unit, u_sy0 = sy0 / unit;
+  const uint32_t u_dx0 = dx0 / unit, u_dy0 = dy0 / unit;
+  const uint32_t u_sw = (sw + unit - 1) / unit;
+  const uint32_t u_sh = (sh + unit - 1) / unit;
+  const uint32_t copyBytes = u_sw * unitBytes;
+
+  for (uint32_t y = 0; y < u_sh; ++y) {
+    const size_t srcOffset = size_t(u_sy0 + y) * srcRowBytes + size_t(u_sx0) * unitBytes;
+    const size_t dstOffset = size_t(u_dy0 + y) * dstRowBytes + size_t(u_dx0) * unitBytes;
+    if (srcOffset + copyBytes <= srcCpu->data.size() && dstOffset + copyBytes <= dstCpu->data.size()) {
+      std::memcpy(dstCpu->data.data() + dstOffset, srcCpu->data.data() + srcOffset, copyBytes);
+    }
+  }
+
+  dstCpu->touch(dx0, dy0, dx0 + sw, dy0 + sh);
+  ++dstCpu->version;
+  g_textures.erase(destination);
+#else
   auto it = g_textures.find(source);
   if (it != g_textures.end())
     g_textures[destination] = it->second;
+  // The destination holds the source's pixels: its next upload compares with those.
+  if (auto last = g_lastUploads.find(source); last != g_lastUploads.end())
+    g_lastUploads[destination] = last->second;
+  else
+    g_lastUploads.erase(destination);
   auto cpu = g_cpuTextures.find(source);
   if (cpu != g_cpuTextures.end())
     g_cpuTextures[destination] = cpu->second;
+#endif
 }
 
 void onTextureReleased(const void *texture) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+#if defined(PROXY_GAME_EZ2)
+  g_userMemoryTextures.erase(texture);
+#endif
   g_textures.erase(texture);
+  g_lastUploads.erase(texture);
   g_pendingTextures.erase(texture);
   auto cpu = g_cpuTextures.find(texture);
   if (cpu != g_cpuTextures.end()) {
+#if defined(PROXY_GAME_EZ2)
+    if (cpu->second && cpu->second->registeredVersion && g_ready)
+      g_api.FreeUITexture(static_cast<remixapi_UITextureHandle>(reinterpret_cast<uintptr_t>(texture)));
+#else
     // UI ids name the CPU copy, which UpdateTexture destinations may share.
     if (cpu->second.use_count() == 1 && cpu->second->registeredVersion && g_ready)
       g_api.FreeUITexture(reinterpret_cast<uintptr_t>(cpu->second.get()));
+#endif
     g_cpuTextures.erase(cpu);
   }
 }
@@ -5767,11 +9440,106 @@ void dumpStatistics(FILE *out) {
           g_stats.noData.exchange(0) / f, g_stats.skinned.exchange(0) / f, g_stats.badPrim.exchange(0) / f,
           g_stats.badRange.exchange(0) / f, g_stats.cacheHits.exchange(0) / f, g_stats.created.exchange(0) / f,
           g_stats.transient.exchange(0) / f, g_stats.evicted.exchange(0) / f, g_stats.rigidModels.exchange(0) / f);
-  fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f\n",
+#ifdef PROXY_GAME_L4D2
+  l4d2::infected::dumpStatistics(out, g_infectedMaterials.size());
+#endif
+  if (game::kFixedFunction) {
+    // Fixed-function draws (fixed_function.h): kinds, then outcomes.
+    auto take = [&](std::atomic<uint32_t> &n) { return n.exchange(0) / f; };
+    auto &s = g_ffStats;
+    fprintf(out, "   fixed-function draws per frame %.1f: 3D rigid %.1f, skinned indexed %.1f (D3DCOLOR indices %.1f), "
+                 "non-indexed %.1f (tweening drawn rigid %.1f, 4 matrices cut to 3 %.1f); 2D %.1f (pre-transformed "
+                 "%.1f) | layout from SetFVF %.1f\n",
+            take(s.draws), take(s.rigid), take(s.indexed), take(s.indexedColor), take(s.nonIndexed), take(s.tweening),
+            take(s.fourMatrices), take(s.flat), take(s.pretransformed), take(s.fvf));
+    fprintf(out, "     camera: fixed-function views per frame %.2f perspective, %.2f flat; main view from D3D's "
+                 "VIEW/PROJECTION in %.0f%% of frames | texture: transforms baked %.1f, projected (not divided) %.1f, "
+                 "projected from the position %.1f, untextured (stage off) %.1f, base texture on another stage %.1f, "
+                 "texture factor %.1f, irises %.1f\n",
+            take(s.views), take(s.flatViews), 100.0 * s.mainFrames.exchange(0) / f, take(s.uvTransforms),
+            take(s.projected), take(s.generated), take(s.untextured), take(s.otherStage), take(s.textureFactor),
+            take(s.irises));
+    std::string outcomes;
+    for (int k = 0; k < 11; ++k) {
+      char item[64];
+      std::snprintf(item, sizeof(item), "%s%s %.1f", k ? ", " : "", kFfOutcomes[k], take(s.outcomes[k]));
+      outcomes += item;
+    }
+    std::string skipped;
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      for (const auto &[reason, n] : g_ffSkipped) {
+        char item[160];
+        std::snprintf(item, sizeof(item), "; %s %.1f", reason.c_str(), n / f);
+        skipped += item;
+      }
+      g_ffSkipped.clear();
+    }
+    fprintf(out, "     outcomes per frame: %s | blended pass layers dropped %.1f | dropped by the conversion%s\n",
+            outcomes.c_str(), take(s.layers), skipped.empty() ? ": none" : skipped.c_str());
+  }
+  fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f | $translucent "
+               "world draws with an opaque texture, drawn opaque %.1f | screen camera draws %.1f (views %zu, "
+               "refused for want of a slot %.1f; instances only screen views see %.1f)\n",
           g_stats.bspDropped.exchange(0) / f, g_stats.bspKeptBlended.exchange(0) / f,
-          g_stats.bspKeptDynamic.exchange(0) / f);
-  fprintf(out, "   dropped for the BSP world: static prop draws %.1f, overlay draws %.1f\n",
-          g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f);
+          g_stats.bspKeptDynamic.exchange(0) / f, g_stats.opaqueTranslucent.exchange(0) / f,
+          g_stats.screenDraws.exchange(0) / f, g_screenViews.size(), g_stats.screenViewsFull.exchange(0) / f,
+          g_stats.screenInstances.exchange(0) / f);
+#ifdef PROXY_GAME_PORTAL2
+  {
+    // The engine's portal views (portal2.h), per frame.
+    auto &p = g_portalViewStats;
+    fprintf(out,
+            "   portal views: marked %.2f (not into the back buffer %.2f), drawn %.2f, frames with any %.0f%%, world views "
+            "inside them (3D sky) %.2f | draws in their world lists dropped %.1f | portal surfaces dropped %.1f, "
+            "stencil marks %.1f, raster overlays %.1f | told by their shader alone %.1f (last %s)\n",
+            p.views.exchange(0) / f, p.notBackBuffer.exchange(0) / f, p.viewsDrawn.exchange(0) / f,
+            100.0 * double(p.frames.exchange(0)) / f, p.worldViewsInPortals.exchange(0) / f,
+            p.worldDropped.exchange(0) / f, p.surfacesDropped.exchange(0) / f,
+            p.surfaceMarks.exchange(0) / f, p.surfaceOverlays.exchange(0) / f, p.byShader.exchange(0) / f,
+            [&] {
+              std::lock_guard<std::mutex> lock(p.byShaderMutex);
+              return p.byShaderName.empty() ? std::string("-") : p.byShaderName;
+            }().c_str());
+    fprintf(out,
+            "   engine portal rims (host passes, always): replayed %.1f, refused %.1f, in portal views (left out) %.1f\n",
+            p.engineRims.exchange(0) / f, p.engineRimsRefused.exchange(0) / f, p.engineRimsInViews.exchange(0) / f);
+    fprintf(out,
+            "   portal-view instances: kept %.1f (the player's own, reflection-only %.1f; in the main view %.1f) | left "
+            "out: raster only %.1f, blended in world space %.1f, stencil %.1f, placed already %.1f\n",
+            p.instances.exchange(0) / f, p.bodies.exchange(0) / f, p.mainBodies.exchange(0) / f, p.skipped[0].exchange(0) / f,
+            p.skipped[1].exchange(0) / f, p.skipped[2].exchange(0) / f, p.skipped[3].exchange(0) / f);
+  }
+#endif
+  fprintf(out, "   last screen draw (%s): c48 %g %g %g %g c49 %g %g %g %g | u %g..%g v %g..%g -> u %g..%g v %g..%g (built "
+               "meshes only)\n",
+          g_screenMaterial.c_str(), g_screenUvRows[0], g_screenUvRows[1], g_screenUvRows[2], g_screenUvRows[3],
+          g_screenUvRows[4], g_screenUvRows[5], g_screenUvRows[6], g_screenUvRows[7], g_screenUvRange[0],
+          g_screenUvRange[1], g_screenUvRange[2], g_screenUvRange[3], g_screenUvRange[4], g_screenUvRange[5],
+          g_screenUvRange[6], g_screenUvRange[7]);
+  for (int k = 0; k < 4; ++k)
+    g_screenUvRange[2 * k] = 1e30f, g_screenUvRange[2 * k + 1] = -1e30f;
+  fprintf(out, "   screen-view instances left out (since the last dump): raster only %llu (%s), blended in world space "
+               "%llu (%s), stencil %llu (%s), placed already %llu (%s)\n",
+          (unsigned long long)g_screenSkipped[0], g_screenSkippedExample[0].c_str(),
+          (unsigned long long)g_screenSkipped[1], g_screenSkippedExample[1].c_str(),
+          (unsigned long long)g_screenSkipped[2], g_screenSkippedExample[2].c_str(),
+          (unsigned long long)g_screenSkipped[3], g_screenSkippedExample[3].c_str());
+  std::fill_n(g_screenSkipped, 4, 0ull);
+  fprintf(out, "   deforming instances submitted (since the last dump): mesh refreshed this frame %llu, earlier %llu\n",
+          (unsigned long long)g_deformFresh, (unsigned long long)g_deformStale);
+  g_deformFresh = g_deformStale = 0;
+  for (const auto &c : screenCameras())
+    fprintf(out, "   screen camera %u: at %.0f %.0f %.0f forward %.2f %.2f %.2f up %.2f %.2f %.2f fovY %.1f aspect %.2f\n",
+            c.slot, c.position.x, c.position.y, c.position.z, c.forward.x, c.forward.y, c.forward.z, c.up.x, c.up.y,
+            c.up.z, c.fovYDegrees, c.aspect);
+  fprintf(out, "   dropped for the BSP world: static prop draws %.1f, overlay draws %.1f, func_lod draws %.1f\n",
+          g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f,
+          g_stats.bspBrushEntitiesDropped.exchange(0) / f);
+  vb_origins::write(out, f);
+  fprintf(out, "   Lua meshes lit as surfaces per frame: %.1f (OPENREMIX_PROXY_LUA_MESHES_LIT); detail sprite draws "
+               "lit as surfaces %.1f\n",
+          g_stats.luaLitDraws.exchange(0) / f, g_stats.detailSpriteDraws.exchange(0) / f);
   bsp::dumpStatistics(out);
   remix_ui::dumpStatistics(out);
   {
@@ -5781,12 +9549,28 @@ void dumpStatistics(FILE *out) {
               bsp::materialName(hash).c_str(), n / f);
     g_keptWorldTextures.clear();
   }
+  {
+    static const char *names[kBuildKinds] = {"flex refresh", "transient", "eye", "iris", "cached first"};
+    fprintf(out, "   mesh build per frame by kind:");
+    for (int k = 0; k < kBuildKinds; ++k)
+      fprintf(out, "%s %s %.1f calls %.0f vertices %.2f ms", k ? " |" : "", names[k], g_buildCalls[k].exchange(0) / f,
+              g_buildVertices[k].exchange(0) / f, g_usBuildKind[k].exchange(0) / f / 1000);
+    fprintf(out, " | sent as vertex updates %.1f (refused %.1f)", g_vertexUpdates.exchange(0) / f,
+            g_vertexUpdatesRefused.exchange(0) / f);
+    fprintf(out, " | of all: runtime CreateMesh %.2f ms (content cache %s)\n", g_usCreateMesh.exchange(0) / f / 1000,
+            envScale("OPENREMIX_PROXY_CONTENT_CACHE", game::kFixedFunction ? 1 : 0) > 0 ? "on" : "off");
+    fprintf(out, "   per frame: texture uploads %.2f (%.2f MiB, %.2f repeats skipped, %.2f already known) %.2f ms, further levels %.2f %.2f ms | "
+                 "replacement keys (geometryHash) %.1f %.2f ms\n",
+            g_textureUploads.exchange(0) / f, g_textureUploadBytes.exchange(0) / f / 1048576.0,
+            g_textureUploadRepeats.exchange(0) / f, g_textureUploadKnown.exchange(0) / f, g_usTextureUpload.exchange(0) / f / 1000, g_textureLevels.exchange(0) / f,
+            g_usTextureLevel.exchange(0) / f / 1000, g_geometryHashes.exchange(0) / f, g_usGeometryHash.exchange(0) / f / 1000);
+  }
   fprintf(out, "   ms/frame: frame %.2f | proxy draws %.2f (mesh build %.2f) present submit %.2f (BSP world %.2f, Present call %.2f)\n",
           g_usFrame.exchange(0) / f / 1000, g_usDraw.exchange(0) / f / 1000, g_usBuild.exchange(0) / f / 1000,
           g_usSubmit.exchange(0) / f / 1000, g_usBsp.exchange(0) / f / 1000, g_usPresent.exchange(0) / f / 1000);
   if (g_ready) {
     static auto framePerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT"));
     remixapi_FramePerformanceEXT perf = {};
     perf.structSize = sizeof(perf);
     if (framePerformance && framePerformance(&perf) == REMIXAPI_ERROR_CODE_SUCCESS)
@@ -5855,7 +9639,7 @@ void dumpStatistics(FILE *out) {
       g_slowFrame.recordSum = 0;
     }
     // GPU side: per-pass times, tracing and local-light counts.
-    auto stat = [](const char *name) { return GetProcAddress(GetModuleHandleW(L"remix.dll"), name); };
+    auto stat = [](const char *name) { return GetProcAddress(game::runtimeModule(), name); };
     static auto passTimings = reinterpret_cast<decltype(&remixapi_GetGpuPassTimingsEXT)>(stat("remixapi_GetGpuPassTimingsEXT"));
     static auto tracing = reinterpret_cast<decltype(&remixapi_GetTracingStatisticsEXT)>(stat("remixapi_GetTracingStatisticsEXT"));
     static auto localLights = reinterpret_cast<decltype(&remixapi_GetLocalLightStatisticsEXT)>(stat("remixapi_GetLocalLightStatisticsEXT"));
@@ -5933,6 +9717,10 @@ void dumpStatistics(FILE *out) {
               cache.queryAttempts ? 100.0 * cache.queryHits / cache.queryAttempts : 0.0,
               static_cast<unsigned long long>(cache.resets), static_cast<unsigned long long>(cache.renderedFrames));
   }
+  if (game::kFixedFunction)
+    fprintf(out, "   dynamic-buffer draws named by their contents per frame %.1f, CPU-deformed models rewritten unchanged "
+                 "(no refresh) %.1f (OPENREMIX_PROXY_CONTENT_CACHE)\n",
+            g_stats.contentNamed.exchange(0) / f, g_stats.contentRefreshSkipped.exchange(0) / f);
   fprintf(out, "   transient: %.0f vertices %.0f indices per frame; by declaration:",
           g_transientVerts.exchange(0) / f, g_transientIndices.exchange(0) / f);
   {
@@ -5945,9 +9733,14 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   lights per frame %.1f (cached %zu); sky radiance %.3f %.3f %.3f\n", g_stats.lights.exchange(0) / f,
           g_lights.size(), g_lastSky[0], g_lastSky[1], g_lastSky[2]);
   fprintf(out, "   engine per-model lights kept per frame: point %.2f, directional %.2f, spot %.2f; copies of projected "
-               "textures dropped %.2f\n",
+               "textures dropped %.2f; projected textures with their cookie %.2f (largest cookie frame %u)\n",
           g_stats.setLightKept[1].exchange(0) / f, g_stats.setLightKept[2].exchange(0) / f,
-          g_stats.setLightKept[3].exchange(0) / f, g_stats.projectedCopies.exchange(0) / f);
+          g_stats.setLightKept[3].exchange(0) / f, g_stats.projectedCopies.exchange(0) / f,
+          g_stats.lightCookies.exchange(0) / f, g_stats.lightCookieFrameMax.exchange(0));
+  fprintf(out, "   shattered glass per frame: solid blocks drawn as the glass %.1f, edge pieces composed %.1f, "
+               "tinted %.1f; composed textures made %u\n",
+          g_stats.shatteredSolid.exchange(0) / f, g_stats.shatteredEdges.exchange(0) / f,
+          g_stats.shatteredTinted.exchange(0) / f, g_stats.shatteredTextures.exchange(0));
   {
     std::lock_guard<std::mutex> lock(g_lightLock);
     for (auto &[h, l] : g_lastLights)
@@ -5958,7 +9751,7 @@ void dumpStatistics(FILE *out) {
   {
     char diagnostic[512] = {};
     auto modsDiagnostic = reinterpret_cast<decltype(&remixapi_GetUSDModsDiagnosticEXT)>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetUSDModsDiagnosticEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetUSDModsDiagnosticEXT"));
     if (g_ready && modsDiagnostic)
       modsDiagnostic(diagnostic, sizeof(diagnostic));
     fprintf(out, "   USD mods: configure %d; %s\n", int(g_modsResult), diagnostic);
@@ -6155,8 +9948,12 @@ void dumpStatistics(FILE *out) {
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
     fprintf(out,
             "   under water (bsp water leaves at the eye; OPENREMIX_PROXY_UNDERWATER): %.0f%% of frames | flat Refract "
-            "screen effects dropped per frame %.1f\n",
-            100.0 * g_stats.underwaterFrames.exchange(0) / std::max(1.0, f), g_stats.refractOverlaysDropped.exchange(0) / f);
+            "screen effects dropped per frame %.1f | window imposters and faded-out brushes dropped %.1f | entity glow "
+            "draws %.1f, taken as halo sources %.1f | water bottom materials ($abovewater 0) dropped above water %.1f "
+            "(OPENREMIX_PROXY_WATER_BOTTOMS)\n",
+            100.0 * g_stats.underwaterFrames.exchange(0) / std::max(1.0, f), g_stats.refractOverlaysDropped.exchange(0) / f,
+            g_stats.windowImpostersDropped.exchange(0) / f, g_stats.glowDraws.exchange(0) / f,
+            g_stats.glowSources.exchange(0) / f, g_stats.waterBottomsDropped.exchange(0) / f);
     fprintf(out,
             "   PBR conversions (pbr_rules; OPENREMIX_PROXY_PBR=%d) per frame: %.1f draws, with a normal map %.1f, a "
             "roughness map %.1f, a metal map %.1f | stayed diffuse: not the material's base texture %.1f | a map not uploaded %.1f | "
@@ -6164,6 +9961,17 @@ void dumpStatistics(FILE *out) {
             pbr::enabled() ? 1 : 0, g_stats.pbrDraws.exchange(0) / f, g_stats.pbrNormalDraws.exchange(0) / f,
             g_stats.pbrMapDraws.exchange(0) / f, g_stats.pbrMetalDraws.exchange(0) / f, g_stats.pbrNotBase.exchange(0) / f,
             g_stats.pbrMapsMissing.exchange(0) / f, g_stats.pbrCreated.exchange(0));
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      for (const auto &[base, n] : g_pbrNotBase) {
+        const std::string drawn = bsp::materialName(n.texture);
+        fprintf(out, "     not its base texture: %s (material %s): %.2f draws per frame, last texture %016llX%s%s, %zu "
+                     "candidate hashes from its file\n",
+                base.empty() ? "(no base texture)" : base.c_str(), n.material.c_str(), n.draws / f,
+                static_cast<unsigned long long>(n.texture), drawn.empty() ? "" : " = ", drawn.c_str(), n.candidates);
+      }
+      g_pbrNotBase.clear();
+    }
     {
       float m[4];
       {
@@ -6188,15 +9996,17 @@ void dumpStatistics(FILE *out) {
               g_stats.modulatedDraws.exchange(0) / f, g_stats.modulatedBlack.exchange(0) / f,
               g_stats.modulatedMasked.exchange(0) / f, g_stats.modulatedMetal.exchange(0) / f, m[0], m[1], m[2], m[3]);
     }
-  fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f\n",
-          g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f);
+  fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f | reflective "
+               "glass drawn as mirrors %.1f (OPENREMIX_PROXY_MIRRORS)\n",
+          g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f, g_stats.mirrorDraws.exchange(0) / f);
   fprintf(out, "   wireframe draws (D3DFILL_WIREFRAME, raster-only lines) per frame: %.1f\n",
           g_stats.wireframeDraws.exchange(0) / f);
-  fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f\n",
+  fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f, with cFlexScale not named by the shader (c%u assumed): %.1f\n",
           g_stats.flexed.exchange(0) / f, g_stats.flexRefreshed.exchange(0) / f, g_flexMeshes.size(),
-          g_stats.flexUnscaled.exchange(0) / f);
-  fprintf(out, "   eye draws per frame (Eyes and EyeRefract shaders): %.1f, iris overlays submitted %.1f, EyeRefract eyes retextured %.1f\n",
-          g_stats.eyes.exchange(0) / f, g_stats.eyeIrises.exchange(0) / f, g_stats.eyeRefracts.exchange(0) / f);
+          g_stats.flexUnscaled.exchange(0) / f, kRegFlexScale, g_stats.flexAssumed.exchange(0) / f);
+  fprintf(out, "   eye draws per frame (Eyes and EyeRefract shaders): %.1f (told by the vertex shader, material not read: %.1f), iris overlays submitted %.1f, EyeRefract eyes retextured %.1f\n",
+          g_stats.eyes.exchange(0) / f, g_stats.eyesByShader.exchange(0) / f, g_stats.eyeIrises.exchange(0) / f,
+          g_stats.eyeRefracts.exchange(0) / f);
   {
     // Cached meshes built more than once in the interval (see MeshBuilds).
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
@@ -6241,6 +10051,19 @@ void dumpStatistics(FILE *out) {
           g_stats.haloGroups.exchange(0) / f, g_stats.haloSources.exchange(0) / f, g_stats.maskGroups.exchange(0) / f,
           g_stats.maskSources.exchange(0) / f, g_stats.maskOverlays.exchange(0) / f, g_stats.maskUi.exchange(0) / f,
           g_stats.maskCuts.exchange(0) / f);
+  if (const double energy = g_stats.tracedEnergy.exchange(0) / f; energy > 0)
+    fprintf(out, "   light bridges (SolidEnergy, effects/projected_wall) traced with the runtime's SolidEnergy "
+                 "(OPENREMIX_PROXY_SOLID_ENERGY): %.1f per frame | lights (OPENREMIX_PROXY_SOLID_ENERGY_LIGHT %.2f): "
+                 "%.1f instances, %.1f triangles per frame | meshes made %.2f per frame (named by their contents: "
+                 "0 while the bridges stand)\n",
+            energy,
+#ifdef PROXY_GAME_PORTAL2
+            portal2::solidEnergyLight(),
+#else
+            0.0,
+#endif
+            g_stats.energyLit.exchange(0) / f, g_stats.energyTriangles.exchange(0) / f,
+            g_stats.energyMeshes.exchange(0) / f);
   if (const double culled = g_stats.cameraCulledModels.exchange(0) / f; culled > 0)
     fprintf(out, "   engine-drawn models with back faces hidden from the camera "
                  "(OPENREMIX_PROXY_CULL_BACKFACES_MODELS): %.1f per frame\n", culled);
@@ -6276,7 +10099,7 @@ void dumpStatistics(FILE *out) {
             g_targetRecreated.exchange(0), g_targetFailed.exchange(0),
             targetUpdateEntry() ? "" : " | in-place updates off: a new texture per image");
     static const auto statistics = reinterpret_cast<PFN_remixapi_GetTextureStatisticsEXT>(reinterpret_cast<void *>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetTextureStatisticsEXT")));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetTextureStatisticsEXT")));
     static remixapi_TextureStatisticsEXT last = {};
     remixapi_TextureStatisticsEXT now = {};
     now.structSize = sizeof(now);
@@ -6363,6 +10186,43 @@ extern "C" __declspec(dllexport) int __cdecl openremix_set_legacy_variable(const
 }
 
 namespace proxy::remix {
+const std::vector<uint8_t> *presentedImage(uint32_t width, uint32_t height) {
+  static const auto read = reinterpret_cast<PFN_remixapi_ReadPresentedImageEXT>(
+      GetProcAddress(game::runtimeModule(), "remixapi_ReadPresentedImageEXT"));
+  static const auto count = reinterpret_cast<PFN_remixapi_GetPresentationCount>(
+      GetProcAddress(game::runtimeModule(), "remixapi_GetPresentationCount"));
+  static struct {
+    std::mutex lock;
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0, height = 0;
+    uint64_t presented = ~0ull;
+  } cache;
+  if (!read || !width || !height)
+    return nullptr;
+  std::lock_guard<std::mutex> guard(cache.lock);
+  uint64_t presented = ~0ull;
+  if (!count || count(&presented) != REMIXAPI_ERROR_CODE_SUCCESS)
+    presented = ~0ull; // unknown: read every time
+  if (presented != ~0ull && presented == cache.presented && width == cache.width && height == cache.height)
+    return &cache.pixels;
+  cache.pixels.resize(size_t(width) * height * 4);
+  remixapi_PresentedImageEXT image = {};
+  image.width = width;
+  image.height = height;
+  image.rowPitch = width * 4;
+  image.pixels = cache.pixels.data();
+  const auto result = read(&image);
+  if (result != REMIXAPI_ERROR_CODE_SUCCESS) {
+    diag::stage("OpenRemix: presented image readback failed (%d)", int(result));
+    cache.presented = ~0ull;
+    return nullptr;
+  }
+  cache.width = width;
+  cache.height = height;
+  cache.presented = presented;
+  return &cache.pixels;
+}
+
 bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint32_t &version, bool &bgra,
                    std::vector<uint8_t> *pixels) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
@@ -6371,6 +10231,25 @@ bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint3
     return false;
   const auto &t = *it->second;
   const bool wide = t.format == D3DFMT_A8R8G8B8 || t.format == D3DFMT_X8R8G8B8;
+#if defined(PROXY_GAME_EZ2)
+  if (!wide && t.format != D3DFMT_DXT1 && t.format != D3DFMT_DXT5 && !isUnpackFormat(t.format))
+    return false;
+  width = t.width;
+  height = t.height;
+  version = t.version;
+  bgra = wide || isUnpackFormat(t.format);
+  if (pixels) {
+    if (t.format == D3DFMT_DXT1) {
+      *pixels = formats::decodeBC1(t.data.data(), t.width, t.height);
+      bgra = false;
+    } else if (t.format == D3DFMT_DXT5) {
+      *pixels = formats::decodeBC3(t.data.data(), t.width, t.height);
+      bgra = false;
+    } else if (isUnpackFormat(t.format)) {
+      *pixels = unpackToBgra(t.format, width, height, t.data.data(), t.data.size());
+      bgra = true;
+    } else {
+#else
   if (!wide && t.format != D3DFMT_DXT1 && t.format != D3DFMT_DXT5)
     return false;
   width = t.width;
@@ -6383,6 +10262,7 @@ bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint3
     else if (t.format == D3DFMT_DXT5)
       *pixels = formats::decodeBC3(t.data.data(), t.width, t.height);
     else {
+#endif
       *pixels = t.data;
       if (t.format == D3DFMT_X8R8G8B8)
         for (size_t i = 3; i < pixels->size(); i += 4)
@@ -6411,7 +10291,11 @@ bool onMarker(const char *text) {
       counter = 0;
   };
   if (const char *v = argument("world_lists")) {
-    if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && g_worldViews.size() < 16 && d3d::backBufferBound()) {
+    // (A world view after a portal view in the frame is one drawn through a
+    // portal, Portal 2's 3D skybox seen through it: never the main camera.)
+    if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && !g_portalViews.empty() && d3d::backBufferBound()) {
+      ++g_portalViewStats.worldViewsInPortals;
+    } else if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && g_worldViews.size() < 16 && d3d::backBufferBound()) {
       WorldView w;
       getMatrix(kMatrixView, w.view);
       getMatrix(kMatrixProjection, w.projection);
@@ -6426,11 +10310,50 @@ bool onMarker(const char *text) {
         g_worldViews.push_back(w);
         readSceneFog();
       }
+    } else if (g_worldLists == 0 && std::atoi(v) && g_shaderApi) {
+      // A view drawn into a render-target texture: a screen camera's.
+      if (const void *target = d3d::boundTargetTexture()) {
+        WorldView w;
+        getMatrix(kMatrixView, w.view);
+        getMatrix(kMatrixProjection, w.projection);
+        if (std::fabs(std::fabs(w.projection[11]) - 1.0f) < 1e-3f && std::fabs(w.projection[15]) < 1e-3f) {
+          if (w.projection[11] < 0) {
+            for (int r = 0; r < 4; ++r)
+              w.view[r * 4 + 2] = -w.view[r * 4 + 2];
+            for (int c = 0; c < 4; ++c)
+              w.projection[8 + c] = -w.projection[8 + c];
+          }
+          // Not the main camera's own view drawn again (an effect's
+          // render.RenderView of the scene, as dev_ssr's): no screen shows it.
+          if (!samePlacement(w.view, g_lastCamera.view))
+            noteScreenView(target, w.view, w.projection);
+        }
+      }
     }
     depth(g_worldLists, v);
   }
   else if (const char *v = argument("overlays"))
     depth(g_overlays, v);
+  else if (const char *v = argument("portal_view")) {
+    // Portal 2: a portal view's DrawWorldLists (x86_engine): its placement,
+    // when drawn into the back buffer (stencil portals; its draws are dropped
+    // while inside, see onDraw).
+    if (g_portalWorldLists == 0 && std::atoi(v) && g_shaderApi) {
+      if (d3d::backBufferBound() && g_portalViews.size() < 32) {
+        std::array<float, 16> view;
+        getMatrix(kMatrixView, view.data());
+        g_portalViews.push_back(view);
+        ++g_portalViewStats.views;
+      } else {
+        ++g_portalViewStats.notBackBuffer;
+      }
+    }
+    depth(g_portalWorldLists, v);
+  }
+#ifdef PROXY_GAME_PORTAL2
+  else if (const char *v = argument("portals"))
+    portal2::activate(uint32_t(std::strtoul(v, nullptr, 10)));
+#endif
   else if (const char *v = argument("body"))
     g_markerCategories = std::atoi(v) ? REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL |
                                             REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY
@@ -6440,6 +10363,9 @@ bool onMarker(const char *text) {
   else if (const char *v = argument("map")) {
     if (g_ready) {
       resetSky(); // the previous map's dome; this map's sky draws follow
+#ifdef PROXY_GAME_PORTAL2
+      portal2::reset(g_api);
+#endif
       proxy::bsp::load(g_api, v);
     }
   } else

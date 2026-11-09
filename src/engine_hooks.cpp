@@ -1,12 +1,15 @@
 #include "engine_hooks.h"
 #include "engine_lights.h"
+#include "engine_mirrors.h"
 #include "engine_nocull.h"
 #include "engine_patches.h"
 #include "engine_shadows.h"
+#include "game.h"
 
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace proxy::engine {
@@ -31,22 +34,53 @@ void *patch(void **vtable, unsigned slot, void *hook) {
 
 // Markers reach the shader API (SetPIXMarker, slot 216) through the render
 // context, so they stay ordered with the draws when the material system
-// queues rendering to its own thread (mat_queue_mode). Slots verified in
-// GMod's materialsystem.dll: IMaterialSystem::GetRenderContext 98 (no AddRef),
-// IMatRenderContext::SetPIXMarker 140 (jumps to IShaderAPI slot 216).
+// queues rendering to its own thread (mat_queue_mode). The material system's
+// slots per game: game::kSlotGetRenderContext, kSlotContextSetPIXMarker.
 void *g_materials = nullptr;
-// IVEngineClient (VEngineClient013) slot 51: GetLevelName ("maps/x.bsp").
+// IVEngineClient (VEngineClient013) slot 51: GetLevelName ("maps/x.bsp"), in
+// GMod's and TF2's engine.dll alike.
 void *g_engineClient = nullptr;
 char g_level[256] = {};
+
+DWORD g_mainThread = 0; // the thread of the first Present: the engine's main one
+
+// Texture detail Very High (mat_picmip -1) with the Advanced video options
+// hidden: the command line cannot carry it (the engine drops a negative value
+// after a "+" command). Run once the configs and "+" commands have been, from
+// the main thread (the command buffer is not shared with the render thread).
+// OPENREMIX_PROXY_PICMIP: another value, or "keep" to leave it as saved.
+void applyTextureDetail() {
+  if (!game::kGMod) // with GMod's Advanced video options (main.cpp) only
+    return;
+  static unsigned presents = 0;
+  static bool done = false;
+  if (done || ++presents < 60 || GetCurrentThreadId() != g_mainThread || !g_engineClient)
+    return;
+  done = true;
+  char value[16] = "-1";
+  if (GetEnvironmentVariableA("OPENREMIX_PROXY_PICMIP", value, sizeof(value)) && std::strcmp(value, "keep") == 0)
+    return;
+  char command[48];
+  std::snprintf(command, sizeof(command), "mat_picmip %d\n", std::atoi(value));
+  // IVEngineClient013 slot 106: ClientCmd_Unrestricted.
+  using ClientCmdFn = void (*)(void *, const char *);
+  reinterpret_cast<ClientCmdFn>((*static_cast<void ***>(g_engineClient))[106])(g_engineClient, command);
+}
 } // namespace
 void marker(const char *text) {
   if (!g_materials)
     return;
   using GetRenderContextFn = void *(*)(void *);
   using SetPIXMarkerFn = void (*)(void *, unsigned long, const char *);
-  void *context = reinterpret_cast<GetRenderContextFn>((*static_cast<void ***>(g_materials))[98])(g_materials);
-  if (context)
-    reinterpret_cast<SetPIXMarkerFn>((*static_cast<void ***>(context))[140])(context, 0, text);
+  void *context = reinterpret_cast<GetRenderContextFn>(
+      (*static_cast<void ***>(g_materials))[game::kSlotGetRenderContext])(g_materials);
+  if (!context)
+    return;
+  reinterpret_cast<SetPIXMarkerFn>((*static_cast<void ***>(context))[game::kSlotContextSetPIXMarker])(context, 0, text);
+  // TF2's GetRenderContext adds a reference (IRefCounted::Release, slot 1).
+  using ReleaseFn = int (*)(void *);
+  if (game::kRenderContextAddRef)
+    reinterpret_cast<ReleaseFn>((*static_cast<void ***>(context))[1])(context);
 }
 // Announces the map ("openremix:map <maps/x.bsp>", loads the BSP world) the
 // first time the world is drawn after it changed.
@@ -64,7 +98,7 @@ void noteLevel() {
 }
 } // namespace proxy::engine
 
-// IVRenderView (VEngineRenderView014) slot 13: DrawWorldLists. Inside it the
+// IVRenderView (VEngineRenderView014) slot 13 (GMod, TF2): DrawWorldLists. Inside it the
 // engine draws the world surfaces and, with DRAWWORLDLISTS_DRAW_SKYBOX, the
 // 2D skybox (dynamic-buffer draws). The wrapper preserves every argument
 // register (RCX, RDX, R8, R9, XMM0-3) and copies eight stack arguments, so it
@@ -142,8 +176,13 @@ namespace {
 
 bool install() {
   static bool done = false;
-  if (done)
+  if (!g_mainThread)
+    g_mainThread = GetCurrentThreadId();
+  if (done) {
+    applyTextureDetail();
+    engine_mirrors::install();
     return true;
+  }
   // OPENREMIX_PROXY_ENGINE_HOOKS=0 leaves the engine untouched.
   static const bool disabled = [] {
     char v[8] = {};
@@ -152,7 +191,7 @@ bool install() {
   if (disabled)
     return false;
   void *renderView = createInterface("engine.dll", "VEngineRenderView014");
-  g_materials = createInterface("materialsystem.dll", "VMaterialSystem080");
+  g_materials = createInterface("materialsystem.dll", game::kMaterialSystemInterface);
   g_engineClient = createInterface("engine.dll", "VEngineClient013");
   if (!renderView || !g_materials)
     return false;
@@ -162,6 +201,7 @@ bool install() {
   engine_nocull::install(g_materials, renderView);
   engine_lights::install();
   engine_shadows::install();
+  engine_mirrors::install();
   done = true;
   return true;
 }

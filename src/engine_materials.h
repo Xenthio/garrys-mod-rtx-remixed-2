@@ -30,6 +30,11 @@ struct Shading {
   bool luminous = false;
   float tint[3] = {1, 1, 1}; // linear multiplier of the emitted colour
   float maskScale = 1;       // emitted share = mask * maskScale (above one: overbright)
+  // The surface's albedo times the texture's (sRGB, as the texture's values):
+  // ShatteredGlass's edge pieces (their mask x the glass's colour). No
+  // opacity: a material opacity below one makes the runtime shade a glass
+  // sheet (transmission from the colour), not the draw's alpha blend.
+  float albedo[3] = {1, 1, 1};
   std::string mask;          // mask texture ("models/x/y_mask"), SelfIllumMask / MaskAlpha
   std::string base;          // $basetexture's name ("" when unknown), also of Lit materials
   pbr::Material pbr;         // its PBR conversion (pbr_rules), of the lit surface shaders
@@ -46,7 +51,22 @@ float fresnelShare(float minimum, float maximum, float exponent);
 
 // Validates the engine's material classes and IShaderAPI::Bind (the real
 // shader API's vtable). False: nothing is read, every draw is Lit.
+//
+// Left 4 Dead 2, Half-Life 2 RTX, Portal 2: the lookup is installed and read
+// at every Bind (statistics, dev dumps), and its answers reach the rest of
+// the proxy as OPENREMIX_PROXY_MATERIALS says: 0 none, every query below
+// answers "not known"; 1 all (the default); or a comma list of the queries'
+// groups:
+//   bound    bound(), currentIsLitOpaque()          (decals, shaders by name)
+//   name     currentName()                          (particle paths, host passes)
+//   shading  current(), remix::onMaterialBound      (unlit, self-illum, PBR)
+//   params   currentFloat/Vector/TextureName()      ($color, $alpha, sprite flags)
+// GMod: all, always.
 bool install(const void *const *shaderApiVtable);
+
+// The name of an ITexture of the material system, lower case ("" when the
+// pointer is not one, or before install). Main thread.
+std::string textureNameOf(void *texture);
 
 // IShaderAPI::Bind(IMaterial *), after the engine's (render thread).
 void onBind(void *material);
@@ -68,6 +88,7 @@ struct Bound {
   bool modulate = false;    // DecalModulate: dst x src x 2
   bool lightmapped = false; // LightmappedGeneric and the other world shaders
   bool vertexColor = false, vertexAlpha = false, translucent = false, additive = false, alphaTest = false;
+  bool isModel = false;     // $model / MATERIAL_VAR_MODEL (1 << 11), or its $model var
   bool subRect = false;     // bound through a CMaterialSubRect
   int flags = 0;
   const char *shader = "";
@@ -82,8 +103,20 @@ bool currentIsLitOpaque();
 // float or int, or a vector's first component). False when the material was
 // not read or does not define it.
 bool currentFloat(const char *name, float &out);
+// A vector parameter of the bound material by name ("$color"): its three
+// components. False when the material was not read or does not define it.
+bool currentVector(const char *name, float out[3]);
+// The name of the texture the bound material's parameter `name` ("$detail")
+// holds, lower case ("" when none, or not a texture).
+std::string currentTextureName(const char *name);
 // The bound material's defined parameters, one per line (dev dumps).
 void describeCurrent(FILE *out, const char *indent);
+
+// What the last Bind read, whether or not it reaches the proxy
+// (OPENREMIX_PROXY_MATERIALS): for dev dumps only.
+const Bound &boundRead();
+const char *nameRead();
+const Shading &currentRead();
 
 void dumpStatistics(FILE *out);
 

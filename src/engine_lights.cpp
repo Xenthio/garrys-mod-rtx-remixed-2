@@ -1,5 +1,11 @@
 #include "engine_lights.h"
 
+#include "engine_materials.h"
+#include "game.h"
+#ifndef PROXY_GAME_GMOD
+#include "x86_engine.h"
+#endif
+
 #include <windows.h>
 
 #include <algorithm>
@@ -12,15 +18,32 @@
 #include <mutex>
 #include <unordered_map>
 
+// Built for GMod (x64) and Portal 2 (x86): projected textures in both, the
+// lightstyles and dlights in GMod only. L4D2 has its own flashlights
+// (l4d2_lights) and Half-Life 2 RTX none: gmod_only_stubs there.
+#if !defined(PROXY_GAME_GMOD) && !defined(PROXY_GAME_PORTAL2)
+#error "engine_lights is built for GMod and Portal 2 only"
+#endif
+
+#ifdef PROXY_GAME_GMOD
 namespace proxy::engine {
 // engine_hooks.cpp: a marker through the render context, ordered with the
 // frame's draws when the material system queues rendering.
 void marker(const char *text);
 } // namespace proxy::engine
+#endif
 
 namespace proxy::engine_lights {
 namespace {
 
+#ifdef PROXY_GAME_GMOD
+void announce(const char *text) { engine::marker(text); }
+#else
+// x86_engine.cpp's marker: the same, through the thread's render context.
+void announce(const char *text) { x86::marker(text); }
+#endif
+
+#ifdef PROXY_GAME_GMOD
 // Everything below is for one engine build: each interface must have its
 // vtable, and each slot used its function, at these engine.dll RVAs (checked
 // in install(); a source that does not match stays off).
@@ -66,9 +89,87 @@ struct FlashlightState {
 constexpr size_t kFlashlightStateSize = 0x54;
 static_assert(offsetof(FlashlightState, color) == 0x38 && offsetof(FlashlightState, spotlightTexture) == 0x48 &&
               offsetof(FlashlightState, spotlightFrame) + 4 == kFlashlightStateSize);
+// What fromProjected reads beyond the shared fields: none here.
+float brightnessScale(const FlashlightState &) { return 1; }
+bool projectsLight(const FlashlightState &) { return true; }
+
+#else // PROXY_GAME_PORTAL2
+
+// Portal 2 (engine.dll and client.dll of Sep 2026): the projected textures
+// only. Lightstyles and dlights stay off (bsp_world then leaves the styled
+// map lights to the draws' SetLights, as before).
+//   CShadowMgr (VEngineShadowMgr002: the singleton at engine+0x63D180, which
+//   a static constructor gives the vtable +0x37373C, the one its RTTI
+//   ".?AVCShadowMgr@@" names); both slots are SDK 2013's, and the client
+//   (CClientShadowMgr) calls them through the interface's vtable, the engine
+//   never directly:
+//     1 DestroyShadow(ShadowHandle_t) (+0x125D00, pops 4): frees the shadow
+//       and its flashlight entry.
+//     16 UpdateFlashlightState(ShadowHandle_t, const FlashlightState_t &)
+//       (+0x11C130, pops 8): copies 0x3F dwords (the 0xFC-byte struct
+//       below) into the shadow's flashlight entry, +0x140; slot 20 returns
+//       that copy, slot 6 the entry.
+//   r_flashlightrender is read where the engine renders flashlights (the
+//   loop at +0x1203C0, slots 10 and 42), not by UpdateFlashlightState and not
+//   by the client (C_EnvProjectedTexture::UpdateLight, client+0x9E6C0, then
+//   CClientShadowMgr slot 19, client+0xF0C30): with it forced 0
+//   (x86_engine.cpp) every env_projectedtexture is still pushed here, and the
+//   engine draws no flashlight pass (nothing to suppress, as GMod's slot 23).
+//   IVEngineClient (VEngineClient015) 53 GetLevelName, checked by its code as
+//   x86_engine.cpp checks it.
+constexpr char kSlotDestroyShadowCode[] = "55 8B EC 83 EC 08 53 0F B7 5D 08 89 5D F8 69 DB 50 01 00 00";
+constexpr uintptr_t kDestroyShadowReturn = 0xC2; // ret 4
+constexpr char kSlotUpdateFlashlightStateCode[] =
+    "55 8B EC 0F B7 45 08 8B 51 08 69 C0 50 01 00 00 0F B7 84 10 DC 00 00 00";
+constexpr uintptr_t kUpdateFlashlightStateCopy = 0x30; // mov ecx,0x3f; rep movsd; ...; ret 8
+constexpr char kUpdateFlashlightStateCopyCode[] = "B9 3F 00 00 00 F3 A5 5F 5E 5D C2 08 00";
+constexpr unsigned kSlotDestroyShadow = 1, kSlotUpdateFlashlightState = 16, kSlotGetLevelName = 53;
+constexpr char kGetLevelNameCode[] = "80 3D ? ? ? ? 00 74 06 B8";
+
+// FlashlightState_t of this branch (Alien Swarm's and later): 0xFC bytes.
+// Laid out as C_EnvProjectedTexture::UpdateLight fills it (its local at
+// ebp-0x238: m_flNearZ, m_flFarZ, m_flLightFOV twice, the attenuations 0,
+// 100, 0 and m_flFarZ again, m_LightColor / 255 * alpha / 255 * lightstyle,
+// m_flBrightnessScale, the texture or, with m_bSimpleProjection, a material,
+// m_nSpotlightTextureFrame, m_bEnableShadows at +0x70; m_bOrtho at +0x2C
+// picks CClientShadowMgr's orthographic matrix) and as the flashlight shaders
+// read it (stdshader_dx9 of Jun 2026 copies the 0xFC bytes and scales m_Color
+// by r_flashlightbrightness, 0.25, and m_fBrightnessScale). Only the part up
+// to the frame is copied.
+struct FlashlightState {
+  float origin[3], orientation[4]; // quaternion x, y, z, w
+  float nearZ, farZ, horizontalFov, verticalFov;
+  uint8_t ortho; // m_bOrtho
+  float orthoLeft, orthoRight, orthoTop, orthoBottom;
+  float quadratic, linear, constant, farZAtten;
+  float color[4];
+  float brightness; // m_fBrightnessScale
+  void *spotlightTexture;
+  void *projectedMaterial; // m_bSimpleProjection's
+  int32_t spotlightFrame;
+};
+constexpr size_t kFlashlightStateSize = 0x70;
+static_assert(offsetof(FlashlightState, ortho) == 0x2C && offsetof(FlashlightState, quadratic) == 0x40 &&
+              offsetof(FlashlightState, color) == 0x50 && offsetof(FlashlightState, brightness) == 0x60 &&
+              offsetof(FlashlightState, spotlightTexture) == 0x64 &&
+              offsetof(FlashlightState, spotlightFrame) + 4 == kFlashlightStateSize);
+float brightnessScale(const FlashlightState &s) {
+  return std::isfinite(s.brightness) ? std::max(s.brightness, 0.0f) : 1.0f;
+}
+// An orthographic projection is not a cone, and a simple projection
+// (m_bSimpleProjection: a material projected unlit, no texture) lights
+// nothing: neither is submitted.
+bool projectsLight(const FlashlightState &s) { return !s.ortho && !s.projectedMaterial; }
+
+x86::Module g_engineModule;
+
+#endif
 
 uintptr_t g_engine = 0, g_engineEnd = 0;
-void *g_client = nullptr, *g_effects = nullptr, *g_shadowMgr = nullptr;
+void *g_client = nullptr, *g_shadowMgr = nullptr;
+#ifdef PROXY_GAME_GMOD
+void *g_effects = nullptr;
+#endif
 std::atomic<bool> g_installed{false}, g_styles{false}, g_level{false}, g_dlights{false}, g_projected{false};
 std::atomic<const char *> g_stylesStatus{"not installed"}, g_dlightsStatus{"not installed"},
     g_projectedStatus{"not installed"};
@@ -93,15 +194,18 @@ uint32_t g_sequence = 0;                     // main thread
 char g_levelName[256] = {};                  // main thread
 
 struct Statistics {
-  std::atomic<uint32_t> samples{0}, published{0}, updates{0}, destroys{0}, invalidProjected{0}, staleProjected{0};
+  std::atomic<uint32_t> samples{0}, published{0}, updates{0}, destroys{0}, invalidProjected{0}, staleProjected{0},
+      notLights{0};
   std::atomic<uint32_t> frames{0}, styled{0}, styledOff{0}, duplicates{0};
 } g_stats;
 
 void *slot(void *object, unsigned index) { return (*static_cast<void ***>(object))[index]; }
+#ifdef PROXY_GAME_GMOD
 bool vtableAt(void *object, uintptr_t rva) { return *static_cast<uintptr_t *>(object) == g_engine + rva; }
 bool slotAt(void *object, unsigned index, uintptr_t rva) {
   return reinterpret_cast<uintptr_t>(slot(object, index)) == g_engine + rva;
 }
+#endif
 
 float envScale(const char *name, float fallback) {
   char v[32] = {};
@@ -111,8 +215,16 @@ float envScale(const char *name, float fallback) {
 
 // IShadowMgr hooks (main thread: the client's Simulate, Lua). ShadowHandle_t
 // is an unsigned short in DX. The return value is passed through untouched
-// (both are void; their error paths tail-call a message function).
-uintptr_t updateFlashlightState(void *self, uint16_t handle, const void *state) {
+// (both are void; their error paths tail-call a message function). Portal 2:
+// thiscall (the handle in a 4-byte stack slot; the callee pops), void.
+#ifdef PROXY_GAME_GMOD
+using Passed = uintptr_t;
+#define LIGHTS_HOOK
+#else
+using Passed = void;
+#define LIGHTS_HOOK [[gnu::force_align_arg_pointer]]
+#endif
+LIGHTS_HOOK Passed PROXY_THISCALL updateFlashlightState(void *self, uint16_t handle, const void *state) {
   if (state && handle != 0xffff) {
     Projected p;
     std::memcpy(&p.state, state, kFlashlightStateSize);
@@ -121,14 +233,16 @@ uintptr_t updateFlashlightState(void *self, uint16_t handle, const void *state) 
     g_projectedStates[handle] = p;
   }
   ++g_stats.updates;
-  using Fn = uintptr_t (*)(void *, uint16_t, const void *);
+  using Fn = Passed(PROXY_THISCALL *)(void *, uint16_t, const void *);
   return reinterpret_cast<Fn>(g_updateOriginal.load(std::memory_order_relaxed))(self, handle, state);
 }
+#ifdef PROXY_GAME_GMOD
 // The engine's own flashlight rendering re-draws every lit surface additively
 // with the cookie as its first texture; captured, those draws pasted the
 // cookie over the meshes. The projected textures are path traced, so the
 // engine iterates none (as with r_flashlightrender 0, without the cvar).
-// OPENREMIX_PROXY_FLASHLIGHT_RASTER=1 keeps the engine's passes.
+// OPENREMIX_PROXY_FLASHLIGHT_RASTER=1 keeps the engine's passes. (Portal 2:
+// r_flashlightrender 0 itself, x86_engine.cpp.)
 std::atomic<void *> g_startFlashlightOriginal{nullptr};
 std::atomic<uint32_t> g_flashlightIterationsSuppressed{0};
 uintptr_t startFlashlight(void *self) {
@@ -143,13 +257,14 @@ uintptr_t startFlashlight(void *self) {
   g_flashlightIterationsSuppressed.fetch_add(1, std::memory_order_relaxed);
   return 0xffff;
 }
+#endif
 
-uintptr_t destroyShadow(void *self, uint16_t handle) {
+LIGHTS_HOOK Passed PROXY_THISCALL destroyShadow(void *self, uint16_t handle) {
   {
     std::lock_guard<std::mutex> lock(g_projectedLock);
     g_stats.destroys += uint32_t(g_projectedStates.erase(handle));
   }
-  using Fn = uintptr_t (*)(void *, uint16_t);
+  using Fn = Passed(PROXY_THISCALL *)(void *, uint16_t);
   return reinterpret_cast<Fn>(g_destroyOriginal.load(std::memory_order_relaxed))(self, handle);
 }
 
@@ -168,6 +283,7 @@ bool hookSlot(void *object, unsigned index, void *hook, std::atomic<void *> &ori
 
 bool finite3(const float *v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
 
+#ifdef PROXY_GAME_GMOD
 // As the engine hands a dlight to models (WorldLightFromDynamicLight, engine
 // 0x1e37a0): colour = byte * 2^exponent / 255, quadratic falloff only,
 // 1 / (max(minlight, 1) * max(radius, 0.1)^2); a spot when m_OuterAngle > 0.
@@ -192,6 +308,7 @@ bool fromDLight(const DLight &d, Light &l) {
   }
   return true;
 }
+#endif
 
 // A projected texture as a spot light. Source's flashlight shaders light a
 // surface with
@@ -200,10 +317,13 @@ bool fromDLight(const DLight &d, Light &l) {
 // last 40% of m_FarZ. The path tracer has inverse-square lights only: the
 // irradiance is matched at a reference distance (a quarter of m_FarZ, 64 to
 // 256 units; OPENREMIX_PROXY_PROJECTED_REFERENCE) and falls off by 1/d^2
-// around it. Approximations: the frustum becomes its inscribed cone (half
-// the larger FOV) with the outer half fading, in place of the cookie texture
-// (ignored); nothing ends the light at m_FarZ. Shadows are the path
-// tracer's. OPENREMIX_PROXY_PROJECTED_SCALE scales the brightness.
+// around it. The cookie texture (env_projectedtexture's, a lamp tool's) is
+// passed with the projection's up vector and FOV; until the runtime has it,
+// the frustum becomes its inscribed cone (half the larger FOV) with the outer
+// half fading. Nothing ends the light at m_FarZ. Shadows are the path
+// tracer's. OPENREMIX_PROXY_PROJECTED_SCALE scales the brightness. Portal 2's
+// shaders scale by r_flashlightbrightness (0.25, its default) and the state's
+// m_fBrightnessScale (env_projectedtexture's brightnessscale) as well.
 bool fromProjected(const FlashlightState &s, Light &l) {
   static const float brightness = 0.25f * envScale("OPENREMIX_PROXY_PROJECTED_SCALE", 1.0f);
   static const float fixedReference = envScale("OPENREMIX_PROXY_PROJECTED_REFERENCE", 0.0f);
@@ -219,7 +339,7 @@ bool fromProjected(const FlashlightState &s, Light &l) {
       s.constant + s.linear / reference + s.quadratic / (reference * reference), 0.0f, 1.0f);
   float sum = 0;
   for (int i = 0; i < 3; ++i)
-    sum += l.color[i] = std::max(s.color[i], 0.0f) * brightness * attenuation;
+    sum += l.color[i] = std::max(s.color[i], 0.0f) * brightness * brightnessScale(s) * attenuation;
   if (!(sum > 0))
     return false; // dark: nothing to submit
   l.type = 3;
@@ -228,6 +348,14 @@ bool fromProjected(const FlashlightState &s, Light &l) {
   l.direction[0] = 1 - 2 * (q[1] * q[1] + q[2] * q[2]);
   l.direction[1] = 2 * (q[0] * q[1] + q[3] * q[2]);
   l.direction[2] = 2 * (q[0] * q[2] - q[3] * q[1]);
+  // Up: +Z of the rotated basis (Source's flashlight frame is forward +X,
+  // left +Y, up +Z).
+  l.up[0] = 2 * (q[0] * q[2] + q[3] * q[1]);
+  l.up[1] = 2 * (q[1] * q[2] - q[3] * q[0]);
+  l.up[2] = 1 - 2 * (q[0] * q[0] + q[1] * q[1]);
+  l.fov = s.horizontalFov;
+  l.cookie = engine_materials::textureNameOf(s.spotlightTexture);
+  l.cookieFrame = std::max(s.spotlightFrame, 0);
   l.attenuation[2] = 1 / (reference * reference);
   const float outer = std::clamp(fov * 0.5f, 1.0f, 89.0f) * 0.01745329252f;
   l.phiDot = std::cos(outer);
@@ -238,11 +366,16 @@ bool fromProjected(const FlashlightState &s, Light &l) {
 bool sameLights(const std::vector<Light> &a, const std::vector<Light> &b) {
   if (a.size() != b.size())
     return false;
-  constexpr size_t from = offsetof(Light, color), size = offsetof(Light, phiDot) + sizeof(float) - from;
-  for (size_t i = 0; i < a.size(); ++i)
-    if (a[i].hash != b[i].hash || a[i].type != b[i].type ||
-        std::memcmp(reinterpret_cast<const char *>(&a[i]) + from, reinterpret_cast<const char *>(&b[i]) + from, size))
+  const auto floats = [](const float *x, const float *y, size_t n) { return !std::memcmp(x, y, n * sizeof(float)); };
+  for (size_t i = 0; i < a.size(); ++i) {
+    const Light &x = a[i], &y = b[i];
+    if (x.hash != y.hash || x.type != y.type || x.cookie != y.cookie || x.cookieFrame != y.cookieFrame ||
+        !floats(x.color, y.color, 3) ||
+        !floats(x.position, y.position, 3) || !floats(x.direction, y.direction, 3) ||
+        !floats(x.attenuation, y.attenuation, 3) || x.thetaDot != y.thetaDot || x.phiDot != y.phiDot ||
+        !floats(x.up, y.up, 3) || x.fov != y.fov)
       return false;
+  }
   return true;
 }
 
@@ -251,7 +384,7 @@ bool sameLights(const std::vector<Light> &a, const std::vector<Light> &b) {
 // previous map's were all pushed before its last sample(), and this map's
 // after it.
 void noteLevel() {
-  using Fn = const char *(*)(void *);
+  using Fn = const char *(PROXY_THISCALL *)(void *);
   const char *level = reinterpret_cast<Fn>(slot(g_client, kSlotGetLevelName))(g_client);
   if (!level || std::strncmp(level, g_levelName, sizeof(g_levelName) - 1) == 0)
     return;
@@ -293,6 +426,7 @@ bool install() {
   const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(g_engine + dos->e_lfanew);
   g_engineEnd = g_engine + nt->OptionalHeader.SizeOfImage;
 
+#ifdef PROXY_GAME_GMOD
   g_client = factory("VEngineClient013", nullptr);
   if (!g_client)
     g_stylesStatus = "no interface";
@@ -342,6 +476,45 @@ bool install() {
                   g_startFlashlightOriginal))
       g_projectedStatus = "ok (hooked; engine flashlight passes not suppressed)";
   }
+#else // PROXY_GAME_PORTAL2
+  g_stylesStatus = g_dlightsStatus = "off (not read in Portal 2)";
+  if (!g_engineModule.open("engine.dll")) {
+    g_projectedStatus = "engine.dll not readable";
+    return false;
+  }
+  const auto codeAt = [](void *object, unsigned index, uintptr_t offset, const char *bytes) {
+    const void *fn = slot(object, index);
+    return g_engineModule.inCode(fn) &&
+           x86::bytesAt(g_engineModule, reinterpret_cast<uintptr_t>(fn) - g_engineModule.base + offset, bytes);
+  };
+  // The level name, for the map change in sample() (without it, entries a
+  // destroy was missed for stay until their handle is reused).
+  g_client = factory("VEngineClient015", nullptr);
+  g_level = g_client && codeAt(g_client, kSlotGetLevelName, 0, kGetLevelNameCode);
+  // The slots must still hold the engine's own functions (by their code):
+  // anything else (another hook) is not what was verified.
+  g_shadowMgr = factory("VEngineShadowMgr002", nullptr);
+  void **const shadowMgrVtable = x86::rttiVtable(g_engineModule, ".?AVCShadowMgr@@");
+  if (!g_shadowMgr)
+    g_projectedStatus = "no interface";
+  else if (!shadowMgrVtable || *static_cast<void ***>(g_shadowMgr) != shadowMgrVtable)
+    g_projectedStatus = "vtable mismatch (not CShadowMgr's)";
+  else if (!codeAt(g_shadowMgr, kSlotDestroyShadow, 0, kSlotDestroyShadowCode) ||
+           !codeAt(g_shadowMgr, kSlotDestroyShadow, kDestroyShadowReturn, "C2 04 00") ||
+           !codeAt(g_shadowMgr, kSlotUpdateFlashlightState, 0, kSlotUpdateFlashlightStateCode) ||
+           !codeAt(g_shadowMgr, kSlotUpdateFlashlightState, kUpdateFlashlightStateCopy,
+                   kUpdateFlashlightStateCopyCode))
+    g_projectedStatus = "slot mismatch (bytes differ)";
+  // Destroy first: an update is never recorded without its destroy.
+  else if (!hookSlot(g_shadowMgr, kSlotDestroyShadow, reinterpret_cast<void *>(&destroyShadow), g_destroyOriginal) ||
+           !hookSlot(g_shadowMgr, kSlotUpdateFlashlightState, reinterpret_cast<void *>(&updateFlashlightState),
+                     g_updateOriginal))
+    g_projectedStatus = "hook failed";
+  else {
+    g_projectedStatus = g_level ? "ok (hooked)" : "ok (hooked; no level name: kept across maps)";
+    g_projected = true;
+  }
+#endif
   g_installed = g_styles || g_dlights || g_projected;
   return g_installed;
 }
@@ -356,6 +529,7 @@ void sample() {
     return;
   ++g_stats.samples;
   auto snapshot = std::make_shared<Snapshot>();
+#ifdef PROXY_GAME_GMOD
   if (g_styles) {
     using Fn = float (*)(void *, int);
     const Fn value = reinterpret_cast<Fn>(slot(g_client, kSlotLightStyleValue));
@@ -388,6 +562,7 @@ void sample() {
       }
     }
   }
+#endif
   if (g_projected) {
     if (g_level)
       noteLevel();
@@ -395,7 +570,9 @@ void sample() {
     for (const auto &[handle, p] : g_projectedStates) {
       Light l;
       l.hash = 0x70726f6a74657800ull ^ (uint64_t(handle) * 0x9e3779b97f4a7c15ull);
-      if (fromProjected(p.state, l))
+      if (!projectsLight(p.state))
+        ++g_stats.notLights;
+      else if (fromProjected(p.state, l))
         snapshot->projected.push_back(l);
       else
         ++g_stats.invalidProjected;
@@ -420,7 +597,7 @@ void sample() {
   }
   char text[48];
   std::snprintf(text, sizeof(text), "openremix:lights %u", sequence);
-  engine::marker(text);
+  announce(text);
 }
 
 void activate(uint32_t sequence) {
@@ -470,8 +647,15 @@ void dumpStatistics(FILE *out) {
           "dropped at map change %u\n",
           g_stats.samples.exchange(0), g_stats.published.exchange(0), pending, g_stats.updates.exchange(0),
           g_stats.destroys.exchange(0), g_stats.invalidProjected.exchange(0), g_stats.staleProjected.load());
+#ifdef PROXY_GAME_GMOD
   fprintf(out, "   engine flashlight render iterations suppressed %u\n",
           g_flashlightIterationsSuppressed.exchange(0));
+#else
+  // Ortho and simple projections (projectsLight), counted per sample.
+  fprintf(out, "   projections that are no light (orthographic, simple) %u; engine flashlight passes: off by "
+               "r_flashlightrender 0 (x86_engine cvars)\n",
+          g_stats.notLights.exchange(0));
+#endif
 }
 
 } // namespace proxy::engine_lights

@@ -1,5 +1,7 @@
 #include "texture_formats.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace proxy::formats {
@@ -60,6 +62,42 @@ std::vector<uint8_t> decode(const uint8_t *blocks, uint32_t width, uint32_t heig
 
 std::vector<uint8_t> decodeBC1(const uint8_t *blocks, uint32_t width, uint32_t height) {
   return decode(blocks, width, height, 8, [](const uint8_t *b, uint8_t p[16][4]) { colorBlock(b, true, p); });
+}
+
+std::vector<uint8_t> decodeBC2(const uint8_t *blocks, uint32_t width, uint32_t height) {
+  return decode(blocks, width, height, 16, [](const uint8_t *b, uint8_t p[16][4]) {
+    colorBlock(b + 8, false, p);
+    // Explicit alpha: four bits a pixel.
+    for (int i = 0; i < 16; ++i)
+      p[i][3] = uint8_t(((b[i / 2] >> (4 * (i % 2))) & 15) * 17);
+  });
+}
+
+void transcodeBC2toBC3(uint8_t *blocks, size_t bytes) {
+  for (size_t at = 0; at + 16 <= bytes; at += 16) {
+    uint8_t *b = blocks + at, alpha[16];
+    uint8_t lo = 255, hi = 0;
+    for (int i = 0; i < 16; ++i) {
+      alpha[i] = uint8_t(((b[i / 2] >> (4 * (i % 2))) & 15) * 17);
+      lo = std::min(lo, alpha[i]);
+      hi = std::max(hi, alpha[i]);
+    }
+    // Eight-value mode (a0 > a1); a uniform block keeps index 0 everywhere.
+    uint8_t palette[8] = {hi, lo};
+    for (int i = 1; i < 7; ++i)
+      palette[i + 1] = uint8_t(((7 - i) * hi + i * lo) / 7);
+    uint64_t bits = 0;
+    for (int i = 0; i < 16 && hi > lo; ++i) {
+      int best = 0;
+      for (int k = 1; k < 8; ++k)
+        if (std::abs(palette[k] - alpha[i]) < std::abs(palette[best] - alpha[i]))
+          best = k;
+      bits |= uint64_t(best) << (3 * i);
+    }
+    b[0] = hi;
+    b[1] = lo;
+    std::memcpy(b + 2, &bits, 6);
+  }
 }
 
 std::vector<uint8_t> decodeBC3(const uint8_t *blocks, uint32_t width, uint32_t height) {

@@ -18,6 +18,7 @@ ULONGLONG g_start = 0;
 std::atomic<int> g_reports{0};
 std::atomic<bool> g_reporting{false}, g_dumped{false};
 LPTOP_LEVEL_EXCEPTION_FILTER g_previousFilter = nullptr;
+PVOID g_vectoredHandler = nullptr;
 
 using MiniDumpWriteDumpFn = BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
                                            PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
@@ -97,6 +98,7 @@ bool fatal(DWORD code) {
   }
 }
 
+#ifdef _WIN64
 void stackTrace(const CONTEXT &at) {
   CONTEXT context = at;
   line("  stack:");
@@ -120,6 +122,48 @@ void stackTrace(const CONTEXT &at) {
     }
   }
 }
+#else
+// x86 has no unwind data: the instruction pointer, then the EBP chain (frames
+// of code built with frame pointers; Source's release builds mostly omit
+// them, so the walk ends early), then the code addresses at the stack's top
+// (a scan, not an unwind: stale addresses may show).
+void stackTrace(const CONTEXT &at) {
+  line("  stack:");
+  char where[MAX_PATH + 32];
+  describe(at.Eip, where, sizeof(where));
+  line("    #00 %s", where);
+  int frame = 1;
+  for (uintptr_t ebp = at.Ebp; frame < 32 && ebp >= at.Esp && !(ebp & 3) &&
+                               !IsBadReadPtr(reinterpret_cast<void *>(ebp), 8);
+       ++frame) {
+    const uintptr_t *link = reinterpret_cast<const uintptr_t *>(ebp);
+    if (!link[1])
+      break;
+    describe(link[1], where, sizeof(where));
+    line("    #%02d %s (ebp chain)", frame, where);
+    if (link[0] <= ebp)
+      break;
+    ebp = link[0];
+  }
+  line("  stack top (code addresses):");
+  int found = 0;
+  for (int slot = 0; slot < 256 && found < 16; ++slot) {
+    const auto *at32 = reinterpret_cast<const uintptr_t *>(at.Esp) + slot;
+    if (IsBadReadPtr(at32, sizeof(*at32)))
+      break;
+    HMODULE module = nullptr;
+    MEMORY_BASIC_INFORMATION region = {};
+    if (!*at32 || !VirtualQuery(reinterpret_cast<void *>(*at32), &region, sizeof(region)) ||
+        !(region.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(*at32), &module))
+      continue;
+    describe(*at32, where, sizeof(where));
+    line("    [esp+%03x] %s", unsigned(slot * sizeof(uintptr_t)), where);
+    ++found;
+  }
+}
+#endif
 
 void modules() {
   HMODULE list[512];
@@ -132,7 +176,7 @@ void modules() {
     char path[MAX_PATH] = {};
     GetModuleFileNameA(list[i], path, sizeof(path));
     const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(list[i]);
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(reinterpret_cast<const BYTE *>(list[i]) + dos->e_lfanew);
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(reinterpret_cast<const BYTE *>(list[i]) + dos->e_lfanew);
     line("    %016llx %8lx %08lx %s", reinterpret_cast<unsigned long long>(list[i]), nt->OptionalHeader.SizeOfImage,
          nt->FileHeader.TimeDateStamp, path);
   }
@@ -168,10 +212,15 @@ void report(EXCEPTION_POINTERS *info, const char *kind) {
     line("  %s address 0x%016llx",
          record.ExceptionInformation[0] == 0 ? "reading" : record.ExceptionInformation[0] == 1 ? "writing" : "executing",
          static_cast<unsigned long long>(record.ExceptionInformation[1]));
+#ifdef _WIN64
   line("  rax %016llx rbx %016llx rcx %016llx rdx %016llx", c.Rax, c.Rbx, c.Rcx, c.Rdx);
   line("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx", c.Rsi, c.Rdi, c.Rbp, c.Rsp);
   line("  r8  %016llx r9  %016llx r10 %016llx r11 %016llx", c.R8, c.R9, c.R10, c.R11);
   line("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx", c.R12, c.R13, c.R14, c.R15);
+#else
+  line("  eax %08lx ebx %08lx ecx %08lx edx %08lx", c.Eax, c.Ebx, c.Ecx, c.Edx);
+  line("  esi %08lx edi %08lx ebp %08lx esp %08lx eip %08lx", c.Esi, c.Edi, c.Ebp, c.Esp, c.Eip);
+#endif
   stackTrace(c);
   // Once: the list is long and the same for later reports.
   static std::atomic<bool> listed{false};
@@ -263,7 +312,7 @@ void install(HMODULE self) {
   _snwprintf(path, MAX_PATH, L"%ls\\shaderapi_proxy_crash.dmp", g_dir);
   DeleteFileW(path); // a previous run's
   header(self);
-  AddVectoredExceptionHandler(1, &vectored);
+  g_vectoredHandler = AddVectoredExceptionHandler(1, &vectored);
   g_previousFilter = SetUnhandledExceptionFilter(&unhandled);
 }
 
@@ -278,6 +327,17 @@ void reinstall() {
   const auto previous = SetUnhandledExceptionFilter(&unhandled);
   if (previous != &unhandled)
     g_previousFilter = previous;
+}
+
+void uninstall() {
+  if (g_vectoredHandler) {
+    RemoveVectoredExceptionHandler(g_vectoredHandler);
+    g_vectoredHandler = nullptr;
+  }
+  if (g_previousFilter) {
+    SetUnhandledExceptionFilter(g_previousFilter);
+    g_previousFilter = nullptr;
+  }
 }
 
 void stage(const char *fmt, ...) {

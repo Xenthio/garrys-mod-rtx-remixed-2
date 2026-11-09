@@ -1,0 +1,3 @@
+option('openremix_include', type: 'string', value: '',
+       description: 'Path to <openremix>/public/include (headers are not vendored)')
+option('sdl_include', type: 'string', value: '', description: 'SDL3 headers (include dir holding SDL3/) for the host\'s UI input injection')

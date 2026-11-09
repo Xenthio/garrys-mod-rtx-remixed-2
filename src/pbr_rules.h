@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <tuple>
 
 // Source materials as PBR materials, converted while they are drawn: the
 // runtime reads the game's own textures (its normal map, and the masks Source
@@ -27,6 +28,9 @@ struct Inputs {
   bool phongAlbedoTint = false, blendTintByBaseAlpha = false, hasColor2 = false, mwb = false;
   float color2[3] = {1, 1, 1};
   float phongBoost = 1;
+  // ExoPBR (screenspace_general_8tex)
+  std::string arm;      // ExoPBR $texture1 (R=AO, G=Rough, B=Metal)
+  bool isExoPbr = false;
   // $surfaceprop (lowercase), and the base texture's mean luminance (-1
   // unknown): asked for (luminance()) only by the dark Phong metal rule.
   std::string surfaceProp;
@@ -53,6 +57,13 @@ struct Material {
   // $color2 removes: the draw's tint is not applied (the metal's colour is
   // the base texture's).
   bool metalByBaseAlpha = false;
+  // The metal's colour (remixapi_MaterialMetalColorEXT, linear): where it is
+  // metal the albedo turns to it (envmapped metal, see convert()).
+  bool metalColored = false;
+  float metalColor[3] = {1, 1, 1};
+  // The roughness map's least mip (remixapi_MaterialPbrBlurEXT; 0: as sharp
+  // as the view allows).
+  float blur = 0;
 };
 
 Material convert(const Inputs &in);
@@ -60,10 +71,20 @@ Material convert(const Inputs &in);
 bool mwbBase(const std::string &base);
 // The shader is one convert() takes (the lit surface shaders); lowercase.
 bool capable(const std::string &shader);
+inline bool isScreenspacePbr(const std::string &shader) {
+  return shader.rfind("screenspace_general", 0) == 0;
+}
 
 // OPENREMIX_PROXY_PBR=0 turns the conversion off.
 bool enabled();
 // OPENREMIX_PROXY_PBR_PHONG_METAL=0 turns the dark Phong metal rule off.
 bool phongMetal();
+// OPENREMIX_PROXY_PBR_ENVMAP_METAL=0 turns the dark envmapped metal rule off.
+bool envmapMetal();
+// The roughness its mask maps to: min, max and the mask's exponent
+// (OPENREMIX_PROXY_PBR_ENVMAP_METAL_ROUGHNESS).
+std::tuple<float, float, float> envmapMetalRoughness();
+// The mips its mask is blurred by (OPENREMIX_PROXY_PBR_ENVMAP_METAL_BLUR).
+float envmapMetalBlur();
 
 } // namespace proxy::pbr

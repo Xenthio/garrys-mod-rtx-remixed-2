@@ -1,0 +1,78 @@
+# The proxy shaderapidx9.dll for Garry's Mod x64 (bin/win64), cross-built on
+# Linux with MinGW-w64 as README.md describes, against OpenRemix's public
+# headers (its Vulkan and SDL3 headers too). Arch Linux for the same rolling
+# toolchain the project is developed with.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      openremix_ref:
+        description: OpenRemix branch, tag or commit for the headers
+        default: main
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed git meson ninja glslang mingw-w64-gcc python github-cli
+
+      # Side by side: Meson refuses an absolute include path inside the
+      # project's own source tree, which OpenRemix checked out within it was.
+      - uses: actions/checkout@v4
+        with:
+          path: proxy
+
+      - name: Check out OpenRemix headers
+        uses: actions/checkout@v4
+        with:
+          repository: sambow23/OpenRemix
+          ref: ${{ inputs.openremix_ref || 'main' }}
+          path: openremix
+          sparse-checkout: |
+            public/include
+            include/vulkan/include
+            subprojects/SDL3-3.4.14/include
+
+      - name: Build
+        working-directory: proxy
+        run: |
+          meson setup --cross-file cross/x86_64-w64-mingw32.txt \
+            -Dopenremix_include="$GITHUB_WORKSPACE/openremix/public/include" _build
+          meson compile -C _build
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaderapidx9-x64
+          path: proxy/_build/shaderapidx9.dll
+
+      # The launcher (RTXLauncher) installs from a rolling "nightly" prerelease:
+      # each push to main moves its tag and replaces its zip, whose upload time
+      # tells the launcher's download cache it is new.
+      - name: Publish nightly release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: proxy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          python3 -c "import zipfile; zipfile.ZipFile('shaderapidx9-x64.zip', 'w', zipfile.ZIP_DEFLATED).write('_build/shaderapidx9.dll', 'shaderapidx9.dll')"
+          git tag -f nightly
+          git push -f origin refs/tags/nightly
+          title="Nightly ${GITHUB_SHA::7}"
+          notes="Built from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "$title" --notes "$notes" --prerelease
+          else
+            gh release create nightly --title "$title" --notes "$notes" --prerelease
+          fi
+          gh release upload nightly shaderapidx9-x64.zip --clobber

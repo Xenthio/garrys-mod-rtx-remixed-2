@@ -1,3 +1,5 @@
+option('game', type: 'combo', choices: ['auto', 'gmod', 'tf2', 'l4d2', 'hl2rtx', 'ez2', 'portal2'], value: 'auto',
+       description: 'Game the proxy is built for: gmod or tf2 (x64 cross file), l4d2, hl2rtx, ez2 or portal2 (x86 cross file); auto picks by the host CPU (x64: gmod, x86: l4d2)')
 option('openremix_include', type: 'string', value: '',
        description: 'Path to <openremix>/public/include (headers are not vendored)')
 option('sdl_include', type: 'string', value: '',

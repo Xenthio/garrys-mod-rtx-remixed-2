@@ -7,10 +7,35 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+inline int ctz64(uint64_t mask) {
+  unsigned long index;
+  if (_BitScanForward(&index, static_cast<unsigned long>(mask)))
+    return static_cast<int>(index);
+  if (_BitScanForward(&index, static_cast<unsigned long>(mask >> 32)))
+    return static_cast<int>(index + 32);
+  return 64;
+}
+#else
+inline int ctz64(uint64_t mask) {
+  return __builtin_ctzll(mask);
+}
+#endif
+
 namespace proxy::dxvk {
 
 uint64_t textureHash(const uint8_t *packedMip0, size_t size) { return XXH3_64bits(packedMip0, size); }
 uint64_t legacyTextureHash(const uint8_t *packedMip0, size_t size) { return XXH64(packedMip0, size, 0); }
+uint64_t rowsHash(const uint8_t *data, uint32_t pitch, uint32_t rowBytes, uint32_t rows) {
+  if (pitch == rowBytes)
+    return XXH3_64bits(data, size_t(rowBytes) * rows);
+  XXH3_state_t state;
+  XXH3_64bits_reset(&state);
+  for (uint32_t r = 0; r < rows; ++r)
+    XXH3_64bits_update(&state, data + size_t(r) * pitch, rowBytes);
+  return XXH3_64bits_digest(&state);
+}
 
 uint64_t geometryHash(const remix::Draw &d) {
   if (!d.indices.data || !d.elements)
@@ -76,7 +101,7 @@ uint64_t geometryHash(const remix::Draw &d) {
   uint64_t positionHash = 0;
   for (size_t word = 0; word < seen.size(); ++word)
     for (uint64_t bits = seen[word]; bits; bits &= bits - 1) {
-      const uint32_t index = low + uint32_t(word * 64 + __builtin_ctzll(bits));
+      const uint32_t index = low + uint32_t(word * 64 + ctz64(bits));
       const int64_t at = int64_t(s.offset) + (int64_t(d.baseVertex) + index) * s.stride + pos->Offset;
       if (at < 0 || uint64_t(at) + elementSize > s.size)
         return 0;

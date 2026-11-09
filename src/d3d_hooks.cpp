@@ -2,10 +2,12 @@
 #include <initguid.h>
 
 #include "d3d_hooks.h"
+#include "diag.h"
 #include "engine_hooks.h"
 #include "sky_faces.h"
 
 #include "bsp_world.h"
+#include "game.h"
 #include "remix_output.h"
 #include "vertex_program.h"
 #include "dxvk_hash.h"
@@ -14,6 +16,7 @@
 #include <algorithm>
 #include <psapi.h>
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -26,16 +29,27 @@
 namespace proxy::d3d {
 namespace {
 
+// Entropy : Zero 2 runs on D3D9Ex and uploads UI/particle textures through
+// surfaces; the extra hooks below are for it alone, the other games keep
+// their original behaviour.
+#if defined(PROXY_GAME_EZ2)
+constexpr bool kEz2 = true;
+#else
+constexpr bool kEz2 = false;
+#endif
+
 // Vtable slots.
 enum : unsigned {
   // IUnknown
   kRelease = 2,
   // IDirect3D9
   kD3DCreateDevice = 16,
+  kD3DCreateDeviceEx = 20,
   // IDirect3DDevice9
   kReset = 16,
   kPresent = 17,
   kCreateTexture = 23,
+  kCreateVolumeTexture = 24,
   kCreateVertexBuffer = 26,
   kCreateIndexBuffer = 27,
   kUpdateSurface = 30,
@@ -44,8 +58,14 @@ enum : unsigned {
   kSetRenderTarget = 37,
   kSetViewport = 47,
   kClear = 43,
+  kSetTransform = 44,
+  kMultiplyTransform = 46,
+  kSetMaterial = 49,
+  kSetLight = 51,
+  kLightEnable = 53,
   kSetRenderState = 57,
   kSetTexture = 65,
+  kSetTextureStageState = 67,
   kSetSamplerState = 69,
   kSetScissorRect = 75,
   kDrawPrimitive = 81,
@@ -53,6 +73,7 @@ enum : unsigned {
   kDrawPrimitiveUP = 83,
   kDrawIndexedPrimitiveUP = 84,
   kSetVertexDeclaration = 87,
+  kSetFVF = 89,
   kCreateVertexShader = 91,
   kSetVertexShader = 92,
   kSetVertexShaderConstantF = 94,
@@ -79,6 +100,9 @@ enum : unsigned {
   // IDirect3DSurface9
   kSurfaceLockRect = 13,
   kSurfaceUnlockRect = 14,
+  // IDirect3DVolumeTexture9
+  kVolumeTextureLockBox = 19,
+  kVolumeTextureUnlockBox = 20,
 };
 
 void **vtableOf(void *object) { return *static_cast<void ***>(object); }
@@ -97,6 +121,63 @@ template <class Fn> void hookSlot(void **vtable, unsigned slot, Fn hook, Fn &ori
   original = reinterpret_cast<Fn>(patch(vtable, slot, reinterpret_cast<void *>(hook)));
 }
 
+// The resources' hooks, per class. One D3D9 interface can be implemented by
+// several classes: Windows' own d3d9.dll has one per pool for buffers (a
+// managed vertex buffer's vtable is not a default one's), where DXVK has one
+// class per interface. Each class's vtable is hooked when its first object is
+// seen (see), and a hook calls the original of its own object's class
+// (original): another class's function on it misbehaves (a managed buffer
+// locked through the default class's Lock returned success and no memory).
+template <unsigned N> class ClassHooks {
+public:
+  explicit ClassHooks(const unsigned (&slots)[N]) {
+    for (unsigned i = 0; i < N; ++i)
+      slots_[i] = slots[i];
+  }
+  // Hooks `object`'s class unless it is (any thread; once per class).
+  void see(void *object, const std::array<void *, N> &hooks) {
+    if (find(object))
+      return;
+    std::lock_guard<std::mutex> guard(lock_);
+    const unsigned n = count_.load(std::memory_order_relaxed);
+    if (find(object) || n == kClasses)
+      return; // more classes than expected: the others stay unhooked
+    Class &c = classes_[n];
+    c.vtable = vtableOf(object);
+    for (unsigned i = 0; i < N; ++i)
+      c.original[i] = c.vtable[slots_[i]];
+    // Published before its vtable is patched: a hook always finds its class.
+    count_.store(n + 1, std::memory_order_release);
+    for (unsigned i = 0; i < N; ++i)
+      patch(c.vtable, slots_[i], hooks[i]);
+  }
+  // `object`'s function i: its class's original, or, for a class not hooked
+  // (objects the proxy made through the real entry points), its vtable's.
+  template <class Fn> Fn original(const void *object, unsigned i) const {
+    const Class *c = find(object);
+    return reinterpret_cast<Fn>(c ? c->original[i] : (*static_cast<void *const *const *>(object))[slots_[i]]);
+  }
+  unsigned classes() const { return count_.load(std::memory_order_acquire); }
+
+private:
+  static constexpr unsigned kClasses = 8;
+  struct Class {
+    void **vtable = nullptr;
+    void *original[N] = {};
+  };
+  const Class *find(const void *object) const {
+    void *const *vtable = *static_cast<void *const *const *>(object);
+    for (unsigned i = 0, n = count_.load(std::memory_order_acquire); i < n; ++i)
+      if (classes_[i].vtable == vtable)
+        return &classes_[i];
+    return nullptr;
+  }
+  unsigned slots_[N] = {};
+  Class classes_[kClasses];
+  std::atomic<unsigned> count_{0};
+  std::mutex lock_;
+};
+
 uint64_t nowUs() {
   static const double usPerTick = [] {
     LARGE_INTEGER f;
@@ -112,6 +193,8 @@ struct Stats {
   std::atomic<uint64_t> usPresent{0}, usLock{0};
   std::atomic<uint32_t> frames{0}, dip{0}, dp{0}, dipUP{0}, dpUP{0}, depthDraws{0}, occlusionQueries{0}, occluderDraws{0}, occluderClears{0}, queriesVisible{0}, queriesHidden{0}, rtChanges{0}, textureBinds{0};
   std::atomic<uint32_t> vsConstCalls{0}, streamSets{0}, partialTextureLocks{0};
+  // Fixed-function state calls (game::kFixedFunction) and the draws without a vertex shader.
+  std::atomic<uint32_t> setTransforms{0}, setFVFs{0}, stageStates{0}, setLights{0}, fixedDraws{0}, fvfDraws{0};
   std::atomic<uint32_t> vertexPrograms{0}; // vertex shaders decoded since launch
   std::atomic<uint64_t> dipPrims{0};
   std::atomic<uint64_t> shadowBytes{0}, shadowCopies{0}, wholeLocks{0}, usShadow{0};
@@ -142,9 +225,9 @@ std::unordered_map<const void *, Shadow> g_shadows;
 using ReleaseFn = ULONG(STDMETHODCALLTYPE *)(IUnknown *);
 using LockFn = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, UINT, void **, DWORD);
 using UnlockFn = HRESULT(STDMETHODCALLTYPE *)(void *);
-ReleaseFn g_vbRelease = nullptr, g_ibRelease = nullptr;
-LockFn g_vbLock = nullptr, g_ibLock = nullptr;
-UnlockFn g_vbUnlock = nullptr, g_ibUnlock = nullptr;
+// Vertex and index buffers: Release, Lock, Unlock.
+enum : unsigned { kBufRelease, kBufLock, kBufUnlock };
+ClassHooks<3> g_vbClasses({kRelease, kBufferLock, kBufferUnlock}), g_ibClasses({kRelease, kBufferLock, kBufferUnlock});
 
 void forget(const void *buffer) {
   std::lock_guard<std::mutex> lock(g_shadowLock);
@@ -198,42 +281,34 @@ void noteUnlock(void *buffer) {
   s.lockPtr = nullptr;
 }
 
-ULONG STDMETHODCALLTYPE vbRelease(IUnknown *self) {
-  const ULONG refs = g_vbRelease(self);
+ULONG bufferRelease(const ClassHooks<3> &classes, IUnknown *self) {
+  const ULONG refs = classes.original<ReleaseFn>(self, kBufRelease)(self);
   if (refs == 0)
     forget(self);
   return refs;
 }
-ULONG STDMETHODCALLTYPE ibRelease(IUnknown *self) {
-  const ULONG refs = g_ibRelease(self);
-  if (refs == 0)
-    forget(self);
-  return refs;
-}
-HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
+HRESULT bufferLock(const ClassHooks<3> &classes, void *self, UINT offset, UINT size, void **data, DWORD flags) {
   const uint64_t t0 = nowUs();
-  const HRESULT hr = g_vbLock(self, offset, size, data, flags);
+  const HRESULT hr = classes.original<LockFn>(self, kBufLock)(self, offset, size, data, flags);
   g_stats.usLock += nowUs() - t0;
   if (SUCCEEDED(hr) && data)
     *data = noteLock(self, offset, size, *data, flags);
   return hr;
+}
+HRESULT bufferUnlock(const ClassHooks<3> &classes, void *self) {
+  noteUnlock(self);
+  return classes.original<UnlockFn>(self, kBufUnlock)(self);
+}
+ULONG STDMETHODCALLTYPE vbRelease(IUnknown *self) { return bufferRelease(g_vbClasses, self); }
+ULONG STDMETHODCALLTYPE ibRelease(IUnknown *self) { return bufferRelease(g_ibClasses, self); }
+HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
+  return bufferLock(g_vbClasses, self, offset, size, data, flags);
 }
 HRESULT STDMETHODCALLTYPE ibLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
-  const uint64_t t0 = nowUs();
-  const HRESULT hr = g_ibLock(self, offset, size, data, flags);
-  g_stats.usLock += nowUs() - t0;
-  if (SUCCEEDED(hr) && data)
-    *data = noteLock(self, offset, size, *data, flags);
-  return hr;
+  return bufferLock(g_ibClasses, self, offset, size, data, flags);
 }
-HRESULT STDMETHODCALLTYPE vbUnlock(void *self) {
-  noteUnlock(self);
-  return g_vbUnlock(self);
-}
-HRESULT STDMETHODCALLTYPE ibUnlock(void *self) {
-  noteUnlock(self);
-  return g_ibUnlock(self);
-}
+HRESULT STDMETHODCALLTYPE vbUnlock(void *self) { return bufferUnlock(g_vbClasses, self); }
+HRESULT STDMETHODCALLTYPE ibUnlock(void *self) { return bufferUnlock(g_ibClasses, self); }
 
 // --- Textures --------------------------------------------------------------
 // Level 0 of 2D textures goes to the Remix output at UnlockRect, straight
@@ -253,9 +328,119 @@ const void *levelKey(const void *texture, UINT level) { return static_cast<const
 using TextureLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, D3DLOCKED_RECT *, const RECT *,
                                                        DWORD);
 using TextureUnlockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT);
-ReleaseFn g_textureRelease = nullptr;
-TextureLockRectFn g_textureLockRect = nullptr;
-TextureUnlockRectFn g_textureUnlockRect = nullptr;
+using GetSurfaceLevelFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, IDirect3DSurface9 **);
+// 2D textures: Release, GetSurfaceLevel, LockRect, UnlockRect.
+enum : unsigned { kTexRelease, kTexGetSurfaceLevel, kTexLockRect, kTexUnlockRect };
+ClassHooks<4> g_textureClasses({kRelease, kTextureGetSurfaceLevel, kTextureLockRect, kTextureUnlockRect});
+
+// Volume textures (Entropy : Zero 2's colour-correction lookup, which the
+// night vision pass samples): a default-pool volume cannot be locked to read
+// it back, so what the engine writes is copied at UnlockBox.
+struct VolumeCopy {
+  uint32_t width = 0, height = 0, depth = 0, version = 0;
+  std::vector<uint8_t> pixels; // B8G8R8A8
+};
+struct VolumeLock {
+  uint8_t *bits = nullptr;
+  uint32_t rowPitch = 0, slicePitch = 0, left = 0, top = 0, front = 0;
+};
+std::mutex g_volumeMutex;
+std::unordered_map<const void *, VolumeCopy> g_volumeCopies;
+std::unordered_map<const void *, VolumeLock> g_volumeLocks;
+using VolumeLockBoxFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DVolumeTexture9 *, UINT, D3DLOCKED_BOX *, const D3DBOX *,
+                                                     DWORD);
+using VolumeUnlockBoxFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DVolumeTexture9 *, UINT);
+ReleaseFn g_volumeRelease = nullptr;
+VolumeLockBoxFn g_volumeLockBox = nullptr;
+VolumeUnlockBoxFn g_volumeUnlockBox = nullptr;
+
+ULONG STDMETHODCALLTYPE volumeRelease(IUnknown *self) {
+  const ULONG count = g_volumeRelease(self);
+  if (count == 0) {
+    std::lock_guard<std::mutex> lock(g_volumeMutex);
+    g_volumeCopies.erase(self);
+    g_volumeLocks.erase(self);
+  }
+  return count;
+}
+
+HRESULT STDMETHODCALLTYPE volumeLockBox(IDirect3DVolumeTexture9 *self, UINT level, D3DLOCKED_BOX *locked,
+                                        const D3DBOX *box, DWORD flags) {
+  const HRESULT hr = g_volumeLockBox(self, level, locked, box, flags);
+  if (SUCCEEDED(hr) && level == 0 && locked && locked->pBits && !(flags & D3DLOCK_READONLY)) {
+    std::lock_guard<std::mutex> lock(g_volumeMutex);
+    g_volumeLocks[self] = {static_cast<uint8_t *>(locked->pBits), uint32_t(locked->RowPitch),
+                           uint32_t(locked->SlicePitch), box ? box->Left : 0, box ? box->Top : 0,
+                           box ? box->Front : 0};
+  }
+  return hr;
+}
+
+HRESULT STDMETHODCALLTYPE volumeUnlockBox(IDirect3DVolumeTexture9 *self, UINT level) {
+  if (level == 0) {
+    VolumeLock locked;
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> lock(g_volumeMutex);
+      if (auto it = g_volumeLocks.find(self); it != g_volumeLocks.end()) {
+        locked = it->second;
+        have = true;
+        g_volumeLocks.erase(it);
+      }
+    }
+    D3DVOLUME_DESC desc = {};
+    if (have && SUCCEEDED(self->GetLevelDesc(0, &desc)) && desc.Width && desc.Height && desc.Depth &&
+        uint64_t(desc.Width) * desc.Height * desc.Depth <= 512u * 512u * 512u &&
+        (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8)) {
+      std::lock_guard<std::mutex> lock(g_volumeMutex);
+      auto &copy = g_volumeCopies[self];
+      if (copy.width != desc.Width || copy.height != desc.Height || copy.depth != desc.Depth) {
+        copy.width = desc.Width;
+        copy.height = desc.Height;
+        copy.depth = desc.Depth;
+        copy.pixels.assign(size_t(desc.Width) * desc.Height * desc.Depth * 4, 255);
+      }
+      // The locked region (the whole volume unless the engine gave a box) from its memory.
+      const uint32_t width = desc.Width - locked.left, height = desc.Height - locked.top,
+                     depth = desc.Depth - locked.front;
+      for (uint32_t z = 0; z < depth; ++z)
+        for (uint32_t y = 0; y < height; ++y)
+          std::memcpy(copy.pixels.data() +
+                          ((size_t(z + locked.front) * desc.Height + y + locked.top) * desc.Width + locked.left) * 4,
+                      locked.bits + size_t(z) * locked.slicePitch + size_t(y) * locked.rowPitch, size_t(width) * 4);
+      if (desc.Format == D3DFMT_X8R8G8B8)
+        for (size_t i = 3; i < copy.pixels.size(); i += 4)
+          copy.pixels[i] = 255;
+      ++copy.version;
+    }
+  }
+  return g_volumeUnlockBox(self, level);
+}
+
+using CreateVolumeTextureFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, UINT, UINT, UINT, UINT, DWORD,
+                                                           D3DFORMAT, D3DPOOL, IDirect3DVolumeTexture9 **, HANDLE *);
+CreateVolumeTextureFn g_createVolumeTexture = nullptr;
+
+HRESULT STDMETHODCALLTYPE createVolumeTexture(IDirect3DDevice9 *dev, UINT width, UINT height, UINT depth, UINT levels,
+                                              DWORD usage, D3DFORMAT format, D3DPOOL pool,
+                                              IDirect3DVolumeTexture9 **out, HANDLE *shared) {
+  const HRESULT hr = g_createVolumeTexture(dev, width, height, depth, levels, usage, format, pool, out, shared);
+  if (SUCCEEDED(hr) && out && *out) {
+    {
+      // A new volume can take the address of a released one.
+      std::lock_guard<std::mutex> lock(g_volumeMutex);
+      g_volumeCopies.erase(*out);
+      g_volumeLocks.erase(*out);
+    }
+    if (!g_volumeLockBox) {
+      void **vt = vtableOf(*out);
+      hookSlot(vt, kRelease, &volumeRelease, g_volumeRelease);
+      hookSlot(vt, kVolumeTextureLockBox, &volumeLockBox, g_volumeLockBox);
+      hookSlot(vt, kVolumeTextureUnlockBox, &volumeUnlockBox, g_volumeUnlockBox);
+    }
+  }
+  return hr;
+}
 
 // Render-target textures (CreateTexture with D3DUSAGE_RENDERTARGET) and the
 // one render target 0 currently belongs to.
@@ -326,7 +511,7 @@ void present();
 } // namespace targetread
 
 ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
-  const ULONG refs = g_textureRelease(self);
+  const ULONG refs = g_textureClasses.original<ReleaseFn>(self, kTexRelease)(self);
   if (refs == 0) {
     if (auto live = targetread::g_live.find(self); live != targetread::g_live.end()) {
       targetread::drop(live->second);
@@ -343,7 +528,7 @@ ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
 
 HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
                                           const RECT *rect, DWORD flags) {
-  const HRESULT hr = g_textureLockRect(self, level, locked, rect, flags);
+  const HRESULT hr = g_textureClasses.original<TextureLockRectFn>(self, kTexLockRect)(self, level, locked, rect, flags);
   if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
     g_lockedTextures[levelKey(self, level)] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch),
@@ -385,17 +570,35 @@ HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level)
       }
     }
   }
-  return g_textureUnlockRect(self, level);
+  return g_textureClasses.original<TextureUnlockRectFn>(self, kTexUnlockRect)(self, level);
 }
 
 // Uploads through level surfaces (GetSurfaceLevel + IDirect3DSurface9::LockRect,
 // as D3DX does): forward level 0 of the containing texture.
 using SurfaceLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DSurface9 *, D3DLOCKED_RECT *, const RECT *, DWORD);
 using SurfaceUnlockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DSurface9 *);
-using GetSurfaceLevelFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, IDirect3DSurface9 **);
-SurfaceLockRectFn g_surfaceLockRect = nullptr;
-SurfaceUnlockRectFn g_surfaceUnlockRect = nullptr;
-GetSurfaceLevelFn g_getSurfaceLevel = nullptr;
+// Texture level surfaces: LockRect, UnlockRect.
+enum : unsigned { kSurfLockRect, kSurfUnlockRect };
+ClassHooks<2> g_surfaceClasses({kSurfaceLockRect, kSurfaceUnlockRect});
+
+ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self);
+HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
+                                          const RECT *rect, DWORD flags);
+HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level);
+HRESULT STDMETHODCALLTYPE textureGetSurfaceLevel(IDirect3DTexture9 *self, UINT level, IDirect3DSurface9 **out);
+HRESULT STDMETHODCALLTYPE surfaceLockRect(IDirect3DSurface9 *self, D3DLOCKED_RECT *locked, const RECT *rect,
+                                          DWORD flags);
+HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self);
+
+// Entropy : Zero 2 (D3D9Ex): textures and surfaces the proxy did not see
+// created (other pools' classes) are hooked when they are met.
+void hookTexture(IDirect3DTexture9 *texture) {
+  g_textureClasses.see(texture, {reinterpret_cast<void *>(&textureRelease), reinterpret_cast<void *>(&textureGetSurfaceLevel),
+                                 reinterpret_cast<void *>(&textureLockRect), reinterpret_cast<void *>(&textureUnlockRect)});
+}
+void hookSurface(IDirect3DSurface9 *surface) {
+  g_surfaceClasses.see(surface, {reinterpret_cast<void *>(&surfaceLockRect), reinterpret_cast<void *>(&surfaceUnlockRect)});
+}
 
 // Returns the 2D texture whose level 0 is `surface` (not AddRef'd), or nullptr.
 IDirect3DTexture9 *levelZeroTexture(IDirect3DSurface9 *surface) {
@@ -403,6 +606,8 @@ IDirect3DTexture9 *levelZeroTexture(IDirect3DSurface9 *surface) {
   if (FAILED(surface->GetContainer(IID_IDirect3DTexture9, reinterpret_cast<void **>(&texture))) || !texture)
     return nullptr;
   texture->Release(); // the texture outlives its surfaces' use here
+  if (kEz2)
+    hookTexture(texture);
   D3DSURFACE_DESC level0, mine;
   if (FAILED(texture->GetLevelDesc(0, &level0)) || FAILED(surface->GetDesc(&mine)) || level0.Width != mine.Width ||
       level0.Height != mine.Height)
@@ -410,9 +615,35 @@ IDirect3DTexture9 *levelZeroTexture(IDirect3DSurface9 *surface) {
   return texture;
 }
 
+IDirect3DTexture9 *containerTexture(IDirect3DSurface9 *surface, UINT *outLevel = nullptr) {
+  if (!surface)
+    return nullptr;
+  IDirect3DTexture9 *texture = nullptr;
+  if (FAILED(surface->GetContainer(IID_IDirect3DTexture9, reinterpret_cast<void **>(&texture))) || !texture)
+    return nullptr;
+  texture->Release();
+  hookTexture(texture);
+  if (outLevel) {
+    *outLevel = 0;
+    D3DSURFACE_DESC mine;
+    if (SUCCEEDED(surface->GetDesc(&mine))) {
+      const UINT count = texture->GetLevelCount();
+      for (UINT l = 0; l < count; ++l) {
+        D3DSURFACE_DESC desc;
+        if (SUCCEEDED(texture->GetLevelDesc(l, &desc)) &&
+            desc.Width == mine.Width && desc.Height == mine.Height && desc.Format == mine.Format) {
+          *outLevel = l;
+          break;
+        }
+      }
+    }
+  }
+  return texture;
+}
+
 HRESULT STDMETHODCALLTYPE surfaceLockRect(IDirect3DSurface9 *self, D3DLOCKED_RECT *locked, const RECT *rect,
                                           DWORD flags) {
-  const HRESULT hr = g_surfaceLockRect(self, locked, rect, flags);
+  const HRESULT hr = g_surfaceClasses.original<SurfaceLockRectFn>(self, kSurfLockRect)(self, locked, rect, flags);
   if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
     g_lockedTextures[self] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch), rect != nullptr,
@@ -461,16 +692,13 @@ HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self) {
       }
     }
   }
-  return g_surfaceUnlockRect(self);
+  return g_surfaceClasses.original<SurfaceUnlockRectFn>(self, kSurfUnlockRect)(self);
 }
 
 HRESULT STDMETHODCALLTYPE textureGetSurfaceLevel(IDirect3DTexture9 *self, UINT level, IDirect3DSurface9 **out) {
-  const HRESULT hr = g_getSurfaceLevel(self, level, out);
-  if (SUCCEEDED(hr) && out && *out && !g_surfaceLockRect) {
-    void **vt = vtableOf(*out);
-    hookSlot(vt, kSurfaceLockRect, &surfaceLockRect, g_surfaceLockRect);
-    hookSlot(vt, kSurfaceUnlockRect, &surfaceUnlockRect, g_surfaceUnlockRect);
-  }
+  const HRESULT hr = g_textureClasses.original<GetSurfaceLevelFn>(self, kTexGetSurfaceLevel)(self, level, out);
+  if (SUCCEEDED(hr) && out && *out)
+    g_surfaceClasses.see(*out, {reinterpret_cast<void *>(&surfaceLockRect), reinterpret_cast<void *>(&surfaceUnlockRect)});
   return hr;
 }
 
@@ -500,6 +728,124 @@ DWORD g_samplerStates[16][16] = {};         // [sampler][D3DSAMPLERSTATETYPE]
 D3DVIEWPORT9 g_viewport = {};
 RECT g_scissor = {};
 DWORD g_renderStates[256] = {};
+// Fixed-function state (game::kFixedFunction; its hooks are installed only
+// there): transforms, texture stage states, the layout SetFVF set, the
+// material and lights. Render thread.
+namespace ff {
+float g_worlds[256][16];       // D3DTS_WORLDMATRIX(n)
+float g_view[16], g_projection[16];
+float g_textures[8][16];       // D3DTS_TEXTURE0..7
+DWORD g_stages[8][33] = {};    // [stage][D3DTEXTURESTAGESTATETYPE]
+uint32_t g_worldsSet = 1;      // highest WORLDMATRIX index set, + 1
+uint32_t g_worldDraw[256] = {}; // the fixed-function draw count when WORLDMATRIX(n) was last set (probe)
+uint32_t g_ffDraws = 0;        // fixed-function draws captured
+DWORD g_fvf = 0;
+bool g_fvfLayout = false;      // SetFVF came after the last SetVertexDeclaration
+D3DMATERIAL9 g_material = {};
+D3DLIGHT9 g_lights[32] = {};
+uint32_t g_lightsEnabled = 0;
+remix::FixedFunction g_state;  // points at the above
+// SetFVF's layouts as vertex declarations (D3DFVF_* to D3DVERTEXELEMENT9),
+// made once per FVF; their address stands for the declaration.
+std::unordered_map<DWORD, std::vector<D3DVERTEXELEMENT9>> g_fvfElements;
+
+void setIdentity(float *m) {
+  std::fill_n(m, 16, 0.0f);
+  m[0] = m[5] = m[10] = m[15] = 1;
+}
+
+// Row-major 4x4: out = a * b.
+void multiply(const float *a, const float *b, float *out) {
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      float v = 0;
+      for (int k = 0; k < 4; ++k)
+        v += a[r * 4 + k] * b[k * 4 + c];
+      out[r * 4 + c] = v;
+    }
+}
+
+// D3D's defaults (a new or reset device).
+void reset() {
+  for (auto &m : g_worlds)
+    setIdentity(m);
+  for (auto &m : g_textures)
+    setIdentity(m);
+  setIdentity(g_view);
+  setIdentity(g_projection);
+  g_worldsSet = 1;
+  for (DWORD s = 0; s < 8; ++s) {
+    DWORD *t = g_stages[s];
+    std::fill_n(t, 33, 0u);
+    t[D3DTSS_COLOROP] = s == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+    t[D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+    t[D3DTSS_COLORARG2] = D3DTA_CURRENT;
+    t[D3DTSS_ALPHAOP] = s == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+    t[D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+    t[D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    t[D3DTSS_TEXCOORDINDEX] = s;
+    t[D3DTSS_TEXTURETRANSFORMFLAGS] = D3DTTFF_DISABLE;
+  }
+  g_fvf = 0;
+  g_fvfLayout = false;
+  g_lightsEnabled = 0;
+  // Render states whose default is not 0 that the conversion reads.
+  g_renderStates[D3DRS_LIGHTING] = TRUE;
+  g_renderStates[D3DRS_TEXTUREFACTOR] = 0xffffffff;
+  g_renderStates[D3DRS_COLORVERTEX] = TRUE;
+  g_renderStates[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+  g_renderStates[D3DRS_SPECULARMATERIALSOURCE] = D3DMCS_COLOR2;
+  g_renderStates[D3DRS_FOGVERTEXMODE] = D3DFOG_NONE;
+}
+
+// The vertex declaration D3D makes of an FVF.
+const std::vector<D3DVERTEXELEMENT9> &fvfElements(DWORD fvf) {
+  auto it = g_fvfElements.find(fvf);
+  if (it != g_fvfElements.end())
+    return it->second;
+  std::vector<D3DVERTEXELEMENT9> e;
+  WORD offset = 0;
+  auto add = [&](BYTE type, BYTE usage, BYTE index, WORD bytes) {
+    e.push_back({0, offset, type, D3DDECLMETHOD_DEFAULT, usage, index});
+    offset = WORD(offset + bytes);
+  };
+  const DWORD position = fvf & D3DFVF_POSITION_MASK;
+  if (position == D3DFVF_XYZRHW)
+    add(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0, 16);
+  else if (position == D3DFVF_XYZW)
+    add(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITION, 0, 16);
+  else if (position)
+    add(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 12);
+  // XYZB1..B5: betas after the position, the last of them the blend indices
+  // with D3DFVF_LASTBETA_UBYTE4 / _D3DCOLOR.
+  if (position >= D3DFVF_XYZB1 && position <= D3DFVF_XYZB5) {
+    int betas = int((position - D3DFVF_XYZB1) / 2) + 1;
+    const bool indices = (fvf & (D3DFVF_LASTBETA_UBYTE4 | D3DFVF_LASTBETA_D3DCOLOR)) != 0;
+    const int weights = betas - (indices ? 1 : 0);
+    if (weights > 0)
+      add(BYTE(D3DDECLTYPE_FLOAT1 + std::min(weights, 4) - 1), D3DDECLUSAGE_BLENDWEIGHT, 0, WORD(weights * 4));
+    if (indices)
+      add((fvf & D3DFVF_LASTBETA_D3DCOLOR) ? D3DDECLTYPE_D3DCOLOR : D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 4);
+  }
+  if (fvf & D3DFVF_NORMAL)
+    add(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, 0, 12);
+  if (fvf & D3DFVF_PSIZE)
+    add(D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_PSIZE, 0, 4);
+  if (fvf & D3DFVF_DIFFUSE)
+    add(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 0, 4);
+  if (fvf & D3DFVF_SPECULAR)
+    add(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 1, 4);
+  const DWORD texcoords = std::min<DWORD>((fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT, 8);
+  for (DWORD i = 0; i < texcoords; ++i) {
+    // D3DFVF_TEXCOORDSIZEn: 0 two floats, 1 three, 2 four, 3 one.
+    static const BYTE sizes[4] = {2, 3, 4, 1};
+    const BYTE n = sizes[(fvf >> (16 + i * 2)) & 3];
+    add(BYTE(D3DDECLTYPE_FLOAT1 + n - 1), D3DDECLUSAGE_TEXCOORD, BYTE(i), WORD(n * 4));
+  }
+  e.push_back(D3DVERTEXELEMENT9{0xff, 0, D3DDECLTYPE_UNUSED, 0, 0, 0}); // D3DDECL_END
+  return g_fvfElements.emplace(fvf, std::move(e)).first->second;
+}
+} // namespace ff
 // Vertex shaders decoded at creation (vsprog): the draws whose shader builds
 // the geometry (particles) are run through it on the CPU. A shader object's
 // address is reused after its release, by a shader created anew.
@@ -566,6 +912,11 @@ uint32_t g_vertexProgramSeen = 0;
 using CreateFn = IDirect3D9 *(WINAPI *)(UINT);
 using CreateDeviceFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3D9 *, UINT, D3DDEVTYPE, HWND, DWORD,
                                                     D3DPRESENT_PARAMETERS *, IDirect3DDevice9 **);
+using CreateExFn = HRESULT(WINAPI *)(UINT, IDirect3D9Ex **);
+using CreateDeviceExFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3D9Ex *, UINT, D3DDEVTYPE, HWND, DWORD,
+                                                      D3DPRESENT_PARAMETERS *, D3DDISPLAYMODEEX *,
+                                                      IDirect3DDevice9Ex **);
+using GetProcAddressFn = FARPROC(WINAPI *)(HMODULE, LPCSTR);
 using ResetFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, D3DPRESENT_PARAMETERS *);
 using PresentFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND,
                                                const RGNDATA *);
@@ -605,6 +956,9 @@ using QueryGetDataFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DQuery9 *, void *, D
 
 CreateFn g_create = nullptr;
 CreateDeviceFn g_createDevice = nullptr;
+CreateExFn g_createEx = nullptr;
+CreateDeviceExFn g_createDeviceEx = nullptr;
+GetProcAddressFn g_getProcAddress = nullptr;
 ResetFn g_reset = nullptr;
 PresentFn g_present = nullptr;
 CreateTextureFn g_createTexture = nullptr;
@@ -644,8 +998,9 @@ SetScissorRectFn g_setScissorRect = nullptr;
 SetSamplerStateFn g_setSamplerState = nullptr;
 SetShaderConstantIFn g_setVertexShaderConstantI = nullptr, g_setPixelShaderConstantI = nullptr;
 SetShaderConstantBFn g_setVertexShaderConstantB = nullptr, g_setPixelShaderConstantB = nullptr;
-QueryIssueFn g_queryIssue = nullptr;
-QueryGetDataFn g_queryGetData = nullptr;
+// Occlusion queries: Issue, GetData.
+enum : unsigned { kQIssue, kQGetData };
+ClassHooks<2> g_queryClasses({kQueryIssue, kQueryGetData});
 // Occlusion queries between Issue(BEGIN) and Issue(END).
 std::unordered_set<IDirect3DQuery9 *> g_openOcclusion;
 // Render targets the game issued occlusion queries on, by the frame it last
@@ -724,6 +1079,8 @@ HRESULT STDMETHODCALLTYPE reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp
   const HRESULT hr = g_reset(dev, pp);
   if (SUCCEEDED(hr))
     refreshBackBuffer(dev);
+  if (SUCCEEDED(hr) && game::kFixedFunction)
+    ff::reset(); // Reset returns the device to D3D's defaults
   return hr;
 }
 
@@ -742,12 +1099,8 @@ HRESULT STDMETHODCALLTYPE createVertexBuffer(IDirect3DDevice9 *dev, UINT length,
                                              IDirect3DVertexBuffer9 **out, HANDLE *shared) {
   const HRESULT hr = g_createVertexBuffer(dev, length, usage, fvf, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out) {
-    if (!g_vbLock) {
-      void **vt = vtableOf(*out);
-      hookSlot(vt, kRelease, &vbRelease, g_vbRelease);
-      hookSlot(vt, kBufferLock, &vbLock, g_vbLock);
-      hookSlot(vt, kBufferUnlock, &vbUnlock, g_vbUnlock);
-    }
+    g_vbClasses.see(*out, {reinterpret_cast<void *>(&vbRelease), reinterpret_cast<void *>(&vbLock),
+                           reinterpret_cast<void *>(&vbUnlock)});
     trackBuffer(*out, length, usage, false, pool);
   }
   return hr;
@@ -757,12 +1110,8 @@ HRESULT STDMETHODCALLTYPE createIndexBuffer(IDirect3DDevice9 *dev, UINT length, 
                                             D3DPOOL pool, IDirect3DIndexBuffer9 **out, HANDLE *shared) {
   const HRESULT hr = g_createIndexBuffer(dev, length, usage, format, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out) {
-    if (!g_ibLock) {
-      void **vt = vtableOf(*out);
-      hookSlot(vt, kRelease, &ibRelease, g_ibRelease);
-      hookSlot(vt, kBufferLock, &ibLock, g_ibLock);
-      hookSlot(vt, kBufferUnlock, &ibUnlock, g_ibUnlock);
-    }
+    g_ibClasses.see(*out, {reinterpret_cast<void *>(&ibRelease), reinterpret_cast<void *>(&ibLock),
+                           reinterpret_cast<void *>(&ibUnlock)});
     trackBuffer(*out, length, usage, format == D3DFMT_INDEX32, pool);
   }
   return hr;
@@ -773,28 +1122,104 @@ HRESULT STDMETHODCALLTYPE createTexture(IDirect3DDevice9 *dev, UINT width, UINT 
   const HRESULT hr = g_createTexture(dev, width, height, levels, usage, format, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out && (usage & D3DUSAGE_RENDERTARGET))
     g_targetTextures[*out] = {width, height, format};
-  if (SUCCEEDED(hr) && out && *out && !g_textureLockRect) {
-    void **vt = vtableOf(*out);
-    hookSlot(vt, kRelease, &textureRelease, g_textureRelease);
-    hookSlot(vt, kTextureGetSurfaceLevel, &textureGetSurfaceLevel, g_getSurfaceLevel);
-    hookSlot(vt, kTextureLockRect, &textureLockRect, g_textureLockRect);
-    hookSlot(vt, kTextureUnlockRect, &textureUnlockRect, g_textureUnlockRect);
-  }
+  // A new texture can reuse the address of one released without our Release hook
+  // seeing it: whatever the runtime holds under that address is the old texture's.
+  if (kEz2 && SUCCEEDED(hr) && out && *out)
+    remix::onTextureReleased(*out);
+  if (kEz2 && SUCCEEDED(hr) && out && *out && !(usage & D3DUSAGE_RENDERTARGET))
+    remix::initCpuTexture(*out, width, height, format);
+  // D3D9Ex: a system-memory texture over the caller's memory (`shared` points
+  // at its pixels). The engine writes there and copies it to a default-pool
+  // texture (UpdateTexture) without ever locking it.
+  if (kEz2 && SUCCEEDED(hr) && out && *out && pool == D3DPOOL_SYSTEMMEM && shared && *shared)
+    remix::onUserMemoryTexture(*out, width, height, format, static_cast<const uint8_t *>(*shared));
+  if (SUCCEEDED(hr) && out && *out)
+    g_textureClasses.see(*out, {reinterpret_cast<void *>(&textureRelease), reinterpret_cast<void *>(&textureGetSurfaceLevel),
+                                reinterpret_cast<void *>(&textureLockRect), reinterpret_cast<void *>(&textureUnlockRect)});
   return hr;
 }
 
 HRESULT STDMETHODCALLTYPE updateSurface(IDirect3DDevice9 *dev, IDirect3DSurface9 *src, const RECT *srcRect,
                                         IDirect3DSurface9 *dst, const POINT *dstPoint) {
-  if (!srcRect && !dstPoint && src && dst) {
-    IDirect3DTexture9 *from = levelZeroTexture(src), *to = levelZeroTexture(dst);
-    if (from && to)
-      remix::onTextureCopy(from, to);
+  if (!kEz2) {
+    if (!srcRect && !dstPoint && src && dst) {
+      IDirect3DTexture9 *from = levelZeroTexture(src), *to = levelZeroTexture(dst);
+      if (from && to)
+        remix::onTextureCopy(from, to);
+    }
+    return g_updateSurface(dev, src, srcRect, dst, dstPoint);
+  }
+  if (src && dst) {
+    hookSurface(src);
+    hookSurface(dst);
+    UINT srcLevel = 0, dstLevel = 0;
+    IDirect3DTexture9 *from = containerTexture(src, &srcLevel);
+    IDirect3DTexture9 *to = containerTexture(dst, &dstLevel);
+    if (from)
+      hookTexture(from);
+    if (to)
+      hookTexture(to);
+
+    if (to && dstLevel == 0) {
+      D3DSURFACE_DESC srcDesc = {}, dstDesc = {};
+      src->GetDesc(&srcDesc);
+      dst->GetDesc(&dstDesc);
+      const bool atOrigin = !dstPoint || (dstPoint->x == 0 && dstPoint->y == 0);
+      const bool fullSrc = !srcRect || (srcRect->left == 0 && srcRect->top == 0 &&
+                                        UINT(srcRect->right) >= srcDesc.Width &&
+                                        UINT(srcRect->bottom) >= srcDesc.Height);
+      const bool fullDst = srcDesc.Width == dstDesc.Width && srcDesc.Height == dstDesc.Height;
+      if (from && srcLevel == 0 && atOrigin && fullSrc && fullDst) {
+        remix::onTextureCopy(from, to);
+        // A staging surface's CPU copy only knows the writes seen through locks, and the engine
+        // restores UI font pages (after a device reset) with writes that bypass them: the
+        // surface's own pixels are the truth.
+        if (srcDesc.Format == D3DFMT_A8R8G8B8 && srcDesc.Width <= 512 && srcDesc.Height <= 512) {
+          D3DLOCKED_RECT locked = {};
+          if (SUCCEEDED(src->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+            remix::onTexturePartialUpload(to, dstDesc.Width, dstDesc.Height, dstDesc.Format,
+                                          RECT{0, 0, LONG(srcDesc.Width), LONG(srcDesc.Height)},
+                                          static_cast<const uint8_t *>(locked.pBits), locked.Pitch);
+            src->UnlockRect();
+          }
+        }
+      } else {
+        const RECT rSrc = srcRect ? *srcRect : RECT{0, 0, static_cast<LONG>(srcDesc.Width), static_cast<LONG>(srcDesc.Height)};
+        const POINT pt = dstPoint ? *dstPoint : POINT{0, 0};
+        const LONG w = rSrc.right - rSrc.left;
+        const LONG h = rSrc.bottom - rSrc.top;
+        bool uploaded = false;
+        if (w > 0 && h > 0) {
+          D3DLOCKED_RECT locked = {};
+          if (SUCCEEDED(src->LockRect(&locked, &rSrc, D3DLOCK_READONLY))) {
+            const RECT dstRect = {pt.x, pt.y, pt.x + w, pt.y + h};
+            remix::onTexturePartialUpload(to, dstDesc.Width, dstDesc.Height, dstDesc.Format, dstRect,
+                                          static_cast<const uint8_t *>(locked.pBits), locked.Pitch);
+            src->UnlockRect();
+            uploaded = true;
+          }
+        }
+        if (!uploaded && from && srcLevel == 0) {
+          remix::onTextureSubCopy(from, to, srcRect, dstPoint);
+        }
+      }
+    }
   }
   return g_updateSurface(dev, src, srcRect, dst, dstPoint);
 }
 
 HRESULT STDMETHODCALLTYPE updateTexture(IDirect3DDevice9 *dev, IDirect3DBaseTexture9 *src, IDirect3DBaseTexture9 *dst) {
   remix::onTextureCopy(src, dst);
+  if (kEz2 && src && dst) {
+    // A volume updated from its system-memory staging volume: the same contents.
+    std::lock_guard<std::mutex> lock(g_volumeMutex);
+    if (const auto from = g_volumeCopies.find(src); from != g_volumeCopies.end()) {
+      auto &to = g_volumeCopies[dst];
+      const uint32_t version = to.version + 1;
+      to = from->second;
+      to.version = version;
+    }
+  }
   return g_updateTexture(dev, src, dst);
 }
 
@@ -823,8 +1248,96 @@ HRESULT STDMETHODCALLTYPE setRenderState(IDirect3DDevice9 *dev, D3DRENDERSTATETY
   return g_setRenderState(dev, state, value);
 }
 
+// --- Fixed-function state (game::kFixedFunction) ---------------------------
+using SetTransformFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
+using SetFVFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD);
+using SetTextureStageStateFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, D3DTEXTURESTAGESTATETYPE,
+                                                            DWORD);
+using SetMaterialFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const D3DMATERIAL9 *);
+using SetLightFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, const D3DLIGHT9 *);
+using LightEnableFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, BOOL);
+SetTransformFn g_setTransform = nullptr, g_multiplyTransform = nullptr;
+SetFVFFn g_setFVF = nullptr;
+SetTextureStageStateFn g_setTextureStageState = nullptr;
+SetMaterialFn g_setMaterial = nullptr;
+SetLightFn g_setLight = nullptr;
+LightEnableFn g_lightEnable = nullptr;
+
+// The tracked matrix of a transform state (nullptr: not one the proxy keeps).
+float *transformSlot(D3DTRANSFORMSTATETYPE state) {
+  const unsigned s = unsigned(state);
+  if (s == D3DTS_VIEW)
+    return ff::g_view;
+  if (s == D3DTS_PROJECTION)
+    return ff::g_projection;
+  if (s >= D3DTS_TEXTURE0 && s <= D3DTS_TEXTURE7)
+    return ff::g_textures[s - D3DTS_TEXTURE0];
+  if (s >= 256 && s < 512) {
+    ff::g_worldsSet = std::max(ff::g_worldsSet, s - 255);
+    ff::g_worldDraw[s - 256] = ff::g_ffDraws;
+    return ff::g_worlds[s - 256];
+  }
+  return nullptr;
+}
+
+HRESULT STDMETHODCALLTYPE setTransform(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *m) {
+  ++g_stats.setTransforms;
+  if (m)
+    if (float *to = transformSlot(state))
+      std::memcpy(to, m, 64);
+  return g_setTransform(dev, state, m);
+}
+
+// D3D: the state becomes m x state.
+HRESULT STDMETHODCALLTYPE multiplyTransform(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *m) {
+  ++g_stats.setTransforms;
+  if (m)
+    if (float *to = transformSlot(state)) {
+      float product[16];
+      ff::multiply(&m->m[0][0], to, product);
+      std::memcpy(to, product, 64);
+    }
+  return g_multiplyTransform(dev, state, m);
+}
+
+HRESULT STDMETHODCALLTYPE setFVF(IDirect3DDevice9 *dev, DWORD fvf) {
+  ++g_stats.setFVFs;
+  ff::g_fvf = fvf;
+  ff::g_fvfLayout = true;
+  return g_setFVF(dev, fvf);
+}
+
+HRESULT STDMETHODCALLTYPE setTextureStageState(IDirect3DDevice9 *dev, DWORD stage, D3DTEXTURESTAGESTATETYPE type,
+                                               DWORD value) {
+  ++g_stats.stageStates;
+  if (stage < 8 && unsigned(type) < 33)
+    ff::g_stages[stage][type] = value;
+  return g_setTextureStageState(dev, stage, type, value);
+}
+
+HRESULT STDMETHODCALLTYPE setMaterial(IDirect3DDevice9 *dev, const D3DMATERIAL9 *material) {
+  if (material)
+    ff::g_material = *material;
+  return g_setMaterial(dev, material);
+}
+
+HRESULT STDMETHODCALLTYPE setLight(IDirect3DDevice9 *dev, DWORD index, const D3DLIGHT9 *light) {
+  ++g_stats.setLights;
+  if (light && index < 32)
+    ff::g_lights[index] = *light;
+  return g_setLight(dev, index, light);
+}
+
+HRESULT STDMETHODCALLTYPE lightEnable(IDirect3DDevice9 *dev, DWORD index, BOOL enable) {
+  if (index < 32)
+    ff::g_lightsEnabled = (ff::g_lightsEnabled & ~(1u << index)) | (enable ? 1u << index : 0u);
+  return g_lightEnable(dev, index, enable);
+}
+
 HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect3DBaseTexture9 *texture) {
   ++g_stats.textureBinds;
+  if (kEz2 && texture && texture->GetType() == D3DRTYPE_TEXTURE)
+    hookTexture(static_cast<IDirect3DTexture9 *>(texture));
   if (stage == 0)
     g_texture0 = texture;
   else if (stage == 1)
@@ -840,6 +1353,7 @@ HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect
 
 HRESULT STDMETHODCALLTYPE setVertexDeclaration(IDirect3DDevice9 *dev, IDirect3DVertexDeclaration9 *decl) {
   g_decl = decl;
+  ff::g_fvfLayout = false;
   if (decl && !g_declElements.count(decl)) {
     D3DVERTEXELEMENT9 elems[MAXD3DDECLLENGTH + 1];
     UINT n = 0;
@@ -997,7 +1511,7 @@ void releaseOccluders() {
 
 // The current map's occluder buffers on this device (created on first use).
 bool occludersReady(IDirect3DDevice9 *dev) {
-  if (!occludersEnabled() || !bsp::active() || !g_vbLock || !g_ibLock)
+  if (!occludersEnabled() || !bsp::active())
     return false;
   const auto &o = bsp::occluders();
   if (o.indices.empty())
@@ -1017,14 +1531,15 @@ bool occludersReady(IDirect3DDevice9 *dev) {
                                  nullptr)))
     return false;
   void *data = nullptr;
-  if (FAILED(g_vbLock(g_occluders.vb, 0, 0, &data, 0)))
+  if (FAILED(g_vbClasses.original<LockFn>(g_occluders.vb, kBufLock)(g_occluders.vb, 0, 0, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.positions.data(), vbBytes);
-  g_vbUnlock(g_occluders.vb);
-  if (FAILED(g_ibLock(g_occluders.ib, 0, 0, &data, 0)))
+  g_vbClasses.original<UnlockFn>(g_occluders.vb, kBufUnlock)(g_occluders.vb);
+  data = nullptr;
+  if (FAILED(g_ibClasses.original<LockFn>(g_occluders.ib, kBufLock)(g_occluders.ib, 0, 0, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.indices.data(), ibBytes);
-  g_ibUnlock(g_occluders.ib);
+  g_ibClasses.original<UnlockFn>(g_occluders.ib, kBufUnlock)(g_occluders.ib);
   g_occluders.vertices = UINT(o.positions.size() / 3);
   g_occluders.triangles = UINT(o.indices.size() / 3);
   g_occluders.failed = false;
@@ -1046,10 +1561,12 @@ void drawOccluders(IDirect3DDevice9 *dev) {
   }
   g_setVertexShader(dev, nullptr); // past the hook: the state block restores the shader, and its tracking would not see that
   dev->SetPixelShader(nullptr);
-  dev->SetFVF(D3DFVF_XYZ);
-  dev->SetTransform(D3DTS_WORLD, &identity);
-  dev->SetTransform(D3DTS_VIEW, &identity);
-  dev->SetTransform(D3DTS_PROJECTION, &projection);
+  // Past the fixed-function hooks where they are installed: the state block
+  // restores the device, and their tracking would not see that.
+  g_setFVF ? g_setFVF(dev, D3DFVF_XYZ) : dev->SetFVF(D3DFVF_XYZ);
+  for (auto [state, matrix] : {std::pair{D3DTS_WORLD, &identity}, std::pair{D3DTS_VIEW, &identity},
+                               std::pair{D3DTS_PROJECTION, &projection}})
+    g_setTransform ? g_setTransform(dev, state, matrix) : dev->SetTransform(state, matrix);
   static const std::pair<D3DRENDERSTATETYPE, DWORD> states[] = {
       {D3DRS_ZENABLE, D3DZB_TRUE}, {D3DRS_ZWRITEENABLE, TRUE}, {D3DRS_ZFUNC, D3DCMP_LESSEQUAL},
       {D3DRS_COLORWRITEENABLE, 0}, {D3DRS_CULLMODE, D3DCULL_NONE}, {D3DRS_ALPHABLENDENABLE, FALSE},
@@ -1073,9 +1590,15 @@ void drawOccluders(IDirect3DDevice9 *dev) {
 }
 
 HRESULT STDMETHODCALLTYPE queryGetData(IDirect3DQuery9 *query, void *data, DWORD size, DWORD flags) {
-  const HRESULT hr = g_queryGetData(query, data, size, flags);
-  if (hr == S_OK && data && size >= 4 && query->GetType() == D3DQUERYTYPE_OCCLUSION)
+  const HRESULT hr = g_queryClasses.original<QueryGetDataFn>(query, kQGetData)(query, data, size, flags);
+  if (hr == S_OK && data && size >= 4 && query->GetType() == D3DQUERYTYPE_OCCLUSION) {
+#if defined(PROXY_GAME_EZ2)
+    // Raytracing renders occluded entities; prevent the engine from culling
+    // characters or enemies when raster occluder depth tests return 0 pixels.
+    *static_cast<DWORD *>(data) = std::max<DWORD>(*static_cast<DWORD *>(data), 1);
+#endif
     ++(*static_cast<const DWORD *>(data) ? g_stats.queriesVisible : g_stats.queriesHidden);
+  }
   return hr;
 }
 
@@ -1100,7 +1623,7 @@ HRESULT STDMETHODCALLTYPE queryIssue(IDirect3DQuery9 *query, DWORD flags) {
     else if (flags & D3DISSUE_END)
       g_openOcclusion.erase(query);
   }
-  return g_queryIssue(query, flags);
+  return g_queryClasses.original<QueryIssueFn>(query, kQIssue)(query, flags);
 }
 
 // A depth clear takes the occluders with it: the engine clears depth between
@@ -1124,10 +1647,8 @@ HRESULT STDMETHODCALLTYPE clear(IDirect3DDevice9 *dev, DWORD count, const D3DREC
 
 HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, IDirect3DQuery9 **out) {
   const HRESULT hr = g_createQuery(dev, type, out);
-  if (SUCCEEDED(hr) && out && *out && type == D3DQUERYTYPE_OCCLUSION && !g_queryIssue) {
-    hookSlot(vtableOf(*out), kQueryIssue, &queryIssue, g_queryIssue);
-    hookSlot(vtableOf(*out), kQueryGetData, &queryGetData, g_queryGetData);
-  }
+  if (SUCCEEDED(hr) && out && *out && type == D3DQUERYTYPE_OCCLUSION)
+    g_queryClasses.see(*out, {reinterpret_cast<void *>(&queryIssue), reinterpret_cast<void *>(&queryGetData)});
   return hr;
 }
 
@@ -1135,9 +1656,22 @@ HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, 
 // draw instead (captured into the sky faces, not submitted).
 bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numVertices, UINT startIndex,
                  UINT primCount) {
-  auto decl = g_declElements.find(g_decl);
-  if (decl == g_declElements.end())
-    return false;
+  // No vertex shader, where the game draws that way: its fixed-function state
+  // goes along, and the layout may be SetFVF's.
+  const bool fixedFunction = game::kFixedFunction && !g_vertexShader;
+  const D3DVERTEXELEMENT9 *elements = nullptr;
+  const void *declaration = g_decl;
+  if ((fixedFunction || kEz2) && ff::g_fvfLayout) {
+    const auto &e = ff::fvfElements(ff::g_fvf);
+    elements = e.data();
+    declaration = &e;
+    ++g_stats.fvfDraws;
+  } else {
+    auto decl = g_declElements.find(g_decl);
+    if (decl == g_declElements.end())
+      return false;
+    elements = decl->second.data();
+  }
   remix::Draw d;
   d.type = type;
   d.baseVertex = baseVertex;
@@ -1153,6 +1687,8 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.mainTarget = g_renderTarget0 == g_backBuffer;
   d.texture0 = g_texture0;
   d.texture1 = g_texture1;
+  for (int s = 0; s < 8; ++s)
+    d.stageTextures[s] = g_textures[s];
   d.colorWrite = g_renderStates[D3DRS_COLORWRITEENABLE];
   d.blend = g_renderStates[D3DRS_ALPHABLENDENABLE] != 0;
   d.srcBlend = g_renderStates[D3DRS_SRCBLEND];
@@ -1199,8 +1735,26 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.scissor = g_scissor;
   d.scissorTest = g_renderStates[D3DRS_SCISSORTESTENABLE] != 0;
   d.forkCategories = g_renderStates[42]; // unused by D3D9; dxvk-remix fork category tag
-  d.elements = decl->second.data();
-  d.declaration = g_decl;
+  d.elements = elements;
+  d.declaration = declaration;
+  if (fixedFunction) {
+    ++g_stats.fixedDraws;
+    auto &f = ff::g_state;
+    f.worlds = ff::g_worlds;
+    f.view = ff::g_view;
+    f.projection = ff::g_projection;
+    f.textures = ff::g_textures;
+    f.stages = ff::g_stages;
+    f.renderStates = g_renderStates;
+    f.fvf = ff::g_fvfLayout ? ff::g_fvf : 0;
+    f.worldsSet = ff::g_worldsSet;
+    f.worldDraw = ff::g_worldDraw;
+    f.draw = ++ff::g_ffDraws;
+    f.material = &ff::g_material;
+    f.lights = ff::g_lights;
+    f.lightsEnabled = ff::g_lightsEnabled;
+    d.fixedFunction = &f;
+  }
   // The shadow lock stays held while the mesh is built from the shadows.
   std::lock_guard<std::mutex> lock(g_shadowLock);
   for (int i = 0; i < 4; ++i) {
@@ -1220,7 +1774,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   if (it != g_shadows.end())
     d.indices = {it->second.data.data(), uint32_t(it->second.data.size()), it->second.is32, g_indices,
                  it->second.version, it->second.dynamic};
-  if (remix::isSkyDraw(d))
+  if (!fixedFunction && remix::isSkyDraw(d)) // the capture replays the draw with its shader's constants
     return true;
   remix::onDraw(d);
   return false;
@@ -1248,6 +1802,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
 namespace skycap {
 constexpr uint64_t kSkyInterval = 30, kSkyMaxInterval = 240, kSkyCostFactor = 50, kSkyFreshInterval = 4;
 constexpr size_t kSkyFreshTextures = 12;
+constexpr UINT kLightScaleRegister = 30; // PSREG_LIGHT_SCALE: the tone mapping scale
 struct Faces {
   IDirect3DDevice9 *device = nullptr;
   IDirect3DSurface9 *targets[6] = {}, *readback[6] = {};
@@ -1407,6 +1962,16 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
 
   float saved[8 * 4];
   std::memcpy(saved, &g_vsConstants[4 * 4], sizeof(saved));
+  // HDR skies (Sky_HDR_DX9) scale their output by the engine's auto exposure
+  // (c30: x linear, w gamma), which climbs over the first seconds of a dark
+  // map (1 to 3 on Entropy : Zero 2's menu): the faces as the texture has
+  // them, whatever the exposure, or each capture after the first is brighter.
+  float savedLightScale[4];
+  std::memcpy(savedLightScale, &g_psConstants[kLightScaleRegister * 4], sizeof(savedLightScale));
+  if (kEz2) {
+    const float neutral[4] = {1, savedLightScale[1], savedLightScale[2], 1};
+    g_setPixelShaderConstantF(dev, kLightScaleRegister, neutral, 1);
+  }
   IDirect3DSurface9 *oldTarget = nullptr, *oldDepth = nullptr;
   dev->GetRenderTarget(0, &oldTarget);
   dev->GetDepthStencilSurface(&oldDepth);
@@ -1443,6 +2008,8 @@ void capture(IDirect3DDevice9 *dev, D3DPRIMITIVETYPE type, INT baseVertex, UINT 
   g.captureFrame = g_d3dFrame;
   g.captured = true;
   g_setVertexShaderConstantF(dev, 4, saved, 8);
+  if (kEz2)
+    g_setPixelShaderConstantF(dev, kLightScaleRegister, savedLightScale, 1);
   g_setRenderTarget(dev, 0, oldTarget);
   dev->SetDepthStencilSurface(oldDepth);
   dev->SetViewport(&oldViewport);
@@ -1717,6 +2284,8 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kReset, &reset, g_reset);
   hookSlot(vt, kPresent, &present, g_present);
   hookSlot(vt, kCreateTexture, &createTexture, g_createTexture);
+  if (kEz2)
+    hookSlot(vt, kCreateVolumeTexture, &createVolumeTexture, g_createVolumeTexture);
   hookSlot(vt, kUpdateTexture, &updateTexture, g_updateTexture);
   hookSlot(vt, kUpdateSurface, &updateSurface, g_updateSurface);
   hookSlot(vt, kCreateVertexBuffer, &createVertexBuffer, g_createVertexBuffer);
@@ -1747,6 +2316,18 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kSetStreamSource, &setStreamSource, g_setStreamSource);
   hookSlot(vt, kSetIndices, &setIndices, g_setIndices);
   hookSlot(vt, kCreateQuery, &createQuery, g_createQuery);
+  if (kEz2)
+    hookSlot(vt, kSetFVF, &setFVF, g_setFVF);
+  if (game::kFixedFunction) {
+    hookSlot(vt, kSetTransform, &setTransform, g_setTransform);
+    hookSlot(vt, kMultiplyTransform, &multiplyTransform, g_multiplyTransform);
+    if (!kEz2)
+      hookSlot(vt, kSetFVF, &setFVF, g_setFVF);
+    hookSlot(vt, kSetTextureStageState, &setTextureStageState, g_setTextureStageState);
+    hookSlot(vt, kSetMaterial, &setMaterial, g_setMaterial);
+    hookSlot(vt, kSetLight, &setLight, g_setLight);
+    hookSlot(vt, kLightEnable, &lightEnable, g_lightEnable);
+  }
 }
 
 HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags,
@@ -1771,30 +2352,104 @@ HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
     g_renderStates[D3DRS_DESTBLENDALPHA] = D3DBLEND_ZERO;
     g_renderStates[D3DRS_BLENDOPALPHA] = D3DBLENDOP_ADD;
     g_renderStates[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+    if (game::kFixedFunction)
+      ff::reset();
     remix::onDeviceCreated(*out);
   }
   return hr;
 }
 
+#if defined(PROXY_GAME_EZ2)
+HRESULT STDMETHODCALLTYPE createDeviceEx(IDirect3D9Ex *d3d, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags,
+                                         D3DPRESENT_PARAMETERS *pp, D3DDISPLAYMODEEX *fullscreenMode,
+                                         IDirect3DDevice9Ex **out) {
+  proxy::diag::stage("CreateDeviceEx called (hwnd %p, adapter %u, flags 0x%x)", focus, adapter, flags);
+  remix::onCreateDevice(focus, pp);
+  const HRESULT hr = g_createDeviceEx(d3d, adapter, type, focus, flags, pp, fullscreenMode, out);
+  proxy::diag::stage("CreateDeviceEx -> hr 0x%08lX, device %p", hr, out ? static_cast<void *>(*out) : nullptr);
+  if (SUCCEEDED(hr) && out && *out) {
+    hookDevice(*out);
+    refreshBackBuffer(*out);
+    g_renderStates[D3DRS_COLORWRITEENABLE] = 0xf;
+    g_renderStates[D3DRS_STENCILFUNC] = D3DCMP_ALWAYS;
+    g_renderStates[D3DRS_STENCILPASS] = g_renderStates[D3DRS_STENCILFAIL] = g_renderStates[D3DRS_STENCILZFAIL] =
+        D3DSTENCILOP_KEEP;
+    g_renderStates[D3DRS_STENCILMASK] = g_renderStates[D3DRS_STENCILWRITEMASK] = 0xffffffff;
+    g_renderStates[D3DRS_ZWRITEENABLE] = TRUE;
+    g_renderStates[D3DRS_ZENABLE] = D3DZB_TRUE;
+    g_renderStates[D3DRS_ZFUNC] = D3DCMP_LESSEQUAL;
+    g_renderStates[D3DRS_SRCBLEND] = D3DBLEND_ONE;
+    g_renderStates[D3DRS_DESTBLEND] = D3DBLEND_ZERO;
+    g_renderStates[D3DRS_BLENDOP] = D3DBLENDOP_ADD;
+    g_renderStates[D3DRS_SRCBLENDALPHA] = D3DBLEND_ONE;
+    g_renderStates[D3DRS_DESTBLENDALPHA] = D3DBLEND_ZERO;
+    g_renderStates[D3DRS_BLENDOPALPHA] = D3DBLENDOP_ADD;
+    g_renderStates[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+    if (game::kFixedFunction)
+      ff::reset();
+    remix::onDeviceCreated(*out);
+  }
+  return hr;
+}
+#endif
+
 IDirect3D9 *WINAPI direct3DCreate9(UINT sdk) {
+  proxy::diag::stage("direct3DCreate9(sdk %u) called", sdk);
   IDirect3D9 *d3d = g_create(sdk);
+  proxy::diag::stage("direct3DCreate9 -> %p", static_cast<void *>(d3d));
   if (d3d && !g_createDevice)
     hookSlot(vtableOf(d3d), kD3DCreateDevice, &createDevice, g_createDevice);
   return d3d;
 }
 
+#if defined(PROXY_GAME_EZ2)
+HRESULT WINAPI direct3DCreate9Ex(UINT sdk, IDirect3D9Ex **out) {
+  proxy::diag::stage("direct3DCreate9Ex(sdk %u) called", sdk);
+  HRESULT hr = g_createEx(sdk, out);
+  proxy::diag::stage("direct3DCreate9Ex -> hr 0x%08lX, pD3DEx %p", hr, out ? static_cast<void *>(*out) : nullptr);
+  if (SUCCEEDED(hr) && out && *out) {
+    if (!g_createDevice)
+      hookSlot(vtableOf(*out), kD3DCreateDevice, &createDevice, g_createDevice);
+    if (!g_createDeviceEx)
+      hookSlot(vtableOf(*out), kD3DCreateDeviceEx, &createDeviceEx, g_createDeviceEx);
+  }
+  return hr;
+}
+#endif
+
+// A shader API that loads d3d9.dll itself and asks for Direct3DCreate9 by
+// name (TF2's x64 one: LoadLibraryA("d3d9.dll"), then GetProcAddress for
+// Direct3DCreate9, or Direct3DCreate9Ex without -nod3d9ex) gets the hook from
+// its GetProcAddress import. Entropy : Zero 2's asks for Direct3DCreate9Ex.
+FARPROC WINAPI getProcAddress(HMODULE module, LPCSTR name) {
+  const FARPROC found = g_getProcAddress(module, name);
+  // By name only: an ordinal's value fits in the low word.
+  if (found && reinterpret_cast<uintptr_t>(name) > 0xffff && std::strcmp(name, "Direct3DCreate9") == 0) {
+    g_create = reinterpret_cast<CreateFn>(reinterpret_cast<void *>(found));
+    return reinterpret_cast<FARPROC>(reinterpret_cast<void *>(&direct3DCreate9));
+  }
+#if defined(PROXY_GAME_EZ2)
+  if (found && reinterpret_cast<uintptr_t>(name) > 0xffff && std::strcmp(name, "Direct3DCreate9Ex") == 0) {
+    g_createEx = reinterpret_cast<CreateExFn>(reinterpret_cast<void *>(found));
+    proxy::diag::stage("hooked GetProcAddress(Direct3DCreate9Ex)");
+    return reinterpret_cast<FARPROC>(reinterpret_cast<void *>(&direct3DCreate9Ex));
+  }
+#endif
+  return found;
+}
+
 // Rewrites `module`'s IAT entry for dll!name.
 void *patchImport(HMODULE module, const char *dll, const char *name, void *hook) {
   auto *base = reinterpret_cast<uint8_t *>(module);
-  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + reinterpret_cast<IMAGE_DOS_HEADER *>(base)->e_lfanew);
+  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + reinterpret_cast<IMAGE_DOS_HEADER *>(base)->e_lfanew);
   const auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
   for (auto *imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress); imp->Name; ++imp) {
     if (_stricmp(reinterpret_cast<char *>(base + imp->Name), dll) != 0)
       continue;
-    auto *names = reinterpret_cast<IMAGE_THUNK_DATA64 *>(base + imp->OriginalFirstThunk);
-    auto *iat = reinterpret_cast<IMAGE_THUNK_DATA64 *>(base + imp->FirstThunk);
+    auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->OriginalFirstThunk);
+    auto *iat = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
     for (; names->u1.AddressOfData; ++names, ++iat) {
-      if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
+      if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG)
         continue;
       auto *byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(base + names->u1.AddressOfData);
       if (std::strcmp(reinterpret_cast<char *>(byName->Name), name) != 0)
@@ -1802,7 +2457,7 @@ void *patchImport(HMODULE module, const char *dll, const char *name, void *hook)
       DWORD old;
       VirtualProtect(&iat->u1.Function, sizeof(iat->u1.Function), PAGE_READWRITE, &old);
       void *previous = reinterpret_cast<void *>(iat->u1.Function);
-      iat->u1.Function = reinterpret_cast<ULONGLONG>(hook);
+      iat->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
       VirtualProtect(&iat->u1.Function, sizeof(iat->u1.Function), old, &old);
       return previous;
     }
@@ -1819,10 +2474,32 @@ void *patchModuleImport(HMODULE module, const char *dll, const char *name, void 
 bool install(HMODULE module) {
   g_create = reinterpret_cast<CreateFn>(
       patchImport(module, "d3d9.dll", "Direct3DCreate9", reinterpret_cast<void *>(&direct3DCreate9)));
-  return g_create != nullptr;
+#if defined(PROXY_GAME_EZ2)
+  // The shader API asks for Direct3DCreate9Ex by name at run time.
+  g_getProcAddress = reinterpret_cast<GetProcAddressFn>(
+      patchImport(module, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void *>(&getProcAddress)));
+  return g_create != nullptr || g_getProcAddress != nullptr;
+#else
+  if (g_create)
+    return true;
+  g_getProcAddress = reinterpret_cast<GetProcAddressFn>(
+      patchImport(module, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void *>(&getProcAddress)));
+  return g_getProcAddress != nullptr;
+#endif
 }
 
 bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+bool backBufferSize(uint32_t &width, uint32_t &height) {
+  D3DSURFACE_DESC desc = {};
+  if (!g_backBuffer || FAILED(g_backBuffer->GetDesc(&desc)))
+    return false;
+  width = desc.Width;
+  height = desc.Height;
+  return true;
+}
+const void *boundTargetTexture() {
+  return g_renderTargetTexture && g_targetTextures.count(g_renderTargetTexture) ? g_renderTargetTexture : nullptr;
+}
 bool targetTexture(const void *texture, uint32_t &width, uint32_t &height, uint32_t &format) {
   auto it = g_targetTextures.find(texture);
   if (it == g_targetTextures.end())
@@ -1838,6 +2515,22 @@ std::shared_ptr<const std::vector<uint32_t>> shaderCode(const void *shader) {
   return it == g_shaderCode.end() ? nullptr : it->second;
 }
 void requestTargetContents(const void *texture) { wantTargetContents(texture); }
+uint32_t volumeVersion(const void *texture) {
+  std::lock_guard<std::mutex> lock(g_volumeMutex);
+  const auto it = g_volumeCopies.find(texture);
+  return it == g_volumeCopies.end() ? 0 : it->second.version;
+}
+bool volumeCopy(const void *texture, uint32_t &width, uint32_t &height, uint32_t &depth, std::vector<uint8_t> &pixels) {
+  std::lock_guard<std::mutex> lock(g_volumeMutex);
+  const auto it = g_volumeCopies.find(texture);
+  if (it == g_volumeCopies.end())
+    return false;
+  width = it->second.width;
+  height = it->second.height;
+  depth = it->second.depth;
+  pixels = it->second.pixels;
+  return true;
+}
 
 void dumpStatistics(FILE *out) {
   const uint32_t frames = g_stats.frames.exchange(0);
@@ -1883,9 +2576,20 @@ void dumpStatistics(FILE *out) {
             targetread::g_superseded.exchange(0), targetread::g_issueUs.exchange(0) / (issues ? issues : 1) / 1000.0,
             targetread::g_collectUs.exchange(0) / (reads ? reads : 1) / 1000.0, targetread::g_failures.exchange(0));
   }
+  fprintf(out, "   resource classes hooked (native D3D9 has several per interface, DXVK one): vertex buffers %u, index "
+               "buffers %u, textures %u, texture surfaces %u, occlusion queries %u\n",
+          g_vbClasses.classes(), g_ibClasses.classes(), g_textureClasses.classes(), g_surfaceClasses.classes(),
+          g_queryClasses.classes());
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
           g_stats.vsConstCalls.exchange(0) / f);
+  if (game::kFixedFunction)
+    fprintf(out, "   fixed function: DIP without a vertex shader %.1f (layout from SetFVF %.1f) | SetTransform %.1f, "
+                 "SetFVF %.1f, SetTextureStageState %.1f, SetLight %.1f per frame; world matrices set since launch %u; "
+                 "lights enabled now %08X\n",
+            g_stats.fixedDraws.exchange(0) / f, g_stats.fvfDraws.exchange(0) / f, g_stats.setTransforms.exchange(0) / f,
+            g_stats.setFVFs.exchange(0) / f, g_stats.stageStates.exchange(0) / f, g_stats.setLights.exchange(0) / f,
+            ff::g_worldsSet, ff::g_lightsEnabled);
   {
     std::lock_guard<std::mutex> lock(g_vertexProgramLock);
     size_t runnable = 0, expanding = 0;

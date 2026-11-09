@@ -3,6 +3,7 @@
 #include "d3d_hooks.h"
 #include "dxvk_hash.h"
 #include "engine_materials.h"
+#include "game.h"
 #include "texture_formats.h"
 #include "dxso/dxso_module.h"
 #include "dxso/dxso_modinfo.h"
@@ -135,13 +136,19 @@ std::unordered_map<uint64_t, Shader> g_shaders;
 // of their contents uploaded.
 struct Uploaded {
   uint32_t version = 0, width = 0, height = 0;
+  uint64_t lastUse = 0; // g_frame of the last pass sampling it
 };
+// The runtime destroys a host target no pass used for 600 of its replayed
+// frames: one the proxy has not sampled for this many of its frames (never
+// fewer than the runtime's) goes up again when next sampled.
+constexpr uint64_t kReuploadFrames = 300;
 std::unordered_map<const void *, Uploaded> g_uploaded;
 
 struct Statistics {
   uint32_t draws = 0, copies = 0, clears = 0, compiled = 0, failed = 0, uploads = 0, depth = 0, dropped = 0;
   uint32_t noShader = 0, plainTexture = 0, noData = 0, badPrimitive = 0, pruned = 0;
   uint32_t enginePost = 0; // Source's bloom / HDR passes dropped
+  uint32_t always = 0, alwaysRefused = 0, alwaysTarget = 0; // recordAlways: recorded, not, a render target sampled
 } g_stats;
 
 // The proxy's own shaders (src/shaders): the view-depth pass.
@@ -228,6 +235,9 @@ bool lockVolume(const void *object, uint32_t &width, uint32_t &height, uint32_t 
   }
   D3DLOCKED_BOX locked = {};
   if (const HRESULT result = texture->LockBox(0, &locked, nullptr, D3DLOCK_READONLY); FAILED(result) || !locked.pBits) {
+    // A default-pool volume: what the engine wrote to it (Entropy : Zero 2).
+    if (proxy::d3d::volumeCopy(object, width, height, depth, pixels))
+      return true;
     snprintf(why, 64, "volume lock %08lx pool %u", static_cast<unsigned long>(result), unsigned(desc.Pool));
     return false;
   }
@@ -296,6 +306,12 @@ const Shader *shaderFor(const void *object) {
     ::dxvk::DxsoReader reader(reinterpret_cast<const char *>(code->data()));
     ::dxvk::DxsoModule module(reader);
     ::dxvk::DxsoModuleInfo info = {};
+#if defined(PROXY_GAME_EZ2)
+    // DxsoOptions' constructor leaves its members unset: whatever the stack held
+    // (forceSamplerTypeSpecConstants among them) made a shader declare one sampler
+    // type and sample another, which the driver could not run.
+    std::memset(&info.options, 0, sizeof(info.options));
+#endif
     const auto analysis = module.analyze();
     shader.vertex = module.info().type() == ::dxvk::DxsoProgramTypes::VertexShader;
     ::dxvk::D3D9ConstantLayout layout = {};
@@ -352,8 +368,11 @@ struct Pass {
   float projection[2] = {}; // p22, p32 of a depth-tested draw on the frame (its depth test's terms)
   uint64_t vsHash = 0, psHash = 0;
   uint32_t inputMask = 0;
+  bool always = false;     // recordAlways: REMIXAPI_HOST_PASS_ALWAYS_EXT
+  float depthScale = 1;    // its depth test's runtime depth, pushed back by this
 };
 std::vector<Pass> g_passes;
+bool g_sentLast = false; // the last submission had passes
 
 // A full-screen pass of the proxy's own shaders (the view-depth passes).
 Pass fullScreen(remixapi_HostShaderHandleEXT fragment, const float push[2], const char *name) {
@@ -414,7 +433,7 @@ static bool available() {
     char value[8] = {};
     if (GetEnvironmentVariableA("OPENREMIX_PROXY_HOST_PASSES", value, sizeof(value)) && value[0] == '0')
       return false;
-    const HMODULE runtime = GetModuleHandleW(L"remix.dll");
+    const HMODULE runtime = game::runtimeModule();
     if (!runtime)
       return false;
     g_registerShader = reinterpret_cast<PFN_remixapi_RegisterHostShaderEXT>(
@@ -464,11 +483,17 @@ bool wants(const remix::Draw &d) {
 // materials (GMod's Lua effects use pp/ ones). The runtime's post-processing
 // (exposure, bloom, tonemapping) does that job on the path-traced frame, so
 // these are dropped: neither replayed nor drawn. OPENREMIX_PROXY_ENGINE_POST=1
-// keeps them.
+// keeps them. Entropy : Zero 2 keeps them unless it is 0: engine_post applies
+// the colour correction (its night vision, maps' grading) and bloom feeds it.
 bool enginePost(const char *name) {
   static const bool keep = [] {
     char value[8] = {};
-    return GetEnvironmentVariableA("OPENREMIX_PROXY_ENGINE_POST", value, sizeof(value)) && value[0] == '1';
+    const bool set = GetEnvironmentVariableA("OPENREMIX_PROXY_ENGINE_POST", value, sizeof(value)) != 0;
+#if defined(PROXY_GAME_EZ2)
+    return !set || value[0] != '0';
+#else
+    return set && value[0] == '1';
+#endif
   }();
   if (keep || _strnicmp(name, "dev/", 4) != 0)
     return false;
@@ -479,10 +504,33 @@ bool enginePost(const char *name) {
   return false;
 }
 
-bool recordDraw(const remix::Draw &d, const float projection[16]) {
-  if (!enabled())
+// D3DDECLTYPE sizes in bytes (0: unknown).
+static uint32_t elementBytes(BYTE type) {
+  switch (type) {
+  case D3DDECLTYPE_FLOAT1: return 4;
+  case D3DDECLTYPE_FLOAT2: return 8;
+  case D3DDECLTYPE_FLOAT3: return 12;
+  case D3DDECLTYPE_FLOAT4: return 16;
+  case D3DDECLTYPE_D3DCOLOR:
+  case D3DDECLTYPE_UBYTE4:
+  case D3DDECLTYPE_SHORT2:
+  case D3DDECLTYPE_UBYTE4N:
+  case D3DDECLTYPE_SHORT2N:
+  case D3DDECLTYPE_USHORT2N:
+  case D3DDECLTYPE_UDEC3:
+  case D3DDECLTYPE_FLOAT16_2: return 4;
+  case D3DDECLTYPE_SHORT4:
+  case D3DDECLTYPE_SHORT4N:
+  case D3DDECLTYPE_USHORT4N:
+  case D3DDECLTYPE_FLOAT16_4: return 8;
+  default: return 0;
+  }
+}
+
+static bool record(const remix::Draw &d, const float projection[16], bool always, float depthScale) {
+  if (always ? !available() : !enabled())
     return false;
-  if (enginePost(engine_materials::currentName())) {
+  if (!always && enginePost(engine_materials::currentName())) {
     ++g_stats.enginePost;
     return true; // handled: nothing to replay or draw
   }
@@ -542,15 +590,46 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
     const uint32_t location = input->location;
     if (bindingOf[e->Stream] < 0) {
       const auto &s = d.streams[e->Stream];
-      const uint64_t first = uint64_t(s.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * s.stride;
-      const uint64_t bytes = uint64_t(d.numVertices) * s.stride;
-      if (!s.data || !s.stride || first + bytes > s.size || bytes > (16u << 20)) {
-        ++g_stats.noData;
-        return false;
+      // An engine overlay's (recordAlways) stream every vertex reads alike
+      // (stride 0), or one the proxy has no copy of that holds only flex
+      // deltas (POSITION1, NORMAL1: studio models' morph stream, zeros when
+      // the model is not flexed): one element per vertex, replicated or zero.
+      uint32_t span = 0;
+      bool deltasOnly = true;
+      for (const D3DVERTEXELEMENT9 *o = d.elements; o->Stream != 0xFF; ++o)
+        if (o->Stream == e->Stream) {
+          span = std::max<uint32_t>(span, o->Offset + elementBytes(o->Type));
+          deltasOnly &= (o->Usage == D3DDECLUSAGE_POSITION || o->Usage == D3DDECLUSAGE_NORMAL) && o->UsageIndex > 0;
+        }
+      const bool constant = always && span && ((s.data && !s.stride && uint64_t(s.offset) + span <= s.size) ||
+                                               (!s.data && deltasOnly));
+      if (constant) {
+        span = (span + 3) & ~3u;
+        if (uint64_t(d.numVertices) * span > (16u << 20)) {
+          ++g_stats.noData;
+          return false;
+        }
+        bindingOf[e->Stream] = int(pass.vertexData.size());
+        std::vector<uint8_t> bytes(size_t(d.numVertices) * span, 0);
+        if (s.data)
+          for (uint32_t v = 0; v < d.numVertices; ++v)
+            std::memcpy(bytes.data() + size_t(v) * span, s.data + s.offset, span);
+        pass.vertexBindings.push_back({nullptr, uint32_t(bytes.size()), span});
+        pass.vertexData.push_back(std::move(bytes));
+      } else {
+        const uint64_t first = uint64_t(s.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * s.stride;
+        const uint64_t bytes = uint64_t(d.numVertices) * s.stride;
+        if (!s.data || !s.stride || first + bytes > s.size || bytes > (16u << 20)) {
+          ++g_stats.noData;
+          if (always && g_dump)
+            fprintf(g_dump, "host skip %s: stream %u without data (stride %u size %u)\n",
+                    engine_materials::currentName(), unsigned(e->Stream), s.stride, s.size);
+          return false;
+        }
+        bindingOf[e->Stream] = int(pass.vertexData.size());
+        pass.vertexData.emplace_back(s.data + first, s.data + first + bytes);
+        pass.vertexBindings.push_back({nullptr, uint32_t(bytes), s.stride});
       }
-      bindingOf[e->Stream] = int(pass.vertexData.size());
-      pass.vertexData.emplace_back(s.data + first, s.data + first + bytes);
-      pass.vertexBindings.push_back({nullptr, uint32_t(bytes), s.stride});
     }
     pass.attributes.push_back({location, uint32_t(bindingOf[e->Stream]), format, e->Offset});
   }
@@ -581,6 +660,15 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
       } else {
         const auto type = const_cast<IDirect3DBaseTexture9 *>(static_cast<const IDirect3DBaseTexture9 *>(texture))->GetType();
         if (d.textureTargets & (1u << n)) {
+          if (always) {
+            // The engine's own render targets (a refraction of the frame)
+            // have no contents on the runtime's side while the setting is off.
+            ++g_stats.alwaysTarget;
+            if (g_dump)
+              fprintf(g_dump, "host skip %s: sampler %u render-target texture %p (always pass)\n",
+                      engine_materials::currentName(), n, texture);
+            return false;
+          }
           used(texture);
         } else {
           // A plain texture: its contents go up as a host target, once per
@@ -590,7 +678,9 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
           if (type == D3DRTYPE_VOLUMETEXTURE) {
             // A volume: read through D3D once, up as a sampled-only target.
             auto &uploaded = g_uploaded[texture];
-            if (uploaded.version != 1) {
+            // The engine's writes to a volume it keeps in the default pool (0: read once).
+            const uint32_t volumeVersion = std::max(proxy::d3d::volumeVersion(texture), 1u);
+            if (uploaded.version != volumeVersion || uploaded.lastUse + kReuploadFrames < g_frame) {
               std::vector<uint8_t> pixels;
               uint32_t depth = 0;
               char why[64] = "no volume support in the runtime";
@@ -608,10 +698,11 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
                           n, texture, why);
                 return false;
               }
-              uploaded = {1, width, height};
+              uploaded = {volumeVersion, width, height, g_frame};
               g_established.insert(texture);
               ++g_stats.uploads;
             }
+            uploaded.lastUse = g_frame;
           } else if (type != D3DRTYPE_TEXTURE) {
             ++g_stats.plainTexture;
             if (g_dump)
@@ -625,7 +716,8 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
           if (!copied)
             version = 1;
           auto &uploaded = g_uploaded[texture];
-          if (uploaded.version != version || (copied && (uploaded.width != width || uploaded.height != height))) {
+          if (uploaded.version != version || (copied && (uploaded.width != width || uploaded.height != height)) ||
+              uploaded.lastUse + kReuploadFrames < g_frame) {
             std::vector<uint8_t> pixels;
             char why[64] = "unsupported copy";
             if (!(copied ? remix::texturePixels(texture, width, height, version, bgra, &pixels)
@@ -639,10 +731,11 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
                         texture, why);
               return false;
             }
-            uploaded = {version, width, height};
+            uploaded = {version, width, height, g_frame};
             g_established.insert(texture);
             ++g_stats.uploads;
           }
+          uploaded.lastUse = g_frame;
           }
         }
         sampler.target = reinterpret_cast<uint64_t>(texture);
@@ -747,8 +840,18 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
   pass.vsHash = vs->hash;
   pass.psHash = ps->hash;
   pass.inputMask = vs->inputMask;
+  pass.always = always;
+  pass.depthScale = depthScale > 0 ? depthScale : 1;
   g_passes.push_back(std::move(pass));
   return true;
+}
+
+bool recordDraw(const remix::Draw &d, const float projection[16]) { return record(d, projection, false, 1); }
+
+bool recordAlways(const remix::Draw &d, const float projection[16], float depthScale) {
+  const bool recorded = record(d, projection, true, depthScale);
+  ++(recorded ? g_stats.always : g_stats.alwaysRefused);
+  return recorded;
 }
 
 bool recordDepth(const remix::Draw &d) {
@@ -817,14 +920,26 @@ void recordClear(const void *target, uint32_t argb) {
 void submit(FILE *dump) {
   poll();
   if (!enabled()) {
-    g_passes.clear(); // recorded before the setting went off
-    return;
+    // The setting off: only the passes the runtime replays regardless
+    // (recordAlways); the rest were recorded before it went off.
+    g_passes.erase(std::remove_if(g_passes.begin(), g_passes.end(), [](const Pass &pass) { return !pass.always; }),
+                   g_passes.end());
+    if (g_passes.empty()) {
+      if (g_sentLast && available()) { // replaces what an unreplayed frame left pending
+        remixapi_HostPassListEXT none = {};
+        none.sType = REMIXAPI_STRUCT_TYPE_HOST_PASS_LIST_EXT;
+        g_submit(&none);
+      }
+      g_sentLast = false;
+      g_dump = dump;
+      return;
+    }
   }
   ++g_frame;
   g_dump = dump;
   // A frame the runtime did not replay (loading) dropped its passes: what
   // they wrote (a clear of a target made once at startup) has to be redone.
-  static bool sentLast = false;
+  bool &sentLast = g_sentLast;
   if (sentLast && g_statistics) {
     remixapi_HostPassStatisticsEXT ran = {};
     ran.structSize = sizeof(ran);
@@ -838,9 +953,23 @@ void submit(FILE *dump) {
   // frame itself is always a live target.
   std::vector<remixapi_HostPassEXT> list;
   list.reserve(g_passes.size() + 4);
-  std::vector<Pass> fills; // the frame-depth fill pass, whose data `list` points into
-  fills.reserve(2);
+  // REMIXAPI_HOST_PASS_* flags of `list`'s passes (a pass's clears and depth
+  // fill take its own).
+  std::vector<uint32_t> flags;
+  flags.reserve(g_passes.size() + 4);
+  bool anyFlags = false;
+  auto push = [&](const remixapi_HostPassEXT &info, bool always) {
+    list.push_back(info);
+    flags.push_back(always ? REMIXAPI_HOST_PASS_ALWAYS_EXT : 0u);
+    anyFlags |= always;
+  };
+  // The frame-depth fill passes, whose data `list` points into: one at the
+  // first depth-tested draw, another where a draw wants the depth pushed
+  // back by a different factor (Pass::depthScale).
+  std::vector<Pass> fills;
+  fills.reserve(4);
   bool frameDepthFilled = false;
+  float filledScale = 1;
   for (auto &pass : g_passes) {
     auto &info = pass.info;
     if (info.kind != REMIXAPI_HOST_PASS_DRAW_EXT && info.target) {
@@ -865,7 +994,7 @@ void submit(FILE *dump) {
           clear.clearColor[2] = (color->second & 0xff) / 255.f;
           clear.clearColor[3] = (color->second >> 24) / 255.f;
         }
-        list.push_back(clear);
+        push(clear, pass.always);
         g_established.insert(sampled);
         ++g_stats.clears;
         if (dump)
@@ -873,12 +1002,15 @@ void submit(FILE *dump) {
       }
     if (info.target && info.target < REMIXAPI_HOST_TARGET_RESERVED_EXT)
       g_established.insert(reinterpret_cast<const void *>(info.target));
-    if (info.kind == REMIXAPI_HOST_PASS_DRAW_EXT && info.depth && !frameDepthFilled) {
-      // The frame's depth from the runtime's, in this draw's projection.
+    if (info.kind == REMIXAPI_HOST_PASS_DRAW_EXT && info.depth &&
+        (!frameDepthFilled || pass.depthScale != filledScale)) {
+      // The frame's depth from the runtime's, in this draw's projection
+      // (device z = p22 + p32 / depth: depth scaled by k is p32 / k).
       if (!depthShaders()) {
         info.depth = 0; // drawn without the test
       } else {
-        Pass fillPass = fullScreen(g_frameDepthFragment, pass.projection, "(frame depth)");
+        const float terms[2] = {pass.projection[0], pass.projection[1] / pass.depthScale};
+        Pass fillPass = fullScreen(g_frameDepthFragment, terms, "(frame depth)");
         fillPass.info.target = REMIXAPI_HOST_TARGET_FRAME_DEPTH_EXT;
         fillPass.info.depth = (uint32_t(VK_COMPARE_OP_ALWAYS) + 1) | REMIXAPI_HOST_DEPTH_WRITE_EXT;
         fillPass.info.colorWriteMask = 0;
@@ -896,12 +1028,13 @@ void submit(FILE *dump) {
         fi.attributeCount = 1;
         fi.indices = fillPass.indices.data();
         fi.indexCount = 3;
-        list.push_back(fi);
+        push(fi, pass.always);
         fills.push_back(std::move(fillPass)); // keeps the data alive until submitted
         frameDepthFilled = true;
+        filledScale = pass.depthScale;
         ++g_stats.draws;
         if (dump)
-          fprintf(dump, "host draw (frame depth) p22=%g p32=%g\n", pass.projection[0], pass.projection[1]);
+          fprintf(dump, "host draw (frame depth) p22=%g p32=%g scale=%g\n", terms[0], terms[1], pass.depthScale);
       }
     }
     if (info.kind == REMIXAPI_HOST_PASS_DRAW_EXT) {
@@ -928,9 +1061,10 @@ void submit(FILE *dump) {
       ++g_stats.clears;
     if (dump) {
       if (info.kind == REMIXAPI_HOST_PASS_DRAW_EXT) {
-        fprintf(dump, "host draw %s target=%llx %ux%u vs=%016llx ps=%016llx samplers=%u blend=%d %u/%u depth=%x verts=%u idx=%u "
+        fprintf(dump, "host draw%s %s target=%llx %ux%u vs=%016llx ps=%016llx samplers=%u blend=%d %u/%u depth=%x verts=%u idx=%u "
                       "viewport=%d,%d %dx%d inputs=%x attributes:",
-                pass.name.c_str(), (unsigned long long)info.target, info.targetWidth, info.targetHeight,
+                pass.always ? " (always)" : "", pass.name.c_str(), (unsigned long long)info.target, info.targetWidth,
+                info.targetHeight,
                 (unsigned long long)pass.vsHash, (unsigned long long)pass.psHash, info.samplerCount,
                 int(info.blendEnable), info.srcColorBlend, info.dstColorBlend, info.depth,
                 info.vertexBindingCount ? info.vertexBindings[0].bytes / info.vertexBindings[0].stride : 0,
@@ -972,12 +1106,20 @@ void submit(FILE *dump) {
       else
         fprintf(dump, "host clear %llx\n", (unsigned long long)info.target);
     }
-    list.push_back(info);
+    push(info, pass.always);
   }
   remixapi_HostPassListEXT submission = {};
   submission.sType = REMIXAPI_STRUCT_TYPE_HOST_PASS_LIST_EXT;
   submission.passes = list.data();
   submission.passCount = uint32_t(list.size());
+  // The flags only when a pass has one: the list an older runtime takes as before.
+  remixapi_HostPassListFlagsEXT passFlags = {};
+  if (anyFlags) {
+    passFlags.sType = REMIXAPI_STRUCT_TYPE_HOST_PASS_LIST_FLAGS_EXT;
+    passFlags.flags = flags.data();
+    passFlags.flagCount = uint32_t(flags.size());
+    submission.pNext = &passFlags;
+  }
   g_submit(&submission);
   sentLast = !list.empty();
   g_passes.clear();
@@ -993,20 +1135,22 @@ void dumpStatistics(FILE *out) {
   fprintf(out,
           "== Host passes (%s): draws %u (view depth %u) copies %u clears %u pruned %u uploads %u frames dropped %u | "
           "Source bloom/HDR passes dropped %u | shaders compiled %u failed %u | skipped: no shader %u plain texture %u "
-          "no data %u primitive %u\n",
+          "no data %u primitive %u | always (engine overlays, any setting): recorded %u refused %u (render target "
+          "sampled %u)\n",
           g_enabled ? "on" : available() ? "off: Pass-through game shaders setting" : "unavailable", g_stats.draws,
           g_stats.depth, g_stats.copies, g_stats.clears, g_stats.pruned, g_stats.uploads, g_stats.dropped, g_stats.enginePost, g_stats.compiled, g_stats.failed, g_stats.noShader, g_stats.plainTexture, g_stats.noData,
-          g_stats.badPrimitive);
+          g_stats.badPrimitive, g_stats.always, g_stats.alwaysRefused, g_stats.alwaysTarget);
   remixapi_HostPassStatisticsEXT runtime = {};
   runtime.structSize = sizeof(runtime);
   if (g_statistics && g_statistics(&runtime) == REMIXAPI_ERROR_CODE_SUCCESS)
     fprintf(out,
             "   runtime last frame: passes %u draws %u copies %u clears %u skipped %u (copy source %u shaders %u pipeline %u "
-            "descriptors %u buffer %u sampler %u target %u view depth %u) | shaders %u targets %u pipelines %u\n",
+            "descriptors %u buffer %u sampler %u target %u view depth %u) | shaders %u targets %u pipelines %u | "
+            "last submission: always %u, dropped (setting off) %u\n",
             runtime.passes, runtime.draws, runtime.copies, runtime.clears, runtime.skipped, runtime.skippedCopySource,
             runtime.skippedShaders, runtime.skippedPipeline, runtime.skippedDescriptors, runtime.skippedBuffer,
             runtime.skippedSampler, runtime.skippedTarget, runtime.skippedViewDepth, runtime.shaders, runtime.targets,
-            runtime.pipelines);
+            runtime.pipelines, runtime.always, runtime.dropped);
   const uint32_t compiled = g_stats.compiled, failed = g_stats.failed;
   g_stats = {};
   g_stats.compiled = compiled;

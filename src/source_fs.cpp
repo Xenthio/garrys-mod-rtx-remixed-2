@@ -1,5 +1,6 @@
 #include "source_fs.h"
 
+#include "game.h"
 #include "lzma_source.h"
 
 #include <windows.h>
@@ -184,11 +185,39 @@ void addVpk(const std::wstring &dirFile) {
     g_paths.push_back({{}, std::move(vpk)});
 }
 
+#if defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_TF2) || defined(PROXY_GAME_EZ2)
+// A "directory/*" search path: its subdirectories loose and its packages
+// (<name>_dir.vpk), in alphabetical order as the engine mounts them.
+void addEach(const std::wstring &directory) {
+  std::vector<std::pair<std::wstring, bool>> entries; // name, is a directory
+  WIN32_FIND_DATAW found;
+  HANDLE find = FindFirstFileW((g_root + L"\\" + directory + L"\\*").c_str(), &found);
+  if (find == INVALID_HANDLE_VALUE)
+    return;
+  do {
+    const std::wstring name = found.cFileName;
+    const bool folder = (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if (folder ? name[0] != L'.'
+               : name.size() > 8 && _wcsicmp(name.c_str() + name.size() - 8, L"_dir.vpk") == 0)
+      entries.emplace_back(name, folder);
+  } while (FindNextFileW(find, &found));
+  FindClose(find);
+  std::sort(entries.begin(), entries.end(),
+            [](const auto &a, const auto &b) { return _wcsicmp(a.first.c_str(), b.first.c_str()) < 0; });
+  for (const auto &[name, folder] : entries)
+    folder ? addLoose(directory + L"\\" + name) : addVpk(directory + L"\\" + name);
+}
+#endif
+
 // GMod's own file system (filesystem_stdio IBaseFileSystem, VBaseFileSystem011)
 // for what the proxy's index lacks: workshop addons (steamapps/workshop/.gma,
 // LZMA legacy archives), mounted games, downloads. Slots: Read 0, Open 2,
 // Close 3, Seek 4, Tell 5 (Size's two overloads are not relied on).
+// L4D2, Half-Life 2 RTX, TF2, Portal 2: not asked (its slots are not verified
+// there); the index is all.
 void *engineFileSystem() {
+  if (!game::kGMod)
+    return nullptr;
   static void *fs = nullptr;
   if (!fs) {
     using CreateInterfaceFn = void *(*)(const char *, int *);
@@ -205,11 +234,11 @@ bool engineRead(const std::string &path, std::vector<uint8_t> *out, uint64_t off
   if (!fs)
     return false;
   void **vt = *static_cast<void ***>(fs);
-  using OpenFn = void *(*)(void *, const char *, const char *, const char *);
-  using CloseFn = void (*)(void *, void *);
-  using SeekFn = void (*)(void *, void *, long long, int);
-  using TellFn = unsigned int (*)(void *, void *);
-  using ReadFn = int (*)(void *, void *, int, void *);
+  using OpenFn = void *(PROXY_THISCALL *)(void *, const char *, const char *, const char *);
+  using CloseFn = void(PROXY_THISCALL *)(void *, void *);
+  using SeekFn = void(PROXY_THISCALL *)(void *, void *, long long, int);
+  using TellFn = unsigned int(PROXY_THISCALL *)(void *, void *);
+  using ReadFn = int(PROXY_THISCALL *)(void *, void *, int, void *);
   void *file = reinterpret_cast<OpenFn>(vt[2])(fs, path.c_str(), "rb", "GAME");
   if (!file)
     return false;
@@ -249,6 +278,7 @@ void index() {
   if (g_indexed)
     return;
   g_indexed = true;
+#ifdef PROXY_GAME_GMOD
   // garrysmod/gameinfo.txt SearchPaths (GMod x64 layout: the exe sits in the
   // game root). Loose addon folders (not .gma archives) come first.
   WIN32_FIND_DATAW found;
@@ -273,6 +303,74 @@ void index() {
   addVpk(L"sourceengine\\content_hl2_dir.vpk");
   addVpk(L"sourceengine\\content_cstrike_dir.vpk");
   addVpk(L"garrysmod\\fallbacks_dir.vpk");
+#elif defined(PROXY_GAME_L4D2)
+  // left4dead2/gameinfo.txt SearchPaths: each directory loose, then its
+  // pak01_dir.vpk.
+  for (const wchar_t *dir : {L"update", L"left4dead2_dlc3", L"left4dead2_dlc2", L"left4dead2_dlc1", L"left4dead2",
+                             L"hl2"}) {
+    addLoose(dir);
+    addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
+  }
+#elif defined(PROXY_GAME_TF2)
+  // tf/gameinfo.txt SearchPaths (game paths, in order; TF2 x64 layout: the
+  // exe sits in the game root): tf/custom/*, TF2's packages, Half-Life 2's
+  // and the platform's, then tf, hl2 and platform loose, downloads last.
+  addEach(L"tf\\custom");
+  for (const wchar_t *vpk : {L"tf2_textures", L"tf2_sound_vo_english", L"tf2_sound_misc", L"tf2_misc"})
+    addVpk(std::wstring(L"tf\\") + vpk + L"_dir.vpk");
+  for (const wchar_t *vpk : {L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
+    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(L"platform\\platform_misc_dir.vpk");
+  addLoose(L"tf");
+  addLoose(L"hl2");
+  addLoose(L"platform");
+  addLoose(L"tf\\download");
+#elif defined(PROXY_GAME_PORTAL2)
+  // portal2/gameinfo.txt has the mod alone ("|gameinfo_path|."); the engine
+  // mounts update and the DLC folders before it (the highest first, as L4D2
+  // does), platform after it. Each directory loose, then its pak01_dir.vpk.
+  for (const wchar_t *dir : {L"update", L"portal2_dlc2", L"portal2_dlc1", L"portal2", L"platform"}) {
+    addLoose(dir);
+    addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
+  }
+#elif defined(PROXY_GAME_HL2RTX)
+  // hl2rtx/gameinfo.txt SearchPaths (game paths, in order): hl2rtx/custom/*,
+  // the mod, Half-Life 2's packages, Mapbase's (mapbase_hl2/*, its shared
+  // content), then hl2 and platform loose.
+  addEach(L"hl2rtx\\custom");
+  addLoose(L"hl2rtx");
+  for (const wchar_t *vpk : {L"hl2_sound_vo_english", L"hl2_pak", L"hl2_textures", L"hl2_sound_misc", L"hl2_misc"})
+    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(L"platform\\platform_misc_dir.vpk");
+  addEach(L"hl2rtx\\mapbase\\mapbase_hl2");
+  addVpk(L"hl2rtx\\mapbase\\mapbase_shared\\shared_content_v7_0_dir.vpk");
+  addLoose(L"hl2");
+  addLoose(L"platform");
+#elif defined(PROXY_GAME_EZ2)
+  // Entropy : Zero 2 search paths (entropyzero2/gameinfo.txt)
+  addEach(L"entropyzero2\\custom");
+  addEach(L"ep2\\custom");
+  addEach(L"episodic\\custom");
+  addEach(L"hl2\\custom");
+  // Workshop addons (|gameinfo_path|../../../workshop/content/1583720/*).
+  addEach(L"..\\..\\workshop\\content\\1583720");
+  addEach(L"entropyzero2\\ez2");
+  addLoose(L"entropyzero2");
+  addEach(L"mapbase\\episodic");
+  addEach(L"mapbase\\hl2");
+  addEach(L"mapbase\\css_weapons_in_hl2\\content");
+  addLoose(L"mapbase\\css_weapons_in_hl2");
+  addVpk(L"mapbase\\shared\\shared_content_v7_0_dir.vpk");
+  addVpk(L"ep2\\ep2_pak_dir.vpk");
+  addVpk(L"episodic\\ep1_pak_dir.vpk");
+  for (const wchar_t *vpk : {L"hl2_pak", L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
+    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(L"platform\\platform_misc_dir.vpk");
+  addLoose(L"ep2");
+  addLoose(L"episodic");
+  addLoose(L"hl2");
+  addLoose(L"platform");
+#endif
 }
 
 } // namespace
