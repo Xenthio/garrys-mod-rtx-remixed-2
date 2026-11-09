@@ -37,6 +37,11 @@ Multiplayer works out of the box since everything lives in the wrapper.
 - Select `Start Quick Install` on the main screen and follow the prompts when asked.
 - Once it's finished, press `Launch Game` at the bottom of the launcher.
 
+### Workshop RTX content (Map remasters)
+RTX Remix mods could be packed as workshop addons, refer to [GMod native loader content package](https://github.com/SheepyLord/Gmod-Workshop-RTX-Remix/blob/main/docs/PACKAGE_FORMAT.md):
+A few example PBR maps could be downloaded from: 
+[RTX-Remix Collection](https://steamcommunity.com/workshop/filedetails/?id=3834474695). 
+
 ## Credits
 * Jane for helping me make the logo.
 * Xenthio for ToPBR, Foward+, and general guidance

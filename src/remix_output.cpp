@@ -22,6 +22,9 @@
 #include "shader_tables.h"
 #include "texture_categories.h"
 #include "vb_origins.h"
+#ifdef PROXY_GAME_GMOD
+#include "workshop_content.h"
+#endif
 #include <unordered_set>
 
 #include "texture_formats.h"
@@ -3613,6 +3616,24 @@ void serviceScreenshotRequest() {
   g_api.RequestPresentedScreenshot(path);
 }
 
+// `path` in the ANSI code page, as the runtime takes the mods directory (a
+// char string it opens with std::filesystem). Empty: the code page cannot
+// name it.
+std::string ansiPath(const std::wstring &path) {
+  if (path.empty())
+    return {};
+  const bool utf8 = GetACP() == CP_UTF8;
+  const DWORD flags = utf8 ? 0 : WC_NO_BEST_FIT_CHARS;
+  BOOL lossy = FALSE;
+  const int n = WideCharToMultiByte(CP_ACP, flags, path.data(), int(path.size()), nullptr, 0, nullptr,
+                                    utf8 ? nullptr : &lossy);
+  if (n <= 0 || lossy)
+    return {};
+  std::string out(size_t(n), '\0');
+  WideCharToMultiByte(CP_ACP, flags, path.data(), int(path.size()), out.data(), n, nullptr, nullptr);
+  return out;
+}
+
 bool startRemix() {
   wchar_t path[MAX_PATH];
   HMODULE self = nullptr;
@@ -3643,6 +3664,11 @@ bool startRemix() {
   startup.hwnd = g_gameWindow;
   // Before SDL wraps the window in Startup: the game's own window procedure.
   const auto gameProc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(g_gameWindow, GWLP_WNDPROC));
+#ifdef PROXY_GAME_GMOD
+  // Subscribed Workshop content packages unpack their mods first: Startup
+  // already reads the mods directory.
+  proxy::workshop::finish();
+#endif
   diag::stage("OpenRemix: Startup (window %p): Vulkan device and swapchain", static_cast<void *>(g_gameWindow));
   if (const auto status = g_api.Startup(&startup); status != REMIXAPI_ERROR_CODE_SUCCESS) {
     diag::stage("OpenRemix: Startup FAILED (remixapi_ErrorCode %d)", int(status));
@@ -3654,22 +3680,18 @@ bool startRemix() {
   char backend[32] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_BACKEND", backend, sizeof(backend)))
     g_api.SetConfigVariable("rtx.native.backend", backend);
-  // USD mod replacements from the game's rtx-remix/mods (OPENREMIX_PROXY_MODS:
-  // another directory, or 0 to disable). Z up.
+  // USD mod replacements from the game's rtx-remix/mods (modsDirectory). Z up.
   {
-    char mods[MAX_PATH * 2] = {};
-    if (!GetEnvironmentVariableA("OPENREMIX_PROXY_MODS", mods, sizeof(mods))) {
-      GetModuleFileNameA(nullptr, mods, MAX_PATH);
-      *strrchr(mods, '\\') = 0;
-      strcat(mods, "\\rtx-remix\\mods");
-    }
+    const std::string mods = ansiPath(modsDirectory());
+    if (mods.empty())
+      diag::stage("OpenRemix: no USD mods (OPENREMIX_PROXY_MODS=0, or a directory the ANSI code page cannot name)");
     auto configure = reinterpret_cast<decltype(&remixapi_ConfigureUSDModsEXT)>(
         GetProcAddress(game::runtimeModule(), "remixapi_ConfigureUSDModsEXT"));
-    if (configure && std::strcmp(mods, "0") != 0) {
+    if (configure && !mods.empty()) {
       remixapi_USDModsOptionsEXT options = {};
       options.structSize = sizeof(options);
       options.version = 1;
-      options.directory = mods;
+      options.directory = mods.c_str();
       // Remix captures and mods declare metersPerUnit 0.01 but hold game units,
       // which dxvk-remix applies unscaled: match the declaration.
       options.hostMetersPerUnit = 0.01;
@@ -3739,6 +3761,27 @@ bool enabled() {
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY", v, sizeof(v)) && v[0] == '0');
   }();
   return on;
+}
+
+std::wstring modsDirectory() {
+  static const std::wstring dir = [] {
+    std::wstring value(32768, L'\0'), found;
+    const DWORD n = GetEnvironmentVariableW(L"OPENREMIX_PROXY_MODS", value.data(), DWORD(value.size()));
+    if (n && n < value.size()) {
+      value.resize(n);
+      if (value == L"0")
+        return std::wstring();
+      std::wstring full(32768, L'\0');
+      const DWORD m = GetFullPathNameW(value.c_str(), DWORD(full.size()), full.data(), nullptr);
+      found = m && m < full.size() ? full.substr(0, m) : value;
+    } else {
+      std::wstring exe(32768, L'\0');
+      exe.resize(GetModuleFileNameW(nullptr, exe.data(), DWORD(exe.size())));
+      found = exe.substr(0, exe.find_last_of(L"\\/")) + L"\\rtx-remix\\mods";
+    }
+    return ansiPath(found).empty() ? std::wstring() : found;
+  }();
+  return dir;
 }
 
 void setShaderApi(void *real) { g_shaderApi = real; }
@@ -3985,6 +4028,10 @@ void onDeviceCreated(IDirect3DDevice9 *) {
   diag::stage("Direct3D device created");
   g_ready = startRemix();
   diag::stage("OpenRemix: start-up %s", g_ready ? "complete" : "FAILED: the game goes on without it");
+#ifdef PROXY_GAME_GMOD
+  if (!g_ready)
+    proxy::workshop::runtimeFailed(); // what needs a runtime is hidden from here on
+#endif
 }
 
 // Census of the draws that depend on what the proxy does not reproduce: a

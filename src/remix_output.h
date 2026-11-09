@@ -4,6 +4,7 @@
 #include <d3d9.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <cstdio>
 
@@ -119,6 +120,10 @@ struct Draw {
 };
 
 bool enabled();
+// The directory the runtime reads USD mods from: OPENREMIX_PROXY_MODS (0:
+// none), else rtx-remix\mods beside the game's executable. Empty: none, also
+// when the ANSI code page the runtime takes it in cannot name it.
+std::wstring modsDirectory();
 
 // A texture's contents as the proxy keeps them (its CPU copy): size, the
 // version its contents are at, whether the pixels are BGRA (else RGBA) and,
