@@ -174,6 +174,11 @@ std::string materialName(uint64_t textureHash);
 // material system's name; null for other materials, before a map is read or
 // with OPENREMIX_PROXY_MIRRORS=0. Render thread.
 remixapi_MaterialHandle mirrorMaterial(const char *materialName);
+// Whether a material (as the material system names it) is a water surface's
+// $bottommaterial by its VMT: "$abovewater" "0", the surface as seen from
+// below. (The engine keeps no such parameter on a LightmappedGeneric one, so
+// the file is read; once per name.) Render thread.
+bool waterBottomMaterial(const char *materialName);
 // Whether reflective glass is path traced (OPENREMIX_PROXY_MIRRORS, default on).
 bool mirrorsOn();
 
