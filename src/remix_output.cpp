@@ -101,6 +101,7 @@ struct Stats {
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, wireframeDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
   // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
+  std::atomic<uint32_t> waterBottomsDropped{0};
   std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0}, windowImpostersDropped{0};
   std::atomic<uint32_t> glowDraws{0}, glowSources{0};
   std::atomic<uint32_t> pbrDraws{0}, pbrNormalDraws{0}, pbrMapDraws{0}, pbrMetalDraws{0}, pbrNotBase{0}, pbrMapsMissing{0}, pbrCreated{0};
@@ -6312,6 +6313,22 @@ void onDraw(const Draw &d) {
     return;
   }
 #endif
+  // A water surface's $bottommaterial ($abovewater 0: the surface as seen
+  // from below) drawn while the camera is above the water: Source shows it
+  // only from below, yet draws it in some frames (HL:Source undertow's moving
+  // water: liquids/water_tentacle_beneath over its top, z-fighting with it).
+  // OPENREMIX_PROXY_WATER_BOTTOMS=1 keeps them.
+  static const bool waterBottoms = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_BOTTOMS", v, sizeof(v)) && v[0] == '1';
+  }();
+  if (!waterBottoms && !g_cameraInWater && engine_materials::bound().known) {
+    float aboveWater = 1;
+    if (engine_materials::currentFloat("$abovewater", aboveWater) && aboveWater == 0) {
+      ++g_stats.waterBottomsDropped;
+      return;
+    }
+  }
   uint64_t instanceView = viewKey;
   const float (*cameraToWorld)[4] = nullptr;
   if (view.cameraSpace) {
@@ -9921,10 +9938,11 @@ void dumpStatistics(FILE *out) {
     fprintf(out,
             "   under water (bsp water leaves at the eye; OPENREMIX_PROXY_UNDERWATER): %.0f%% of frames | flat Refract "
             "screen effects dropped per frame %.1f | window imposters and faded-out brushes dropped %.1f | entity glow "
-            "draws %.1f, taken as halo sources %.1f\n",
+            "draws %.1f, taken as halo sources %.1f | water bottom materials ($abovewater 0) dropped above water %.1f "
+            "(OPENREMIX_PROXY_WATER_BOTTOMS)\n",
             100.0 * g_stats.underwaterFrames.exchange(0) / std::max(1.0, f), g_stats.refractOverlaysDropped.exchange(0) / f,
             g_stats.windowImpostersDropped.exchange(0) / f, g_stats.glowDraws.exchange(0) / f,
-            g_stats.glowSources.exchange(0) / f);
+            g_stats.glowSources.exchange(0) / f, g_stats.waterBottomsDropped.exchange(0) / f);
     fprintf(out,
             "   PBR conversions (pbr_rules; OPENREMIX_PROXY_PBR=%d) per frame: %.1f draws, with a normal map %.1f, a "
             "roughness map %.1f, a metal map %.1f | stayed diffuse: not the material's base texture %.1f | a map not uploaded %.1f | "
