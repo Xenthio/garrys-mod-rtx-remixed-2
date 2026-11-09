@@ -1627,12 +1627,19 @@ int materialByName(const std::string &name, bool brush) {
     if (digits != std::string::npos)
       std::sscanf(color.c_str() + digits, "%f %f %f", &fog[0], &fog[1], &fog[2]);
     const float fogEnd = kv.values.count("$fogend") ? float(std::atof(kv.values["$fogend"].c_str())) : 128;
+    // Seen from above, Source fogs the water in its refraction view with
+    // height fog: the length of the view ray under the surface over
+    // $fogend - $fogstart ($fogstart is no offset there; water_ps2x_helper.h,
+    // CalcWaterFogAlpha). gm_bigcity_improved's canals (-100 to 100) fog over
+    // 200 units, not 100.
+    const float fogStart = kv.values.count("$fogstart") ? float(std::atof(kv.values["$fogstart"].c_str())) : 0;
+    const float fogRange = std::max(fogStart < fogEnd ? fogEnd - fogStart : fogEnd, 1.0f);
     remixapi_MaterialInfoOpaqueEXT opaque = {};
     opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
     opaque.albedoConstant = {std::pow(std::clamp(fog[0], 0.0f, 255.0f) / 255, 2.2f),
                              std::pow(std::clamp(fog[1], 0.0f, 255.0f) / 255, 2.2f),
                              std::pow(std::clamp(fog[2], 0.0f, 255.0f) / 255, 2.2f)};
-    opaque.opacityConstant = std::clamp(0.35f + 40.0f / std::max(fogEnd, 1.0f), 0.35f, 0.9f);
+    opaque.opacityConstant = std::clamp(0.35f + 40.0f / fogRange, 0.35f, 0.9f);
     opaque.roughnessConstant = 0.05f;
     opaque.alphaTestType = 7;
     // Mods made for the fixed-function compatibility mod replace water by
@@ -1716,7 +1723,9 @@ int materialByName(const std::string &name, bool brush) {
     remixapi_MaterialTranslucentFogEXT fade = {};
     fade.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_TRANSLUCENT_FOG_EXT;
     fade.pNext = opaque.pNext;
-    fade.fogEnd = std::max(fogEnd, 1.0f);
+    // The shader blends toward the fog color by that fraction less 0.05.
+    fade.fogStart = 0.05f * fogRange;
+    fade.fogEnd = 1.05f * fogRange;
     // $refracttint multiplies the refraction image, gamma-encoded as Source
     // samples it: linear, its 2.2 power ({}: 0-255, []: 0-1).
     float refractTint[3] = {1, 1, 1};
@@ -1732,7 +1741,7 @@ int materialByName(const std::string &name, bool brush) {
     {
       const auto &c = opaque.albedoConstant;
       const float luminance = std::clamp(0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z, 1e-4f, 0.95f);
-      translucent.transmittanceMeasurementDistance = std::max(fogEnd, 1.0f) * std::log(luminance) / std::log(0.05f);
+      translucent.transmittanceMeasurementDistance = fogRange * std::log(luminance) / std::log(0.05f);
     }
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
@@ -1755,7 +1764,7 @@ int materialByName(const std::string &name, bool brush) {
     m.noCull = true;
     std::memcpy(m.waterColor, &translucent.transmittanceColor, sizeof(m.waterColor));
     m.waterDistance = translucent.transmittanceMeasurementDistance;
-    m.waterFogEnd = translucentWater && fogWater ? fade.fogEnd : 0;
+    m.waterFogEnd = translucentWater && fogWater ? std::max(fogEnd, 1.0f) : 0;
     slot = int(g_world.materials.size());
     g_world.materials.push_back(std::move(m));
     return slot;
