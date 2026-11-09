@@ -6315,19 +6315,19 @@ void onDraw(const Draw &d) {
 #endif
   // A water surface's $bottommaterial ($abovewater 0: the surface as seen
   // from below) drawn while the camera is above the water: Source shows it
-  // only from below, yet draws it in some frames (HL:Source undertow's moving
-  // water: liquids/water_tentacle_beneath over its top, z-fighting with it).
+  // only from below, yet the engine draws it every frame ($nocull: HL:Source
+  // undertow's moving water, liquids/water_tentacle_beneath, the inside of its
+  // whole box, one face on its top's plane): blended in the game, coplanar
+  // here, they z-fought. By the VMT (bsp::waterBottomMaterial).
   // OPENREMIX_PROXY_WATER_BOTTOMS=1 keeps them.
   static const bool waterBottoms = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_BOTTOMS", v, sizeof(v)) && v[0] == '1';
   }();
-  if (!waterBottoms && !g_cameraInWater && engine_materials::bound().known) {
-    float aboveWater = 1;
-    if (engine_materials::currentFloat("$abovewater", aboveWater) && aboveWater == 0) {
-      ++g_stats.waterBottomsDropped;
-      return;
-    }
+  if (!waterBottoms && !g_cameraInWater && engine_materials::bound().known &&
+      bsp::waterBottomMaterial(engine_materials::currentName())) {
+    ++g_stats.waterBottomsDropped;
+    return;
   }
   uint64_t instanceView = viewKey;
   const float (*cameraToWorld)[4] = nullptr;

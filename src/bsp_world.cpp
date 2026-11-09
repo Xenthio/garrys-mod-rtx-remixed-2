@@ -4057,6 +4057,21 @@ std::string materialName(uint64_t textureHash) {
 
 bool mirrorsOn() { return mirrorsEnabled(); }
 
+bool waterBottomMaterial(const char *materialName) {
+  if (!materialName || !*materialName)
+    return false;
+  static std::unordered_map<std::string, bool> bottoms;
+  const std::string key = lower(materialName);
+  const auto it = bottoms.find(key);
+  if (it != bottoms.end())
+    return it->second;
+  KeyValues kv;
+  const bool bottom = loadMaterial(key, kv) && kv.values.count("$abovewater") &&
+                      std::atoi(kv.values["$abovewater"].c_str()) == 0;
+  bottoms.emplace(key, bottom);
+  return bottom;
+}
+
 remixapi_MaterialHandle mirrorMaterial(const char *materialName) {
   if (!materialName || !mirrorsEnabled())
     return nullptr;
