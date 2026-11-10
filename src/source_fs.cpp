@@ -18,8 +18,17 @@ namespace {
 std::string normalize(std::string path) {
   for (auto &c : path)
     c = c == '\\' ? '/' : char(std::tolower(static_cast<unsigned char>(c)));
+  // Some studio material search directories end in doubled separators.
+  // Windows tolerates them; VPK keys require the same canonical spelling.
+  path.erase(std::unique(path.begin(), path.end(), [](char a, char b) {
+    return a == '/' && b == '/';
+  }), path.end());
   while (!path.empty() && path[0] == '/')
     path.erase(0, 1);
+  // Older BSP prop dictionaries (Lost Coast, for example) prefix model paths
+  // with "./". Loose Windows files tolerate it, VPK entry names do not.
+  while (path.rfind("./", 0) == 0)
+    path.erase(0, 2);
   return path;
 }
 
@@ -176,13 +185,59 @@ bool g_indexed = false;
 Pak g_pak;
 
 void addLoose(const std::wstring &directory) {
-  g_paths.push_back({g_root + L"\\" + directory + L"\\", nullptr});
+  g_paths.push_back({directory + L"\\", nullptr});
 }
 
 void addVpk(const std::wstring &dirFile) {
   auto vpk = std::make_unique<Vpk>();
-  if (vpk->open(g_root + L"\\" + dirFile))
+  if (vpk->open(dirFile))
     g_paths.push_back({{}, std::move(vpk)});
+}
+
+// Standalone hosts lack the engine's mounted-game filesystem. Explicit roots
+// provide its loose files and original VPKs without copying or renaming assets.
+void addContentMounts() {
+  const wchar_t *option = L"OPENREMIX_PROXY_CONTENT_MOUNTS";
+  const DWORD size = GetEnvironmentVariableW(option, nullptr, 0);
+  if (!size) return;
+  std::wstring value(size, L'\0');
+  const DWORD length = GetEnvironmentVariableW(option, value.data(), size);
+  if (!length || length >= size) return;
+  value.resize(length);
+  std::vector<std::wstring> mounted;
+  for (size_t begin = 0; begin < value.size();) {
+    const size_t separator = value.find(L';', begin);
+    std::wstring directory = value.substr(begin, separator == std::wstring::npos ? separator : separator - begin);
+    begin = separator == std::wstring::npos ? value.size() : separator + 1;
+    const auto first = directory.find_first_not_of(L" \t");
+    if (first == std::wstring::npos) continue;
+    directory = directory.substr(first, directory.find_last_not_of(L" \t") - first + 1);
+    std::replace(directory.begin(), directory.end(), L'/', L'\\');
+    while (directory.size() > 3 && directory.back() == L'\\') directory.pop_back();
+    const bool absolute = (directory.size() >= 3 && directory[1] == L':' && directory[2] == L'\\') ||
+                          directory.rfind(L"\\\\", 0) == 0;
+    const DWORD attributes = absolute ? GetFileAttributesW(directory.c_str()) : INVALID_FILE_ATTRIBUTES;
+    if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      std::fprintf(stderr, "Source content mount skipped (expected an absolute directory): %ls\n", directory.c_str());
+      continue;
+    }
+    if (std::any_of(mounted.begin(), mounted.end(), [&](const auto &previous) {
+          return _wcsicmp(previous.c_str(), directory.c_str()) == 0;
+        })) continue;
+    mounted.push_back(directory);
+    addLoose(directory);
+    WIN32_FIND_DATAW found;
+    HANDLE files = FindFirstFileW((directory + L"\\*_dir.vpk").c_str(), &found);
+    std::vector<std::wstring> archives;
+    if (files != INVALID_HANDLE_VALUE) {
+      do {
+        if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) archives.push_back(found.cFileName);
+      } while (FindNextFileW(files, &found));
+      FindClose(files);
+    }
+    std::sort(archives.begin(), archives.end());
+    for (const auto &archive : archives) addVpk(directory + L"\\" + archive);
+  }
 }
 
 #if defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_TF2) || defined(PROXY_GAME_EZ2)
@@ -205,7 +260,7 @@ void addEach(const std::wstring &directory) {
   std::sort(entries.begin(), entries.end(),
             [](const auto &a, const auto &b) { return _wcsicmp(a.first.c_str(), b.first.c_str()) < 0; });
   for (const auto &[name, folder] : entries)
-    folder ? addLoose(directory + L"\\" + name) : addVpk(directory + L"\\" + name);
+    folder ? addLoose(g_root + L"\\" + directory + L"\\" + name) : addVpk(g_root + L"\\" + directory + L"\\" + name);
 }
 #endif
 
@@ -286,30 +341,32 @@ void index() {
   if (find != INVALID_HANDLE_VALUE) {
     do
       if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && found.cFileName[0] != L'.')
-        addLoose(std::wstring(L"garrysmod\\addons\\") + found.cFileName);
+        addLoose(g_root + L"\\garrysmod\\addons\\" + found.cFileName);
     while (FindNextFileW(find, &found));
     FindClose(find);
   }
-  addVpk(L"garrysmod\\garrysmod_dir.vpk");
+  addContentMounts();
+  addVpk(g_root + L"\\garrysmod\\garrysmod_dir.vpk");
   for (const wchar_t *vpk : {L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
-    addVpk(std::wstring(L"sourceengine\\") + vpk + L"_dir.vpk");
-  addVpk(L"platform\\platform_misc_dir.vpk");
-  addLoose(L"garrysmod");
-  addLoose(L"sourceengine");
-  addLoose(L"platform");
-  addLoose(L"garrysmod\\download");
+    addVpk(g_root + L"\\sourceengine\\" + vpk + L"_dir.vpk");
+  addVpk(g_root + L"\\platform\\platform_misc_dir.vpk");
+  addLoose(g_root + L"\\garrysmod");
+  addLoose(g_root + L"\\sourceengine");
+  addLoose(g_root + L"\\platform");
+  addLoose(g_root + L"\\garrysmod\\download");
   // Mounted game content (cfg/mount.cfg) as shipped with GMod, then the
   // missing-content fallbacks.
-  addVpk(L"sourceengine\\content_hl2_dir.vpk");
-  addVpk(L"sourceengine\\content_cstrike_dir.vpk");
-  addVpk(L"garrysmod\\fallbacks_dir.vpk");
+  addVpk(g_root + L"\\sourceengine\\content_hl2_dir.vpk");
+  addVpk(g_root + L"\\sourceengine\\content_cstrike_dir.vpk");
+  addVpk(g_root + L"\\garrysmod\\fallbacks_dir.vpk");
 #elif defined(PROXY_GAME_L4D2)
   // left4dead2/gameinfo.txt SearchPaths: each directory loose, then its
   // pak01_dir.vpk.
   for (const wchar_t *dir : {L"update", L"left4dead2_dlc3", L"left4dead2_dlc2", L"left4dead2_dlc1", L"left4dead2",
                              L"hl2"}) {
-    addLoose(dir);
-    addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
+    const auto base = g_root + L"\\" + dir;
+    addLoose(base);
+    addVpk(base + L"\\pak01_dir.vpk");
   }
 #elif defined(PROXY_GAME_TF2)
   // tf/gameinfo.txt SearchPaths (game paths, in order; TF2 x64 layout: the
@@ -317,35 +374,35 @@ void index() {
   // and the platform's, then tf, hl2 and platform loose, downloads last.
   addEach(L"tf\\custom");
   for (const wchar_t *vpk : {L"tf2_textures", L"tf2_sound_vo_english", L"tf2_sound_misc", L"tf2_misc"})
-    addVpk(std::wstring(L"tf\\") + vpk + L"_dir.vpk");
+    addVpk(g_root + L"\\" + std::wstring(L"tf\\") + vpk + L"_dir.vpk");
   for (const wchar_t *vpk : {L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
-    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
-  addVpk(L"platform\\platform_misc_dir.vpk");
-  addLoose(L"tf");
-  addLoose(L"hl2");
-  addLoose(L"platform");
-  addLoose(L"tf\\download");
+    addVpk(g_root + L"\\" + std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(g_root + L"\\" + L"platform\\platform_misc_dir.vpk");
+  addLoose(g_root + L"\\" + L"tf");
+  addLoose(g_root + L"\\" + L"hl2");
+  addLoose(g_root + L"\\" + L"platform");
+  addLoose(g_root + L"\\" + L"tf\\download");
 #elif defined(PROXY_GAME_PORTAL2)
   // portal2/gameinfo.txt has the mod alone ("|gameinfo_path|."); the engine
   // mounts update and the DLC folders before it (the highest first, as L4D2
   // does), platform after it. Each directory loose, then its pak01_dir.vpk.
   for (const wchar_t *dir : {L"update", L"portal2_dlc2", L"portal2_dlc1", L"portal2", L"platform"}) {
-    addLoose(dir);
-    addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
+    addLoose(g_root + L"\\" + dir);
+    addVpk(g_root + L"\\" + std::wstring(dir) + L"\\pak01_dir.vpk");
   }
 #elif defined(PROXY_GAME_HL2RTX)
   // hl2rtx/gameinfo.txt SearchPaths (game paths, in order): hl2rtx/custom/*,
   // the mod, Half-Life 2's packages, Mapbase's (mapbase_hl2/*, its shared
   // content), then hl2 and platform loose.
   addEach(L"hl2rtx\\custom");
-  addLoose(L"hl2rtx");
+  addLoose(g_root + L"\\" + L"hl2rtx");
   for (const wchar_t *vpk : {L"hl2_sound_vo_english", L"hl2_pak", L"hl2_textures", L"hl2_sound_misc", L"hl2_misc"})
-    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
-  addVpk(L"platform\\platform_misc_dir.vpk");
+    addVpk(g_root + L"\\" + std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(g_root + L"\\" + L"platform\\platform_misc_dir.vpk");
   addEach(L"hl2rtx\\mapbase\\mapbase_hl2");
-  addVpk(L"hl2rtx\\mapbase\\mapbase_shared\\shared_content_v7_0_dir.vpk");
-  addLoose(L"hl2");
-  addLoose(L"platform");
+  addVpk(g_root + L"\\" + L"hl2rtx\\mapbase\\mapbase_shared\\shared_content_v7_0_dir.vpk");
+  addLoose(g_root + L"\\" + L"hl2");
+  addLoose(g_root + L"\\" + L"platform");
 #elif defined(PROXY_GAME_EZ2)
   // Entropy : Zero 2 search paths (entropyzero2/gameinfo.txt)
   addEach(L"entropyzero2\\custom");
@@ -355,21 +412,21 @@ void index() {
   // Workshop addons (|gameinfo_path|../../../workshop/content/1583720/*).
   addEach(L"..\\..\\workshop\\content\\1583720");
   addEach(L"entropyzero2\\ez2");
-  addLoose(L"entropyzero2");
+  addLoose(g_root + L"\\" + L"entropyzero2");
   addEach(L"mapbase\\episodic");
   addEach(L"mapbase\\hl2");
   addEach(L"mapbase\\css_weapons_in_hl2\\content");
-  addLoose(L"mapbase\\css_weapons_in_hl2");
-  addVpk(L"mapbase\\shared\\shared_content_v7_0_dir.vpk");
-  addVpk(L"ep2\\ep2_pak_dir.vpk");
-  addVpk(L"episodic\\ep1_pak_dir.vpk");
+  addLoose(g_root + L"\\" + L"mapbase\\css_weapons_in_hl2");
+  addVpk(g_root + L"\\" + L"mapbase\\shared\\shared_content_v7_0_dir.vpk");
+  addVpk(g_root + L"\\" + L"ep2\\ep2_pak_dir.vpk");
+  addVpk(g_root + L"\\" + L"episodic\\ep1_pak_dir.vpk");
   for (const wchar_t *vpk : {L"hl2_pak", L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
-    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
-  addVpk(L"platform\\platform_misc_dir.vpk");
-  addLoose(L"ep2");
-  addLoose(L"episodic");
-  addLoose(L"hl2");
-  addLoose(L"platform");
+    addVpk(g_root + L"\\" + std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(g_root + L"\\" + L"platform\\platform_misc_dir.vpk");
+  addLoose(g_root + L"\\" + L"ep2");
+  addLoose(g_root + L"\\" + L"episodic");
+  addLoose(g_root + L"\\" + L"hl2");
+  addLoose(g_root + L"\\" + L"platform");
 #endif
 }
 

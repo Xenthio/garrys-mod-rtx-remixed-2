@@ -4,3 +4,5 @@ option('openremix_include', type: 'string', value: '',
        description: 'Path to <openremix>/public/include (headers are not vendored)')
 option('sdl_include', type: 'string', value: '',
        description: 'SDL3 include directory (default: <openremix>/subprojects/SDL3-3.4.14/include)')
+option('sdl_test_dll', type: 'string', value: '',
+       description: 'Absolute path to SDL3_shared.dll for the optional Windows input-bridge test')

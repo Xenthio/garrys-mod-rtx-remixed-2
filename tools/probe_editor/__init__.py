@@ -1,0 +1,1 @@
+"""Cubemap volume authoring workbench."""
