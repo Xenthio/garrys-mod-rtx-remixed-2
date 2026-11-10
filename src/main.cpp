@@ -692,8 +692,8 @@ HANDLE openFile(std::string path, DWORD access, DWORD disposition, Open &&open) 
 // The video options' "Advanced..." button becomes "OpenRemix Settings...",
 // which opens OpenRemix's panel: the settings the Advanced page held (model,
 // texture and shader detail, water, shadows, antialiasing, filtering, HDR...)
-// are given on the command line (README) and mat_picmip by the proxy
-// (engine_hooks.cpp). GameUI reads the page's layout from
+// are given on the command line (README), and mat_picmip and multicore
+// rendering by the proxy (engine_hooks.cpp). GameUI reads the page's layout from
 // resource/optionssubvideo.res; an open of it gets a copy beside the proxy, of
 // the same size (the file system may know it from a stat), where the button
 // has the new label and the command "openremix_settings". COptionsSubVideo

@@ -44,12 +44,30 @@ char g_level[256] = {};
 
 DWORD g_mainThread = 0; // the thread of the first Present: the engine's main one
 
-// Texture detail Very High (mat_picmip -1) with the Advanced video options
-// hidden: the command line cannot carry it (the engine drops a negative value
-// after a "+" command). Run once the configs and "+" commands have been, from
-// the main thread (the command buffer is not shared with the render thread).
-// OPENREMIX_PROXY_PICMIP: another value, or "keep" to leave it as saved.
-void applyTextureDetail() {
+// Sets a console variable to the value of the environment variable env (or
+// fallback), unless env is "keep".
+void forceSetting(const char *name, const char *env, const char *fallback) {
+  char value[16];
+  std::snprintf(value, sizeof(value), "%s", fallback);
+  if (GetEnvironmentVariableA(env, value, sizeof(value)) && std::strcmp(value, "keep") == 0)
+    return;
+  char command[64];
+  std::snprintf(command, sizeof(command), "%s %d\n", name, std::atoi(value));
+  // IVEngineClient013 slot 106: ClientCmd_Unrestricted.
+  using ClientCmdFn = void (*)(void *, const char *);
+  reinterpret_cast<ClientCmdFn>((*static_cast<void ***>(g_engineClient))[106])(g_engineClient, command);
+}
+
+// Settings the hidden Advanced video options (main.cpp) held, run once the
+// configs and "+" commands have been, from the main thread (the command
+// buffer is not shared with the render thread):
+// - Texture detail Very High (mat_picmip -1): the command line cannot carry
+//   it (the engine drops a negative value after a "+" command).
+//   OPENREMIX_PROXY_PICMIP: another value, or "keep" to leave it as saved.
+// - Multicore rendering (gmod_mcore_test 1): the engine renders on its own
+//   thread (mat_queue_mode), a large gain where the game is CPU-bound.
+//   OPENREMIX_PROXY_MCORE: 0, or "keep" to leave it as saved.
+void applyForcedSettings() {
   if (!game::kGMod) // with GMod's Advanced video options (main.cpp) only
     return;
   static unsigned presents = 0;
@@ -57,14 +75,8 @@ void applyTextureDetail() {
   if (done || ++presents < 60 || GetCurrentThreadId() != g_mainThread || !g_engineClient)
     return;
   done = true;
-  char value[16] = "-1";
-  if (GetEnvironmentVariableA("OPENREMIX_PROXY_PICMIP", value, sizeof(value)) && std::strcmp(value, "keep") == 0)
-    return;
-  char command[48];
-  std::snprintf(command, sizeof(command), "mat_picmip %d\n", std::atoi(value));
-  // IVEngineClient013 slot 106: ClientCmd_Unrestricted.
-  using ClientCmdFn = void (*)(void *, const char *);
-  reinterpret_cast<ClientCmdFn>((*static_cast<void ***>(g_engineClient))[106])(g_engineClient, command);
+  forceSetting("mat_picmip", "OPENREMIX_PROXY_PICMIP", "-1");
+  forceSetting("gmod_mcore_test", "OPENREMIX_PROXY_MCORE", "1");
 }
 } // namespace
 void marker(const char *text) {
@@ -179,7 +191,7 @@ bool install() {
   if (!g_mainThread)
     g_mainThread = GetCurrentThreadId();
   if (done) {
-    applyTextureDetail();
+    applyForcedSettings();
     engine_mirrors::install();
     return true;
   }
