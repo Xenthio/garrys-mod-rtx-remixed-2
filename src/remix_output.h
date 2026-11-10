@@ -174,6 +174,9 @@ void onTargetPixels(const void *texture, uint32_t width, uint32_t height, D3DFOR
                     uint32_t pitch);
 // The draw being captured has a perspective projection (not 2D).
 bool drawIsPerspective();
+// The engine is drawing world lists (IVRenderView::DrawWorldLists: the
+// world's surfaces) or static props, not entities (props, NPCs, doors...).
+bool drawOfWorldOrStaticProp();
 void onPresent();
 // The game is shutting its renderer down: stop OpenRemix while every thread
 // is alive (exit-time teardown after ExitProcess hung on its workers).

@@ -1800,6 +1800,8 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
 
 // Depth of IVRenderView::DrawWorldLists calls (openremix_proxy_world_lists).
 int g_worldLists = 0;
+// Depth of the engine's static prop passes ("static_props" markers).
+int g_staticProps = 0;
 // Dynamic world-list draws kept for the engine, by base texture (statistics).
 std::unordered_map<uint64_t, uint32_t> g_keptWorldTextures;
 // Depth of COverlayMgr::RenderOverlays calls (openremix_proxy_overlays).
@@ -4012,6 +4014,8 @@ struct CensusRow {
   uint32_t draws = 0, primitives = 0;
 };
 std::map<std::string, CensusRow> g_census; // under g_transientSampleLock
+
+bool drawOfWorldOrStaticProp() { return g_worldLists > 0 || g_staticProps > 0; }
 
 bool drawIsPerspective() {
   if (!g_ready || !g_shaderApi)
@@ -10431,6 +10435,8 @@ bool onMarker(const char *text) {
   }
   else if (const char *v = argument("overlays"))
     depth(g_overlays, v);
+  else if (const char *v = argument("static_props"))
+    depth(g_staticProps, v);
   else if (const char *v = argument("portal_view")) {
     // Portal 2: a portal view's DrawWorldLists (x86_engine): its placement,
     // when drawn into the back buffer (stencil portals; its draws are dropped

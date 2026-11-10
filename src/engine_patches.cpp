@@ -14,6 +14,12 @@
 // call chain is decoded from).
 extern "C" void *openremix_drawWorldListsOriginal;
 
+namespace proxy::engine {
+// engine_hooks.cpp: a marker through the render context, ordered with the
+// frame's draws when the material system queues rendering.
+void marker(const char *text);
+} // namespace proxy::engine
+
 namespace proxy::engine_patches {
 namespace {
 
@@ -318,10 +324,19 @@ const float *propTransform(void *prop) {
 using DrawStaticPropsFn = void (*)(void *self, void **props, int count, uintptr_t shadowDepth, uintptr_t wireframe);
 DrawStaticPropsFn g_drawStaticProps = nullptr;
 
+// The engine's static prop draws, between "static_props" markers (ordered
+// with the draws when the material system queues rendering): their depth is
+// not needed for occlusion queries (d3d_hooks), the occluders hold the map's.
+void drawMarked(void *self, void **props, int count, uintptr_t shadowDepth, uintptr_t wireframe) {
+  proxy::engine::marker("openremix:static_props 1");
+  g_drawStaticProps(self, props, count, shadowDepth, wireframe);
+  proxy::engine::marker("openremix:static_props 0");
+}
+
 void drawStaticProps(void *self, void **props, int count, uintptr_t shadowDepth, uintptr_t wireframe) {
   if ((shadowDepth & 0xff) || count <= 0 || !props || g_propFilterBroken.load(std::memory_order_relaxed) ||
       !redundant()) {
-    g_drawStaticProps(self, props, count, shadowDepth, wireframe);
+    drawMarked(self, props, count, shadowDepth, wireframe);
     return;
   }
   void *local[1024];
@@ -341,7 +356,7 @@ void drawStaticProps(void *self, void **props, int count, uintptr_t shadowDepth,
   }
   if (g_propFilterBroken.load(std::memory_order_relaxed)) {
     g_propsHook.state = "filter off: transform is not at the expected member";
-    g_drawStaticProps(self, props, count, shadowDepth, wireframe);
+    drawMarked(self, props, count, shadowDepth, wireframe);
     return;
   }
   g_stats.propCalls.fetch_add(1, std::memory_order_relaxed);
@@ -349,7 +364,7 @@ void drawStaticProps(void *self, void **props, int count, uintptr_t shadowDepth,
   g_stats.propsPassed.fetch_add(uint64_t(keptCount), std::memory_order_relaxed);
   g_stats.propsUnknown.fetch_add(uint64_t(unknown), std::memory_order_relaxed);
   if (keptCount)
-    g_drawStaticProps(self, kept, keptCount, shadowDepth, wireframe);
+    drawMarked(self, kept, keptCount, shadowDepth, wireframe);
 }
 
 bool envDisabled(const char *name) {

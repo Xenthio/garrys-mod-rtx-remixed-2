@@ -1024,9 +1024,10 @@ constexpr uint64_t kQueryTargetFrames = 60;
 // Occluders: with the BSP world loaded, the map's opaque faces and static
 // props (bsp::occluders) are rasterized into the depth buffer once per frame
 // and render target, before its first occlusion query, in a few
-// fixed-function draws; the engine's own depth-writing draws (one per
-// object, ~1000 a frame) are then skipped. Dynamic models no longer occlude
-// queries. OPENREMIX_PROXY_D3D_OCCLUDERS=0 keeps the engine's depth draws.
+// fixed-function draws; the engine's own depth-writing world draws are then
+// skipped. Models and brush entities still draw their depth (see
+// drawIndexedPrimitive), so they occlude queries too.
+// OPENREMIX_PROXY_D3D_OCCLUDERS=0 keeps all of the engine's depth draws.
 struct OccluderBuffers {
   IDirect3DDevice9 *device = nullptr;
   IDirect3DVertexBuffer9 *vb = nullptr;
@@ -2271,9 +2272,12 @@ HRESULT STDMETHODCALLTYPE drawIndexedPrimitive(IDirect3DDevice9 *dev, D3DPRIMITI
       const bool query = !g_openOcclusion.empty();
       bool writesDepth = g_renderStates[D3DRS_ZENABLE] && g_renderStates[D3DRS_ZWRITEENABLE] &&
                          !g_renderStates[D3DRS_ALPHABLENDENABLE];
+      // The occluders stand in for the world's and static props' draws.
+      // Entities (props, NPCs, doors, the view model) still draw their depth:
+      // without it a glow sprite's pixel-visibility query saw through them.
       if (writesDepth && !query && g_occluders.vb && g_occluders.device == dev && !g_occluders.failed &&
-          bsp::active())
-        writesDepth = false; // the occluders stand in for it
+          bsp::active() && remix::drawOfWorldOrStaticProp())
+        writesDepth = false;
       if (writesDepth && !query) {
         auto it = g_queryTargets.find(g_renderTarget0);
         writesDepth = it != g_queryTargets.end() && g_d3dFrame - it->second <= kQueryTargetFrames;
