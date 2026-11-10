@@ -29,6 +29,9 @@
 #endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
+#ifdef PROXY_GAME_GMOD
+#include "workshop_content.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -1049,6 +1052,16 @@ extern "C" __declspec(dllexport) void *CreateInterface(const char *name, int *re
   static bool threadsStarted = false;
   if (!threadsStarted) {
     threadsStarted = true;
+#ifdef PROXY_GAME_GMOD
+    // Workshop content packages (workshop_content.h): with a runtime this
+    // session, their add-on folders now, ahead of GMod mounting
+    // garrysmod/addons, and their Remix mods on a thread that startRemix waits
+    // for; without one, nothing is placed and their add-ons that need it are
+    // hidden.
+    proxy::workshop::begin(proxy::remix::enabled() &&
+                               GetFileAttributesW((g_dir + proxy::game::kRuntimePath).c_str()) != INVALID_FILE_ATTRIBUTES,
+                           proxy::remix::modsDirectory());
+#endif
     hookFileOpens();
     if (!g_workers.start(statisticsThread) || !g_workers.start(profilerThread))
       log("proxy: diagnostic worker creation failed (%lu)", GetLastError());

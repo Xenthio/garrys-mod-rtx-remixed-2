@@ -74,7 +74,8 @@ endif
 if game == 'gmod'
   cpp_args += '-DPROXY_GAME_GMOD'
   sources += ['src/engine_hooks.cpp', 'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp',
-              'src/engine_shadows.cpp', 'src/engine_nocull.cpp', 'src/engine_mirrors.cpp']
+              'src/engine_shadows.cpp', 'src/engine_nocull.cpp', 'src/engine_mirrors.cpp',
+              'src/workshop_content.cpp']
   def_file = 'shaderapidx9.def'
 elif game == 'tf2'
   # Team Fortress 2 x64: OpenRemix in process and GMod's interface-based engine
