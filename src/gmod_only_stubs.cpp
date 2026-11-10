@@ -57,4 +57,3 @@ void report(uint32_t, uint32_t, uint32_t) {}
 void dumpStatistics(FILE *) {}
 } // namespace proxy::engine_lights
 #endif
-

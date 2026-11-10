@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -7,6 +8,7 @@
 
 #define REMIX_ALLOW_X86
 #include <remix/remix_c.h>
+#include <remix/remix_bake_ext.h>
 
 #include "engine_materials.h"
 
@@ -30,6 +32,7 @@ struct MaterialRef {
 // (remixapi_MaterialBlendModulationEXT, with `transform` from the mesh's
 // coordinates; null handle while none of them is uploaded).
 struct BlendMask {
+  std::string texture; // Source asset name for offline replay
   const std::vector<uint64_t> *candidates = nullptr;
   float transform[2][3] = {{1, 0, 0}, {0, 1, 0}};
 };
@@ -58,8 +61,41 @@ bool textureMeanColor(const std::string &name, float rgba[4]);
 bool textureRgba(const std::string &name, uint32_t &width, uint32_t &height, std::vector<uint8_t> &rgba);
 
 // Loads `maps/<mapName>.bsp` from the search paths; an empty name unloads.
-// Returns whether the map's world is now provided from the BSP.
-bool load(const remixapi_Interface &api, const std::string &mapName);
+// Returns whether the map's world is now provided from the BSP. The host
+// enables styled lights only when it can supply current engine lightstyles.
+struct LoadOptions {
+  bool lightStylesAvailable = false;
+  bool decodeSkybox = false;
+  bool freezeAnimation = false;
+  bool operator==(const LoadOptions &other) const {
+    return lightStylesAvailable == other.lightStylesAvailable &&
+           decodeSkybox == other.decodeSkybox && freezeAnimation == other.freezeAnimation;
+  }
+};
+bool load(const remixapi_Interface &api, const std::string &mapName, LoadOptions options = {});
+struct SkyboxFace {
+  uint32_t width = 0, height = 0;
+  std::vector<uint8_t> rgba;
+  // HDR sky materials are decoded before interpolation; no display transform.
+  std::vector<float> linearRgba;
+};
+struct SkyboxImages {
+  std::string name, error;
+  // Source world axes: +X, -X, +Y, -Y, +Z, -Z.
+  std::array<SkyboxFace, 6> faces;
+};
+const SkyboxImages &skyboxImages();
+
+// Offline replay uses the same Source search paths and VTF decoder as the game.
+// Animated images are refused unless the diagnostic host explicitly requests
+// a frozen frame-zero snapshot. This is not engine animation playback.
+bool textureImage(const std::string &name, uint32_t &width, uint32_t &height,
+                  std::vector<uint8_t> &rgba, std::string &error, bool freezeAnimation = false);
+bool materialSource(uint64_t textureHash, std::string &baseTexture);
+// Legacy XXH64 replacement key for the same upload bytes/mip as a current
+// texture candidate. Offline hosts need this because decoded DDSs have new IDs.
+uint64_t textureReplacementHash(const std::string &name, uint64_t sourceHash);
+bool playerStart(float origin[3], float angles[3]);
 
 // The BSP world is loaded: world draws are dropped.
 bool active();
@@ -69,6 +105,14 @@ bool overlaysActive();
 
 // Resolves materials, builds pending meshes and draws this frame's instances.
 void submit(MaterialLookup lookup);
+
+// Publish the complete retained BSP scene for load-time baking. Static map
+// lights and the captured sky use ordinary handles. Stationary styled lights
+// provide separate fully-on authored handles and live identities; never dlights/flashlights. The native runtime captures inputs once per map/material revision.
+// Diagnostic hosts may override the probe domain; ordinary gameplay uses the full map.
+void publishBakeScene(const std::vector<remixapi_LightHandle> &lights,
+                      const std::vector<remixapi_BakeStyledLightEXT> &styled = {},
+                      const std::array<float, 6> *probeBounds = nullptr);
 
 // Whether a draw's model-to-world rows (3x4, as in vertex shader c58) place
 // one of the map's static props, which the BSP world draws itself. eye: the
@@ -81,12 +125,13 @@ bool isStaticProp(const float *modelRows, const float eye[3]);
 bool isBakedBrushEntity(const float *a, const float *b, const float *c);
 
 // A static light of the map, in the engine's LightDesc_t terms (type 1 point,
-// 2 directional, 3 spot; color in Source's linear intensity units).
+// 2 directional, 3 spot, internal 4 surface; color in Source intensity units).
 struct Light {
   int type = 0;
   float color[3] = {}, position[3] = {}, direction[3] = {};
   float attenuation[3] = {}; // constant, linear, quadratic
   float thetaDot = 0, phiDot = 0; // spot inner and outer cone cosines
+  float forwardCutoff = 0; // compiled cutoff for point/spot lights
   uint64_t hash = 0;
   int style = 0; // lightstyle scaling the color each frame (0: none)
 };

@@ -3,14 +3,17 @@
 #include <string>
 #include <vector>
 
-// Read-only view of the game's content as Source's file system sees it: the
-// map's embedded pakfile, then each search path (gameinfo.txt order) as a
-// loose directory and its pak01_dir.vpk. Paths are relative ("materials/x.vmt"),
+// Read-only content index: embedded map pakfile, loose addons, optional game
+// mounts, then the retained GMod search paths. The engine filesystem supplies
+// content absent from this index. Paths are relative ("materials/x.vmt"),
 // matched case-insensitively with '/' separators.
 namespace proxy::fs {
 
-// `gameRoot`: the directory holding left4dead2.exe. VPK directories are
+// `gameRoot`: the directory holding GMod's executable. VPK directories are
 // indexed on first use and kept for the process lifetime.
+// Optional OPENREMIX_PROXY_CONTENT_MOUNTS is a semicolon-separated list of
+// absolute game-content directories. In list order, each contributes loose
+// files before its *_dir.vpk archives (sorted by filename). All access is read-only.
 void init(const std::wstring &gameRoot);
 
 // Files of the loaded map's PAKFILE lump (a stored zip) take precedence;

@@ -1,4 +1,9 @@
+#include "source_lights.h"
+#include "source_rendering.h"
+#include <remix/remix_reflection_ext.h>
+#include "styled_lights.h"
 #include "diag.h"
+#include "frame_profile.h"
 #include <map>
 #include <tuple>
 #include "remix_output.h"
@@ -6,6 +11,8 @@
 #include "remix_ui.h"
 #include "sky_faces.h"
 #include "bsp_world.h"
+#include "bake_sky.h"
+#include "device_window.h"
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
@@ -34,6 +41,7 @@
 #define REMIX_ALLOW_X86
 #include <remix/remix_c.h>
 #include <remix/remix_native_ext.h>
+#include <remix/remix_bake_ext.h>
 #include <remix/remix_usd_ext.h>
 
 #include <algorithm>
@@ -839,6 +847,7 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness, boo
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
     remixapi_MaterialInfoOpaqueEXT opaque = {};
     opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.roughnessConstant = 1; // A plain Source surface has no authored glossy lobe.
     // The runtime multiplies texture gamma values by the tint (then linearizes),
     // so a linear brightness B is B^(1/2.2).
     const float tint = sky ? std::pow(skyBrightness, 1.0f / 2.2f) : 1.0f;
@@ -849,8 +858,11 @@ remixapi_MaterialHandle ensureMaterial(RemixTexture &t, float skyBrightness, boo
     remixapi_MaterialInfoReplacementHashEXT replacement = {};
     replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
     replacement.materialHash = t.legacyHash;
+    remixapi_MaterialInfoPbrEXT diffuse = {};
+    diffuse.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
+    opaque.pNext = &diffuse; // Preserve the path tracer's diffuse-only fallback.
     if (t.legacyHash && !sky)
-      opaque.pNext = &replacement;
+      diffuse.pNext = &replacement;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
@@ -1008,6 +1020,7 @@ float envScale(const char *name, float fallback);
 // replacements are keyed by it).
 struct EmissiveMaterial {
   remixapi_MaterialHandle handle = nullptr;
+  uint64_t reflectionSceneId = 0, reflectionVolumeId = 0;
   uint64_t lastFrame = 0;
   uint32_t pins = 0; // BSP materials holding it
 };
@@ -1168,10 +1181,14 @@ remixapi_MaterialHandle clampedMaterialFor(const void *texture, bool nearest = f
     swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
     remixapi_MaterialInfoOpaqueEXT opaque = {};
     opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+    opaque.roughnessConstant = 1;
     opaque.albedoConstant = {1, 1, 1};
     opaque.opacityConstant = 1;
     opaque.alphaTestType = 7;
     opaque.useDrawCallAlphaState = 1;
+    remixapi_MaterialInfoPbrEXT diffuse = {};
+    diffuse.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
+    opaque.pNext = &diffuse;
     remixapi_MaterialInfo info = {};
     info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
     info.pNext = &opaque;
@@ -1426,13 +1443,16 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     key.blur = uint8_t(std::lround(std::clamp(p.blur, 0.0f, 15.9375f) * 16));
   }
   uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), t.hash);
+  if (s.reflectionReceiverKey)
+    hash = XXH3_64bits_withSeed(&s.reflectionReceiverKey, sizeof(s.reflectionReceiverKey), hash);
   if (!hash || hash == t.hash)
     hash = ~t.hash;
   if (materialHash)
     *materialHash = hash;
   EmissiveMaterial &variant = g_emissiveMaterials[hash];
   variant.lastFrame = g_frame;
-  if (variant.handle)
+  const bool existed = variant.handle != nullptr;
+  if (existed && variant.reflectionSceneId == s.reflectionSceneId && variant.reflectionVolumeId == s.reflectionVolumeId)
     return &variant;
   wchar_t path[32], maskPath[32], normalPath[32], mapPaths[2][32];
   swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
@@ -1478,6 +1498,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   void *chain = emits ? static_cast<void *>(&self) : t.legacyHash ? &replacement : nullptr;
   remixapi_MaterialInfoOpaqueEXT opaque = {};
   opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.roughnessConstant = 1; // PBR conversion below overrides this diffuse fallback.
   if (pbr.use) {
     remap.pNext = chain;
     enable.pNext = &remap;
@@ -1500,8 +1521,14 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
       opaque.roughnessTexture = mapPaths[0];
     if (pbr.maps[1])
       opaque.metallicTexture = mapPaths[1];
+  } else {
+    enable.enabled = 0; // The rough Forward+ fallback must not opt path tracing into GGX.
+    enable.pNext = chain;
+    chain = &enable;
   }
-  opaque.pNext = chain;
+  remixapi_MaterialReflectionBindingEXT reflection{
+      REMIXAPI_STRUCT_TYPE_MATERIAL_REFLECTION_BINDING_EXT, chain, s.reflectionSceneId, s.reflectionVolumeId};
+  opaque.pNext = s.reflectionReceiverKey ? static_cast<void *>(&reflection) : chain;
   opaque.albedoConstant = {key.albedo[0] / 1024.0f, key.albedo[1] / 1024.0f, key.albedo[2] / 1024.0f};
   opaque.opacityConstant = 1;
   opaque.alphaTestType = 7;
@@ -1522,11 +1549,15 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   info.filterMode = nearest ? 0 : 1;
   info.wrapModeU = info.wrapModeV = 1;
   if (g_api.CreateMaterial(&info, &variant.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
-    g_emissiveMaterials.erase(hash);
+    if (!existed) g_emissiveMaterials.erase(hash);
     ++g_stats.emissiveFailed;
     return nullptr;
   }
-  ++(emits ? g_stats.emissiveCreated : g_stats.pbrCreated);
+  variant.reflectionSceneId = s.reflectionSceneId;
+  variant.reflectionVolumeId = s.reflectionVolumeId;
+  if (existed) return &variant;
+  if (emits) ++g_stats.emissiveCreated;
+  else if (pbr.use) ++g_stats.pbrCreated;
   // Evicted variants (animated tints) leave their keys behind.
   if (t.emissive.size() >= 256)
     t.emissive.erase(std::remove_if(t.emissive.begin(), t.emissive.end(),
@@ -1728,7 +1759,7 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   const PbrMaps maps = emission ? pbrMapsFor(*texture, *emission, true, &complete) : PbrMaps{};
   if (!complete)
     return {};
-  if (!emission || (emission->mode == Shading::Lit && !maps.use)) {
+  if (!emission || (emission->mode == Shading::Lit && !maps.use && !emission->reflectionReceiverKey)) {
     ref.handle = ensureMaterial(*texture, 0, nearest);
     ref.keep = std::move(texture);
     return ref;
@@ -1798,19 +1829,9 @@ struct PortalViewStats {
 
 // --- Lights ------------------------------------------------------------------
 // LightDesc_t (public/mathlib/lightdesc.h), 88 bytes.
-struct SourceLight {
-  int32_t type; // 1 point, 2 directional, 3 spot
-  float color[3], position[3], direction[3];
-  float range, falloff, attenuation0, attenuation1, attenuation2, theta, phi, thetaDot, phiDot;
-  // Not in LightDesc_t: a projected texture's cookie (the runtime texture's
-  // hash, 0: none), the projection's up vector and horizontal FOV in degrees.
-  // No padding (spare aligns the hash): the definition hashes these bytes.
-  float cookieUp[3], cookieFov, spare;
-  uint64_t cookie;
-};
+using SourceLight = lighting::SourceLight;
 constexpr size_t kLightDescSize = 88, kLightDescPart = offsetof(SourceLight, cookieUp);
-static_assert(kLightDescPart <= kLightDescSize && offsetof(SourceLight, cookie) == kLightDescPart + 20 &&
-              sizeof(SourceLight) == kLightDescPart + 28);
+
 std::mutex g_lightLock;
 std::unordered_map<uint64_t, SourceLight> g_frameLights, g_lastLights;
 struct CachedLight {
@@ -1830,81 +1851,11 @@ float envScale(const char *name, float fallback) {
   return value > 0 ? value : fallback;
 }
 
-// Source colors are linear intensities with 1/(a0 + a1 d + a2 d^2) falloff in
-// game units. A point light becomes a small sphere of the same radiant
-// intensity (matched at a reference distance when the falloff is not purely
-// quadratic). The runtime shades the distant light as brdf * cos * radiance
-// with a Lambert brdf of albedo / pi, where Source lights a surface with
-// albedo * cos * color: the sun's radiance is Source's color times pi (passed
-// as it was, light_environment suns came out at a third of their brightness).
-remixapi_LightHandle createLight(const SourceLight &l, uint64_t hash) {
+remixapi_LightHandle createLight(const SourceLight &light, uint64_t hash) {
   static const float lightScale = envScale("OPENREMIX_PROXY_LIGHT_SCALE", 1.0f);
   static const float sunScale = envScale("OPENREMIX_PROXY_SUN_SCALE", 1.0f);
-  remixapi_LightInfo info = {};
-  info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-  info.hash = hash;
-  remixapi_LightInfoSphereEXT sphere = {};
-  remixapi_LightInfoDistantEXT distant = {};
-  remixapi_LightInfoCookieEXT cookie = {};
-  wchar_t cookiePath[32] = {};
-  if (l.type == 2) {
-    constexpr float kSunDiameterDegrees = 0.5f;
-    const float s = sunScale * 3.14159265f;
-    info.radiance = {l.color[0] * s, l.color[1] * s, l.color[2] * s};
-    const float len = std::sqrt(l.direction[0] * l.direction[0] + l.direction[1] * l.direction[1] +
-                                l.direction[2] * l.direction[2]);
-    if (len < 1e-6f)
-      return nullptr;
-    distant.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_DISTANT_EXT;
-    distant.direction = {l.direction[0] / len, l.direction[1] / len, l.direction[2] / len};
-    distant.angularDiameterDegrees = kSunDiameterDegrees;
-    distant.volumetricRadianceScale = 1; // dxvk-remix's default; 0 leaves it out of volumetrics
-    info.pNext = &distant;
-  } else {
-    constexpr float kRadius = 2.0f, kReference = 100.0f;
-    const float falloff = l.attenuation0 + l.attenuation1 * kReference + l.attenuation2 * kReference * kReference;
-    if (falloff <= 0)
-      return nullptr;
-    const float intensity = kReference * kReference / falloff; // radiant intensity per unit color
-    const float s = lightScale * intensity / (3.14159265f * kRadius * kRadius);
-    info.radiance = {l.color[0] * s, l.color[1] * s, l.color[2] * s};
-    sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-    sphere.position = {l.position[0], l.position[1], l.position[2]};
-    sphere.radius = kRadius;
-    sphere.volumetricRadianceScale = 1; // dxvk-remix's default; 0 leaves it out of volumetrics
-    if (l.type == 3) {
-      const float len = std::sqrt(l.direction[0] * l.direction[0] + l.direction[1] * l.direction[1] +
-                                  l.direction[2] * l.direction[2]);
-      if (len > 1e-6f && l.phiDot > -1 && l.phiDot < 1) {
-        sphere.shaping_hasvalue = 1;
-        sphere.shaping_value.direction = {l.direction[0] / len, l.direction[1] / len, l.direction[2] / len};
-        const float outer = std::acos(l.phiDot), inner = std::acos(std::clamp(l.thetaDot, -1.0f, 1.0f));
-        sphere.shaping_value.coneAngleDegrees = outer * 57.2957795f;
-        sphere.shaping_value.coneSoftness = outer > 0 ? std::clamp((outer - inner) / outer, 0.0f, 1.0f) : 0;
-        sphere.shaping_value.focusExponent = 0;
-      }
-    }
-    info.pNext = &sphere;
-    // A projected texture's cookie: the texture spans the FOV and shapes the
-    // beam (dark outside it), so the cone only bounds the frustum, out to its
-    // corners, without a fade.
-    if (l.cookie && sphere.shaping_hasvalue && l.cookieFov > 0 && l.cookieFov < 180) {
-      swprintf(cookiePath, 32, L"0x%llX", static_cast<unsigned long long>(l.cookie));
-      cookie.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_COOKIE_EXT;
-      cookie.texture = cookiePath;
-      cookie.up = {l.cookieUp[0], l.cookieUp[1], l.cookieUp[2]};
-      cookie.fovDegrees = l.cookieFov;
-      const float corner = std::atan(1.41421356f * std::tan(l.cookieFov * 0.5f * 0.01745329252f));
-      sphere.shaping_value.coneAngleDegrees = std::min(corner * 57.2957795f + 1.0f, 89.0f);
-      sphere.shaping_value.coneSoftness = 0;
-      sphere.pNext = &cookie;
-    }
-  }
-  for (float c : {info.radiance.x, info.radiance.y, info.radiance.z})
-    if (!std::isfinite(c) || c < 0)
-      return nullptr;
-  remixapi_LightHandle handle = nullptr;
-  return g_api.CreateLight(&info, &handle) == REMIXAPI_ERROR_CODE_SUCCESS ? handle : nullptr;
+  return lighting::createLight(g_api, light, hash, lightScale, sunScale);
+
 }
 
 } // namespace
@@ -3676,7 +3627,7 @@ bool startRemix() {
   }
   diag::stage("OpenRemix: Startup succeeded");
   remix_ui::install(g_gameWindow, &g_api, gameProc);
-  // OPENREMIX_PROXY_BACKEND=pathtrace|raster (runtime default: raster).
+  // OPENREMIX_PROXY_BACKEND=pathtrace|raster|forwardplus (runtime default: raster).
   char backend[32] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_BACKEND", backend, sizeof(backend)))
     g_api.SetConfigVariable("rtx.native.backend", backend);
@@ -3718,16 +3669,7 @@ bool startRemix() {
     if (!configDefault || configDefault(key, value) != REMIXAPI_ERROR_CODE_SUCCESS)
       g_api.SetConfigVariable(key, value);
   };
-  // Source units are inches: the runtime's default local light reach (16
-  // units, meant as meters) would fade flashlights and lamps past ~40 cm.
-  setDefault("rtx.native.pathtrace.localRange", "0");
-  // The adaptive local-light budget compares absolute importance against
-  // thresholds tuned for meter-scale scenes; with Source's light intensities
-  // nearly every pixel takes the maximum 4 shadow rays (~10 ms on c8m1).
-  setDefault("rtx.native.pathtrace.adaptiveLocalSampling", "0");
-  // Source units are inches: the runtime converts its meter-based defaults
-  // (denoiser hit distances, visibility-guiding cells) with the scene scale.
-  setDefault("rtx.native.pathtrace.sceneScale", "0.0254");
+  source_rendering::lightingDefaults(setDefault);
   // Static world brushes (onPresent) would otherwise make every ray traverse
   // a static and a dynamic acceleration structure.
   setDefault("rtx.native.pathtrace.combinedTlas", "1");
@@ -3749,6 +3691,12 @@ bool startRemix() {
         g_api.SetConfigVariable(entry, eq + 1);
       }
     }
+  }
+  char gpuStats[8] = {}, frameProfile[2] = {};
+  if ((GetEnvironmentVariableA("OPENREMIX_PROXY_GPU_STATS", gpuStats, sizeof(gpuStats)) && gpuStats[0] == '1') ||
+      GetEnvironmentVariableA("OPENREMIX_PROXY_FRAME_PROFILE", frameProfile, sizeof(frameProfile))) {
+    const auto result = g_api.SetConfigVariable("rtx.native.gpuPassTimers", "1");
+    diag::stage("GPU profiling: native pass timer request returned %u", unsigned(result));
   }
   return true;
 }
@@ -3807,6 +3755,8 @@ bool isSkyDraw(const Draw &d) {
 // seam is a meridian; with the identity they lay on the horizon at +-y. The
 // swap is its own inverse: either reading of the transform gives the same map.
 remixapi_LightHandle g_skyDome = nullptr;
+BakeSky g_bakeSky;
+lighting::StyledLights g_styledBakeLights;
 remixapi_TextureHandle g_skyTexture = nullptr;
 uint64_t g_skyTextureHash = 0;
 uint32_t g_skyEpoch = 0;
@@ -3833,7 +3783,9 @@ uint32_t skyEpoch() { return g_skyEpoch; }
 
 // A new map: the dome of the previous one must not outlive it (a map whose
 // 2D sky is not drawn, or not yet, falls back to the sky light estimate).
-static void resetSky() {
+static void resetSky(const char *mapName) {
+  g_styledBakeLights.reset(g_api);
+  g_bakeSky.reset(g_api, mapName && *mapName ? XXH3_64bits(mapName, std::strlen(mapName)) | 1 : 0);
   if (g_skyDome)
     g_api.DestroyLight(g_skyDome);
   if (g_skyTexture)
@@ -3843,6 +3795,22 @@ static void resetSky() {
   g_skyTextureHash = 0;
   g_skyBlocks.clear();
   ++g_skyEpoch;
+}
+
+// Both the ordered engine marker and external hosts announce map lifecycle
+// events here. Keep the live and baked environment lifetime identical on both
+// entry points, including unloads and failed map loads.
+bool loadMap(const char *name) {
+  if (!g_ready)
+    return false;
+  resetSky(name);
+#ifdef PROXY_GAME_PORTAL2
+  portal2::reset(g_api);
+#endif
+  diag::stage("Map lifecycle: %s", name && *name ? name : "unload");
+  bsp::LoadOptions options;
+  options.lightStylesAvailable = engine_lights::stylesActive();
+  return bsp::load(g_api, name ? name : "", options);
 }
 
 void setSkyFaces(const uint8_t *const faces[6]) {
@@ -3993,13 +3961,16 @@ void applySkyDome() {
   g_skyBlocks = g_skyJob.blocks;
   g_skyDomeTick = GetTickCount64();
   g_skyChanged = true;
+  if (!g_bakeSky.capture(g_api, info, domeScale))
+    diag::stage("Map-load bake sky capture failed; a later changed sky capture will retry");
 }
 
 void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp) {
   if (!enabled() || !pp)
     return;
-  if (gameWindow || !g_gameWindow)
-    g_gameWindow = pp->hDeviceWindow ? pp->hDeviceWindow : gameWindow;
+  g_gameWindow = gameWindowForDevice(g_gameWindow, g_hiddenWindow, gameWindow, pp->hDeviceWindow);
+  diag::stage("D3D host window: focus %p, requested %p, game %p, hidden %p", gameWindow,
+              pp->hDeviceWindow, g_gameWindow, g_hiddenWindow);
   g_displayWidth = pp->BackBufferWidth;
   g_displayHeight = pp->BackBufferHeight;
   // D3D9 keeps rendering (to a hidden window) so the shader API is unaffected;
@@ -6705,8 +6676,8 @@ void onDraw(const Draw &d) {
   const auto meshName = [&](uint64_t geometryName) {
     uint64_t h = geometryName ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^ (unlitColors ? 0xc0105c0105c0105ull : 0) ^
                  (decalColors ? 0x0decac0105c0105ull : 0) ^ (hueColors ? 0x4e0c0105c0105ull : 0) ^
-                 (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
-    if (g_screenUv)
+                  (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+  if (g_screenUv)
       h = fnv(g_screenUv, 8 * sizeof(float), h);
     if (g_ffUv)
       h = fnv(g_ffUv, 8 * sizeof(float), h);
@@ -6726,7 +6697,7 @@ void onDraw(const Draw &d) {
   const bool alphaBlended = d.blend && d.blendOp == D3DBLENDOP_ADD && d.srcBlend == D3DBLEND_SRCALPHA &&
                             d.dstBlend == D3DBLEND_INVSRCALPHA;
   const bool infectedShader = l4d2::infected::enabled() &&
-                              l4d2::infected::classify(d.pixelShader, d.vertexShader, d.psConstants, d.vsConstants,
+                            l4d2::infected::classify(d.pixelShader, d.vertexShader, d.psConstants, d.vsConstants,
                                                        alphaBlended, infected);
   const bool infectedFade = infectedShader && alphaBlended && infected.fadeable;
   const bool infectedDraw = infectedShader && (!d.blend || infectedFade) && !d.alphaTest && !lifted &&
@@ -7707,7 +7678,7 @@ void logRendererState(uint32_t presents, size_t instances) {
   lastRendered = denoising.renderedFrames;
   char text[900];
   std::snprintf(text, sizeof(text),
-                "backend active %u, requested %u, supported mask %u (1 raster, 2 path tracing)%s%s | tracer frames "
+                "backend active %u, requested %u, supported mask %u (1 raster, 2 path tracing, 4 Forward+)%s%s | tracer frames "
                 "advancing %d, scene changing %d, accumulation %u | denoiser active %u of requested %u, frames "
                 "advancing %d%s%s | map world loaded %d, instances this frame %s, world cameras %s",
                 backend.activeBackend, backend.requestedBackend, backend.supportedBackends,
@@ -7721,6 +7692,19 @@ void logRendererState(uint32_t presents, size_t instances) {
     diag::stage("frame %u: renderer: %s (instances %zu, tracer sequence %llu)", presents, text, instances,
                 static_cast<unsigned long long>(tracing.sampleSequence));
     last = text;
+  }
+  static auto getBake = reinterpret_cast<PFN_remixapi_GetBakeStatisticsEXT>(stat("remixapi_GetBakeStatisticsEXT"));
+  remixapi_BakeStatisticsEXT bake = {};
+  bake.structSize = sizeof(bake);
+  if (getBake && getBake(&bake) == REMIXAPI_ERROR_CODE_SUCCESS) {
+    std::snprintf(text, sizeof(text), "state %u, active %u, input %llu, progress %u/%u; %s", bake.state,
+                  bake.active, static_cast<unsigned long long>(bake.requestedHash), bake.completed,
+                  bake.probes, bake.status);
+    static std::string lastBake;
+    if (text != lastBake) {
+      diag::stage("frame %u: bake: %s", presents, text);
+      lastBake = text;
+    }
   }
 }
 
@@ -7746,6 +7730,26 @@ void onPresent() {
     g_lastPresent = now;
     g_frameBegan.store(now.QuadPart, std::memory_order_relaxed);
     g_frameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+  }
+  frame_profile::HostStages hostStages;
+  if (frame_profile::enabled()) {
+    // Take the deltas before any submission timer for the new frame begins.
+    static uint32_t previous[5] = {};
+    static frame_profile::WorldListTotals previousWorld;
+    static bool havePrevious = false;
+    double milliseconds[5];
+    for (size_t i = 0; i < std::size(previous); ++i) {
+      const uint32_t current = g_totalUs[i].load(std::memory_order_relaxed);
+      milliseconds[i] = double(uint32_t(current - previous[i])) / 1000;
+      previous[i] = current;
+    }
+    const auto world = frame_profile::worldListTotals();
+    if (havePrevious)
+      hostStages = {true, milliseconds[0], milliseconds[1], milliseconds[2], milliseconds[3], milliseconds[4],
+                    double(uint32_t(world.lists - previousWorld.lists)) / 1000,
+                    double(uint32_t(world.patches - previousWorld.patches)) / 1000};
+    previousWorld = world;
+    havePrevious = true;
   }
   Timer timer(g_usSubmit, &g_totalUs[2]);
   // Classify this frame's perspective views. The main view is the one with the
@@ -8530,6 +8534,7 @@ void onPresent() {
       l.attenuation2 = b.attenuation[2];
       l.thetaDot = b.thetaDot;
       l.phiDot = b.phiDot;
+      l.forwardCutoff = b.forwardCutoff;
       if (b.style) {
         // Switchable and flickering lights: scaled by their lightstyle (off at 0).
         const float value = engineLights && engineLights->styles && b.style > 0 && b.style < 128
@@ -8597,6 +8602,44 @@ void onPresent() {
 #endif
     if (g_skyDome)
       g_api.DrawLightInstance(g_skyDome); // the captured 2D skybox (setSkyFaces)
+    // Styled lights capture a separate immutable fully-on definition. The retained
+    // BSP snapshot supplies emissive materials independently of this list.
+    std::vector<remixapi_LightHandle> bakeLights;
+    std::vector<remixapi_BakeStyledLightEXT> styledLights;
+    static const float bakeLightScale = envScale("OPENREMIX_PROXY_LIGHT_SCALE", 1.f);
+    static const float bakeSunScale = envScale("OPENREMIX_PROXY_SUN_SCALE", 1.f);
+    bool bakeLightsReady = true;
+    for (const auto &light : bsp::lights()) {
+      if (light.style) {
+        SourceLight authored = {};
+        authored.type = light.type;
+        std::memcpy(authored.color, light.color, 12);
+        std::memcpy(authored.position, light.position, 12);
+        std::memcpy(authored.direction, light.direction, 12);
+        authored.attenuation0 = light.attenuation[0];
+        authored.attenuation1 = light.attenuation[1];
+        authored.attenuation2 = light.attenuation[2];
+        authored.thetaDot = light.thetaDot;
+        authored.phiDot = light.phiDot;
+        authored.forwardCutoff = light.forwardCutoff;
+        const float currentStyle = engineLights && engineLights->styles && light.style < 128
+                                       ? engineLights->style[light.style] : 1.f;
+        const auto captured = g_styledBakeLights.capture(g_api, authored, light.hash, light.style,
+                                                        bakeLightScale, bakeSunScale, currentStyle);
+        if (!captured.authoredLight) bakeLightsReady = false;
+        else styledLights.push_back(captured);
+        continue;
+      }
+      const auto found = g_lights.find(light.hash);
+      if (found == g_lights.end() || !found->second.handle)
+        bakeLightsReady = false;
+      else
+        bakeLights.push_back(found->second.handle);
+    }
+    if (g_bakeSky.light())
+      bakeLights.push_back(g_bakeSky.light());
+    if (bakeLightsReady)
+      bsp::publishBakeScene(bakeLights, styledLights);
     g_lastLights.swap(g_frameLights);
     g_frameLights.clear();
     for (auto it = g_lights.begin(); it != g_lights.end();) {
@@ -8718,10 +8761,17 @@ void onPresent() {
   }
   sendSceneFog();
   hostpass::submit(g_dumpFlat);
+  remixapi_ErrorCode presentResult;
   {
     Timer present(g_usPresent, &g_totalUs[4]);
-    g_api.Present(nullptr);
+    presentResult = g_api.Present(nullptr);
   }
+  static auto previousPresentResult = REMIXAPI_ERROR_CODE_SUCCESS;
+  if (presentResult != previousPresentResult) {
+    diag::stage("OpenRemix Present returned %u (previous %u)", unsigned(presentResult), unsigned(previousPresentResult));
+    previousPresentResult = presentResult;
+  }
+  frame_profile::sample(g_frameIntervalMs, presentResult, g_gameWindow, g_api.GetWindowState, hostStages);
   if (mark)
     diag::stage("frame %u: presented", presents);
   logWindowState(presents);
@@ -10408,13 +10458,7 @@ bool onMarker(const char *text) {
   else if (const char *v = argument("lights"))
     engine_lights::activate(uint32_t(std::strtoul(v, nullptr, 10)));
   else if (const char *v = argument("map")) {
-    if (g_ready) {
-      resetSky(); // the previous map's dome; this map's sky draws follow
-#ifdef PROXY_GAME_PORTAL2
-      portal2::reset(g_api);
-#endif
-      proxy::bsp::load(g_api, v);
-    }
+    loadMap(v);
   } else
     return false;
   return true;
@@ -10425,9 +10469,7 @@ bool onMarker(const char *text) {
 // 1 if its world is taken from the BSP, so the engine's world draws are dropped.
 extern "C" __declspec(dllexport) int __cdecl openremix_proxy_load_map(const char *mapName) {
   using namespace proxy::remix;
-  if (!g_ready)
-    return 0;
-  return proxy::bsp::load(g_api, mapName ? mapName : "") ? 1 : 0;
+  return loadMap(mapName) ? 1 : 0;
 }
 
 // l4d2-rtx: whether the BSP world draws the static prop at this placement

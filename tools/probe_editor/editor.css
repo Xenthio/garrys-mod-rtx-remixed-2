@@ -1,0 +1,57 @@
+:root {
+  font: 14px system-ui;
+  color: #dbe5ee;
+  background: #12191f;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; height: 100vh; display: flex; flex-direction: column; }
+header {
+  min-height: 60px; display: flex; flex-wrap: wrap; align-items: center;
+  gap: 12px; padding: 12px 18px; border-bottom: 1px solid #34414b;
+}
+header strong { font-size: 18px; }
+button, .button {
+  background: #293945; border: 1px solid #52616b; border-radius: 5px;
+  padding: 7px 10px; color: inherit; cursor: pointer;
+}
+button:hover, .button:hover { background: #405463; }
+.button { display: inline-block; margin: 0; }
+#save { background: #215c69; }
+#status { margin-left: auto; color: #88d8c5; }
+main { flex: 1; min-height: 0; display: flex; }
+aside {
+  width: 290px; flex: none; padding: 16px; overflow: auto;
+  border-right: 1px solid #34414b;
+}
+label { display: block; margin: 8px 0; }
+select { display: block; width: 100%; margin-top: 8px; }
+input {
+  min-width: 0; width: 100%; padding: 6px; border: 1px solid #52616b;
+  border-radius: 4px; background: #1c2933; color: inherit;
+}
+input[type=checkbox] { width: auto; }
+.triple { display: grid; grid-template-columns: repeat(3,1fr); gap: 5px; }
+.property { margin: 12px 0; }
+.property span { display: block; margin-bottom: 5px; color: #a4b8c6; }
+p { color: #a4b8c6; line-height: 1.55; }
+#workspace { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+article { position: relative; min-height: 0; min-width: 0; background: #16212a; }
+h2 {
+  position: absolute; top: 8px; left: 14px; pointer-events: none;
+  font-size: 13px; font-weight: 500; color: #a4b8c6; margin: 0;
+}
+canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+#perspective { flex: 1; min-height: 180px; }
+#perspective canvas { position: absolute; inset: 0; }
+#perspective h2 { z-index: 1; }
+#precision { flex: none; border-top: 1px solid #34414b; }
+summary { padding: 8px 14px; cursor: pointer; }
+#views {
+  height: 320px; display: grid; grid-template-columns: repeat(3,1fr);
+  grid-template-rows: 1fr; gap: 1px; background: #34414b;
+}
+#note { font-size: 12px; }
+#showReference { margin-right: 6px; }
+#referenceControl { white-space: nowrap; }
+[hidden] { display: none !important; }

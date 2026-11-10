@@ -10,7 +10,6 @@
 #include <cstring>
 #include <map>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -47,7 +46,7 @@ const std::map<std::string, uint32_t> kOptions = {
     {"rtx.smoothNormalsTextures", REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS},
 };
 
-std::shared_mutex g_lock;
+std::mutex g_lock;
 std::map<std::string, std::vector<uint64_t>> g_lists;
 std::unordered_map<uint64_t, uint32_t> g_flags;
 
@@ -116,7 +115,7 @@ void loadFile(const std::wstring &path) {
 } // namespace
 
 void load(const std::wstring &directory) {
-  std::unique_lock lock(g_lock);
+  std::lock_guard lock(g_lock);
   g_lists.clear();
   loadFile(directory + L"\\rtx.conf");
   loadFile(directory + L"\\user.conf");
@@ -126,7 +125,7 @@ void load(const std::wstring &directory) {
 bool set(const char *option, const char *value) {
   if (!option || !value || !kOptions.count(option))
     return false;
-  std::unique_lock lock(g_lock);
+  std::lock_guard lock(g_lock);
   g_lists[option] = parse(value);
   rebuild();
   return true;
@@ -141,13 +140,13 @@ uint32_t lookup(uint64_t textureHash) {
   }();
   if (!textureHash)
     return 0;
-  std::shared_lock lock(g_lock);
+  std::lock_guard lock(g_lock);
   auto it = g_flags.find(textureHash);
   return it == g_flags.end() ? 0 : it->second & mask;
 }
 
 size_t size() {
-  std::shared_lock lock(g_lock);
+  std::lock_guard lock(g_lock);
   return g_flags.size();
 }
 

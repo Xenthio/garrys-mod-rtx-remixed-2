@@ -33,7 +33,7 @@ jobs:
       - name: Check out OpenRemix headers
         uses: actions/checkout@v4
         with:
-          repository: sambow23/OpenRemix
+          repository: OpenRenderCollective/OpenRemix
           ref: ${{ inputs.openremix_ref || 'main' }}
           path: openremix
           sparse-checkout: |

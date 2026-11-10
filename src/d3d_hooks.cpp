@@ -12,12 +12,16 @@
 #include "vertex_program.h"
 #include "dxvk_hash.h"
 #include "host_passes.h"
+#include "shader_bytecode.h"
+#include "d3d_method.h"
+#include "query_profile.h"
 
 #include <algorithm>
 #include <psapi.h>
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -871,22 +875,14 @@ const std::wstring &moduleDir() {
   }();
   return dir;
 }
-// The bytecode's length in DWORDs, as the created shader reports it
-// (GetFunction). Not found by walking the tokens to the END token: shader
-// model 1 gives no instruction lengths, and a def's float constants read as
-// instructions then, so a walk could miss the END and run off the end of the
-// game's buffer (it did, into unmapped stack, on Windows).
-template <typename Shader> size_t shaderWords(Shader *shader) {
-  UINT bytes = 0;
-  if (!shader || FAILED(shader->GetFunction(nullptr, &bytes)) || bytes < 8 || bytes % 4)
-    return 0;
-  return bytes / 4;
-}
-template <typename Shader> void keepShaderCode(Shader *shader, const DWORD *function, const char *kind) {
-  const size_t words = function ? shaderWords(shader) : 0;
-  if (!words)
+void keepShaderCode(const void *shader, std::shared_ptr<const std::vector<uint32_t>> code,
+                    const char *kind) {
+  if (!code) {
+    std::lock_guard<std::mutex> lock(g_vertexProgramLock);
+    g_shaderCode.erase(shader);
     return;
-  auto code = std::make_shared<std::vector<uint32_t>>(function, function + words);
+  }
+  const size_t words = code->size();
   static const bool dump = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_DUMP_SHADERS", v, sizeof(v)) && v[0] == '1';
@@ -1001,6 +997,20 @@ SetShaderConstantBFn g_setVertexShaderConstantB = nullptr, g_setPixelShaderConst
 // Occlusion queries: Issue, GetData.
 enum : unsigned { kQIssue, kQGetData };
 ClassHooks<2> g_queryClasses({kQueryIssue, kQueryGetData});
+QueryProfile g_queryProfile;
+
+bool queryProfiling() {
+  static const bool enabled = [] {
+    const char *value = std::getenv("OPENREMIX_PROXY_QUERY_PROFILE");
+    return value && *value && std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
+QueryProfile::Kind queryKind(D3DQUERYTYPE type) {
+  return type == D3DQUERYTYPE_EVENT ? QueryProfile::Event :
+         type == D3DQUERYTYPE_OCCLUSION ? QueryProfile::Occlusion : QueryProfile::Other;
+}
 // Occlusion queries between Issue(BEGIN) and Issue(END).
 std::unordered_set<IDirect3DQuery9 *> g_openOcclusion;
 // Render targets the game issued occlusion queries on, by the frame it last
@@ -1077,6 +1087,11 @@ HRESULT STDMETHODCALLTYPE reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp
   targetread::release();
   remix::onCreateDevice(nullptr, pp);
   const HRESULT hr = g_reset(dev, pp);
+  if (FAILED(hr))
+    diag::stage("D3D Reset failed: HRESULT 0x%08lx, size %ux%u, format %u, windowed %d",
+                static_cast<unsigned long>(hr), pp ? pp->BackBufferWidth : 0,
+                pp ? pp->BackBufferHeight : 0, pp ? unsigned(pp->BackBufferFormat) : 0,
+                pp ? int(pp->Windowed) : -1);
   if (SUCCEEDED(hr))
     refreshBackBuffer(dev);
   if (SUCCEEDED(hr) && game::kFixedFunction)
@@ -1366,23 +1381,22 @@ HRESULT STDMETHODCALLTYPE setVertexDeclaration(IDirect3DDevice9 *dev, IDirect3DV
 HRESULT STDMETHODCALLTYPE createVertexShader(IDirect3DDevice9 *dev, const DWORD *function,
                                              IDirect3DVertexShader9 **out) {
   const HRESULT hr = g_createVertexShader(dev, function, out);
-  if (SUCCEEDED(hr) && out && *out && function) {
-    static_assert(sizeof(DWORD) == sizeof(uint32_t));
-    auto program = vsprog::compile(reinterpret_cast<const uint32_t *>(function));
+  if (SUCCEEDED(hr) && out && *out) {
+    const auto code = readShaderBytecode(*out);
+    auto program = code ? vsprog::compile(code->data(), code->size()) : nullptr;
+    keepShaderCode(*out, code, "vs");
     std::lock_guard<std::mutex> lock(g_vertexProgramLock);
     g_stats.vertexPrograms += program != nullptr;
     g_vertexPrograms[*out] = std::move(program);
     ++g_vertexProgramsCreated;
   }
-  if (SUCCEEDED(hr) && out && *out)
-    keepShaderCode(*out, function, "vs");
   return hr;
 }
 
 HRESULT STDMETHODCALLTYPE createPixelShader(IDirect3DDevice9 *dev, const DWORD *function, IDirect3DPixelShader9 **out) {
   const HRESULT hr = g_createPixelShader(dev, function, out);
   if (SUCCEEDED(hr) && out && *out)
-    keepShaderCode(*out, function, "ps");
+    keepShaderCode(*out, readShaderBytecode(*out), "ps");
   return hr;
 }
 
@@ -1523,23 +1537,27 @@ bool occludersReady(IDirect3DDevice9 *dev) {
   g_occluders.version = o.version;
   g_occluders.failed = true;
   const UINT vbBytes = UINT(o.positions.size() * sizeof(float)), ibBytes = UINT(o.indices.size() * 4);
-  // MANAGED: survives device resets. Created and filled through the real
-  // entry points, so the proxy's buffer tracking never sees them.
+  // MANAGED: survives device resets. Bypass creation tracking, then dispatch
+  // Lock/Unlock through each object's own vtable. Native D3D9 can use different
+  // implementations for managed and default-pool buffers; an entry point saved
+  // from a game buffer is not valid for these objects.
   if (FAILED(g_createVertexBuffer(dev, vbBytes, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_MANAGED, &g_occluders.vb,
                                   nullptr)) ||
       FAILED(g_createIndexBuffer(dev, ibBytes, D3DUSAGE_WRITEONLY, D3DFMT_INDEX32, D3DPOOL_MANAGED, &g_occluders.ib,
                                  nullptr)))
     return false;
   void *data = nullptr;
-  if (FAILED(g_vbClasses.original<LockFn>(g_occluders.vb, kBufLock)(g_occluders.vb, 0, 0, &data, 0)) || !data)
+  if (FAILED(g_occluders.vb->Lock(0, vbBytes, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.positions.data(), vbBytes);
-  g_vbClasses.original<UnlockFn>(g_occluders.vb, kBufUnlock)(g_occluders.vb);
+  if (FAILED(g_occluders.vb->Unlock()))
+    return false;
   data = nullptr;
-  if (FAILED(g_ibClasses.original<LockFn>(g_occluders.ib, kBufLock)(g_occluders.ib, 0, 0, &data, 0)) || !data)
+  if (FAILED(g_occluders.ib->Lock(0, ibBytes, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.indices.data(), ibBytes);
-  g_ibClasses.original<UnlockFn>(g_occluders.ib, kBufUnlock)(g_occluders.ib);
+  if (FAILED(g_occluders.ib->Unlock()))
+    return false;
   g_occluders.vertices = UINT(o.positions.size() / 3);
   g_occluders.triangles = UINT(o.indices.size() / 3);
   g_occluders.failed = false;
@@ -1590,7 +1608,15 @@ void drawOccluders(IDirect3DDevice9 *dev) {
 }
 
 HRESULT STDMETHODCALLTYPE queryGetData(IDirect3DQuery9 *query, void *data, DWORD size, DWORD flags) {
-  const HRESULT hr = g_queryClasses.original<QueryGetDataFn>(query, kQGetData)(query, data, size, flags);
+  const auto original = g_queryClasses.original<QueryGetDataFn>(query, kQGetData);
+  const bool profile = queryProfiling();
+  const uint64_t start = profile ? nowUs() : 0;
+  const HRESULT hr = original(query, data, size, flags);
+  if (profile) {
+    const uint64_t elapsed = nowUs() - start;
+    g_queryProfile.polled(queryKind(query->GetType()), hr == S_FALSE, FAILED(hr),
+                         (flags & D3DGETDATA_FLUSH) != 0, elapsed);
+  }
   if (hr == S_OK && data && size >= 4 && query->GetType() == D3DQUERYTYPE_OCCLUSION) {
 #if defined(PROXY_GAME_EZ2)
     // Raytracing renders occluded entities; prevent the engine from culling
@@ -1623,7 +1649,10 @@ HRESULT STDMETHODCALLTYPE queryIssue(IDirect3DQuery9 *query, DWORD flags) {
     else if (flags & D3DISSUE_END)
       g_openOcclusion.erase(query);
   }
-  return g_queryClasses.original<QueryIssueFn>(query, kQIssue)(query, flags);
+  const HRESULT hr = g_queryClasses.original<QueryIssueFn>(query, kQIssue)(query, flags);
+  if (queryProfiling() && SUCCEEDED(hr) && (flags & D3DISSUE_END))
+    g_queryProfile.issued(queryKind(query->GetType()));
+  return hr;
 }
 
 // A depth clear takes the occluders with it: the engine clears depth between
@@ -1647,7 +1676,7 @@ HRESULT STDMETHODCALLTYPE clear(IDirect3DDevice9 *dev, DWORD count, const D3DREC
 
 HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, IDirect3DQuery9 **out) {
   const HRESULT hr = g_createQuery(dev, type, out);
-  if (SUCCEEDED(hr) && out && *out && type == D3DQUERYTYPE_OCCLUSION)
+  if (SUCCEEDED(hr) && out && *out && (type == D3DQUERYTYPE_OCCLUSION || queryProfiling()))
     g_queryClasses.see(*out, {reinterpret_cast<void *>(&queryIssue), reinterpret_cast<void *>(&queryGetData)});
   return hr;
 }
@@ -1667,9 +1696,9 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
     declaration = &e;
     ++g_stats.fvfDraws;
   } else {
-    auto decl = g_declElements.find(g_decl);
-    if (decl == g_declElements.end())
-      return false;
+  auto decl = g_declElements.find(g_decl);
+  if (decl == g_declElements.end())
+    return false;
     elements = decl->second.data();
   }
   remix::Draw d;
@@ -2334,6 +2363,14 @@ HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
                                        D3DPRESENT_PARAMETERS *pp, IDirect3DDevice9 **out) {
   remix::onCreateDevice(focus, pp);
   const HRESULT hr = g_createDevice(d3d, adapter, type, focus, flags, pp, out);
+  if (FAILED(hr))
+    diag::stage("D3D CreateDevice failed: HRESULT 0x%08lx, adapter %u, type %u, flags 0x%lx, "
+                "size %ux%u, format %u, samples %u, swap %u, windowed %d, interval 0x%x",
+                static_cast<unsigned long>(hr), adapter, unsigned(type), static_cast<unsigned long>(flags),
+                pp ? pp->BackBufferWidth : 0, pp ? pp->BackBufferHeight : 0,
+                pp ? unsigned(pp->BackBufferFormat) : 0, pp ? unsigned(pp->MultiSampleType) : 0,
+                pp ? unsigned(pp->SwapEffect) : 0, pp ? int(pp->Windowed) : -1,
+                pp ? pp->PresentationInterval : 0);
   if (SUCCEEDED(hr) && out && *out) {
     hookDevice(*out);
     refreshBackBuffer(*out);
@@ -2535,6 +2572,8 @@ bool volumeCopy(const void *texture, uint32_t &width, uint32_t &height, uint32_t
 void dumpStatistics(FILE *out) {
   const uint32_t frames = g_stats.frames.exchange(0);
   const double f = frames ? frames : 1;
+  if (queryProfiling())
+    g_queryProfile.dump(out, f);
   fprintf(out, "== D3D9 per frame (%u frames): DIP %.1f (%.0f prims) DP %.1f DIPUP %.1f DPUP %.1f, depth DIP %.1f (occlusion queries %.1f: visible %.1f hidden %.1f; occluder passes %.1f, depth clears after one %.1f)\n",
           frames, g_stats.dip.exchange(0) / f, g_stats.dipPrims.exchange(0) / f, g_stats.dp.exchange(0) / f,
           g_stats.dipUP.exchange(0) / f, g_stats.dpUP.exchange(0) / f, g_stats.depthDraws.exchange(0) / f, g_stats.occlusionQueries.exchange(0) / f,

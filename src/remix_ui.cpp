@@ -3,6 +3,7 @@
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keyboard.h>
+#include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 
@@ -18,13 +19,16 @@ WNDPROC g_previous = nullptr;
 WNDPROC g_gameProc = nullptr;
 remixapi_Interface *g_api = nullptr;
 bool g_active = false;
+bool g_hovered = false;
+unsigned g_injected = 0, g_rejected = 0;
 char g_status[160] = "not installed";
 int g_pumpError = 0;
 unsigned g_toggles = 0;
 
-// The runtime's SDL3.dll, loaded by remix.dll into this process.
+// Resolve the runtime's actual SDL module; do not load a second event queue.
 template <class Fn> Fn sdl(const char *name) {
-  static HMODULE module = GetModuleHandleW(L"SDL3.dll");
+  HMODULE module = GetModuleHandleW(L"SDL3_shared.dll");
+  if (!module) module = GetModuleHandleW(L"SDL3.dll");
   return module ? reinterpret_cast<Fn>(GetProcAddress(module, name)) : nullptr;
 }
 
@@ -115,24 +119,35 @@ SDL_MouseButtonFlags g_buttons = 0;
 std::array<std::string, 64> g_text;
 size_t g_textIndex = 0;
 
-enum class Input { Motion, Button, Wheel, Key, Text, Focus };
+enum class Input { Motion, Button, Wheel, Key, Text, Focus, Hover };
 
 // Pushes one window input event to the runtime's SDL queue.
 void inject(Input type, uint32_t code, bool down, float x = 0, float y = 0, float wheel = 0) {
   static auto push = sdl<bool (*)(SDL_Event *)>("SDL_PushEvent");
   static auto windows = sdl<SDL_Window **(*)(int *)>("SDL_GetWindows");
   static auto windowId = sdl<SDL_WindowID (*)(SDL_Window *)>("SDL_GetWindowID");
+  static auto properties = sdl<SDL_PropertiesID (*)(SDL_Window *)>("SDL_GetWindowProperties");
+  static auto pointerProperty = sdl<void *(*)(SDL_PropertiesID, const char *, void *)>("SDL_GetPointerProperty");
   static auto sdlFree = sdl<void (*)(void *)>("SDL_free");
   static auto ticks = sdl<Uint64 (*)()>("SDL_GetTicksNS");
   static auto keyFromScancode = sdl<SDL_Keycode (*)(SDL_Scancode, SDL_Keymod, bool)>("SDL_GetKeyFromScancode");
-  if (!push || !windows || !windowId || !sdlFree || !ticks || !keyFromScancode)
+  if (!push || !windows || !windowId || !properties || !pointerProperty || !sdlFree || !ticks || !keyFromScancode) {
+    ++g_rejected;
     return;
+  }
   int count = 0;
   SDL_Window **list = windows(&count);
-  const SDL_WindowID id = list && count > 0 ? windowId(list[0]) : 0;
+  SDL_WindowID id = 0;
+  for (int i = 0; list && i < count; ++i)
+    if (pointerProperty(properties(list[i]), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr) == g_window) {
+      id = windowId(list[i]);
+      break;
+    }
   sdlFree(list);
-  if (!id)
+  if (!id) {
+    ++g_rejected;
     return;
+  }
 
   SDL_Event e = {};
   e.common.timestamp = ticks();
@@ -203,8 +218,23 @@ void inject(Input type, uint32_t code, bool down, float x = 0, float y = 0, floa
       g_buttons = 0;
     }
     break;
+  case Input::Hover:
+    e.type = down ? SDL_EVENT_WINDOW_MOUSE_ENTER : SDL_EVENT_WINDOW_MOUSE_LEAVE;
+    e.window.windowID = id;
+    break;
   }
-  push(&e);
+  if (push(&e)) ++g_injected;
+  else ++g_rejected;
+}
+
+void hover(bool inside) {
+  if (g_hovered == inside) return;
+  g_hovered = inside;
+  inject(Input::Hover, 0, inside);
+  if (inside) {
+    TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, g_window, 0};
+    TrackMouseEvent(&track);
+  }
 }
 
 // Opens or closes the panel on the proxy's side: input capture and cursor.
@@ -221,7 +251,9 @@ void setActive(bool active) {
       g_y = float(p.y);
     }
   }
+  hover(g_active);
   inject(Input::Focus, 0, g_active);
+  if (g_active) inject(Input::Motion, 0, false, g_x, g_y);
   setCursorVisible(g_active);
 }
 
@@ -246,7 +278,13 @@ void toggle() {
 bool forward(UINT message, WPARAM w, LPARAM l) {
   const float x = float(short(LOWORD(l))), y = float(short(HIWORD(l)));
   switch (message) {
-  case WM_MOUSEMOVE: inject(Input::Motion, 0, false, x, y); break;
+  case WM_MOUSEMOVE:
+    // We consume WM_MOUSEMOVE before SDL's window procedure can emit enter.
+    // Without it ImGui falls back to polling the host's warped mouse position.
+    hover(true);
+    inject(Input::Motion, 0, false, x, y);
+    break;
+  case WM_MOUSELEAVE: hover(false); break;
   case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: inject(Input::Button, 1, true, x, y); break;
   case WM_LBUTTONUP: inject(Input::Button, 1, false, x, y); break;
   case WM_MBUTTONDOWN: case WM_MBUTTONDBLCLK: inject(Input::Button, 2, true, x, y); break;
@@ -283,6 +321,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
       return 0;
   } else if (g_active) {
     if (message == WM_KILLFOCUS || message == WM_SETFOCUS) {
+      if (message == WM_KILLFOCUS) hover(false);
       inject(Input::Focus, 0, message == WM_SETFOCUS);
       pump();
     } else if (forward(message, w, l)) {
@@ -324,6 +363,7 @@ void uninstall() {
   if (g_active)
     setCursorVisible(false);
   g_active = false;
+  g_hovered = false;
   g_gameProc = nullptr;
   std::snprintf(g_status, sizeof(g_status), "uninstalled");
 }
@@ -336,8 +376,10 @@ void open() {
 }
 
 void dumpStatistics(FILE *out) {
-  std::fprintf(out, "   Remix panel: %s; open %d, toggles %u, PumpEvents error %d\n", g_status, int(g_active),
-               g_toggles, g_pumpError);
+  std::fprintf(out, "   Remix panel: %s; open %d, toggles %u, PumpEvents error %d; shared SDL %d, "
+                   "injected %u, rejected %u, hovered %d\n", g_status, int(g_active),
+               g_toggles, g_pumpError, GetModuleHandleW(L"SDL3_shared.dll") != nullptr,
+               g_injected, g_rejected, int(g_hovered));
 }
 
 } // namespace proxy::remix_ui

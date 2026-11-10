@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Cubemap bounds workbench</title>
+  <link rel="stylesheet" href="editor.css">
+</head>
+<body>
+  <header>
+    <strong>Cubemap bounds</strong><span id="mapName"></span>
+    <button id="add">Add cubemap</button>
+    <button id="undo">Undo</button><button id="redo">Redo</button>
+    <button id="save">Save</button>
+    <label><input type="checkbox" id="live"> Live save</label>
+    <button id="export">Export JSON</button>
+    <label class="button">Import JSON<input id="import" type="file" accept=".json" hidden></label>
+    <label id="referenceControl" hidden><input id="showReference" type="checkbox" checked> Original fit</label>
+    <span id="status" role="status"></span>
+  </header>
+  <main>
+    <aside>
+      <label>Volumes<select id="volumes" size="9"></select></label>
+      <button id="remove">Delete selected</button>
+      <div id="properties"></div>
+      <button id="focus">Frame selected</button>
+      <button id="goCapture">Go to capture</button>
+      <button id="frameMap">Frame map</button>
+      <p>Hold right mouse and use WASD to fly; Q/E move down/up, Shift moves faster,
+        and the wheel adjusts speed. Escape exits mouse look.</p>
+      <p>Drag yellow face handles to resize, the green square to move bounds
+        (Alt when overlapping), or the blue capture point to move it independently.
+        Use XYZ rotation fields or the optional orthographic views to rotate.
+        Add cubemap places a volume at the camera.</p>
+      <p>Higher priorities win overlaps. Coordinates use BSP units. Capture points
+        stay fixed when moving, resizing or rotating bounds.</p>
+      <p id="note"></p>
+      <p>Live save publishes edits when a runtime output is configured. The game keeps
+        its previous valid reflections while changed captures are prepared.</p>
+    </aside>
+    <section id="workspace">
+      <article id="perspective">
+        <h2>Perspective · 3D authoring</h2>
+        <canvas class="solid" aria-label="Solid BSP preview"></canvas>
+        <canvas class="gizmos" aria-label="Cubemap volume handles and fly camera" tabindex="0"></canvas>
+      </article>
+      <details id="precision">
+        <summary>Orthographic precision views</summary>
+        <section id="views">
+          <article><h2>Top · XY</h2><canvas data-axes="0,1,2"></canvas></article>
+          <article><h2>Front · XZ</h2><canvas data-axes="0,2,1"></canvas></article>
+          <article><h2>Side · YZ</h2><canvas data-axes="1,2,0"></canvas></article>
+        </section>
+      </details>
+    </section>
+  </main>
+  <script type="module" src="editor.js"></script>
+</body>
+</html>

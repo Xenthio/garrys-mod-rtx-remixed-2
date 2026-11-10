@@ -38,6 +38,8 @@ struct Shading {
   std::string mask;          // mask texture ("models/x/y_mask"), SelfIllumMask / MaskAlpha
   std::string base;          // $basetexture's name ("" when unknown), also of Lit materials
   pbr::Material pbr;         // its PBR conversion (pbr_rules), of the lit surface shaders
+  uint64_t reflectionReceiverKey = 0; // stable VMT receiver identity, independent of selected volume
+  uint64_t reflectionSceneId = 0, reflectionVolumeId = 0;
 };
 
 // The shading a VMT's shader name selects: Unlit for the unlit shaders,

@@ -5,9 +5,11 @@
 #include "engine_patches.h"
 #include "engine_shadows.h"
 #include "game.h"
+#include "frame_profile.h"
 
 #include <windows.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +45,20 @@ void *g_engineClient = nullptr;
 char g_level[256] = {};
 
 DWORD g_mainThread = 0; // the thread of the first Present: the engine's main one
+
+using WorldListClock = std::chrono::steady_clock;
+thread_local WorldListClock::time_point worldListsStarted;
+thread_local uint32_t worldPatchMicroseconds = 0;
+
+bool profileWorldLists() {
+  // The engine hook can run before the renderer has loaded remix.dll.
+  static const bool enabled = GetEnvironmentVariableW(L"OPENREMIX_PROXY_FRAME_PROFILE", nullptr, 0) != 0;
+  return enabled;
+}
+
+uint32_t microseconds(WorldListClock::duration duration) {
+  return uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
+}
 
 // Texture detail Very High (mat_picmip -1) with the Advanced video options
 // hidden: the command line cannot carry it (the engine drops a negative value
@@ -107,14 +123,27 @@ void noteLevel() {
 extern "C" {
 void *openremix_drawWorldListsOriginal = nullptr;
 void openremix_worldListsBegin() {
+  using namespace proxy::engine;
+  const bool profile = profileWorldLists();
+  if (profile) worldListsStarted = WorldListClock::now();
   proxy::engine::noteLevel();
   proxy::engine_lights::sample();
+  const auto patchStarted = profile ? WorldListClock::now() : WorldListClock::time_point{};
   proxy::engine_patches::beginWorldLists();
+  if (profile) worldPatchMicroseconds = microseconds(WorldListClock::now() - patchStarted);
   proxy::engine::marker("openremix:world_lists 1");
 }
 void openremix_worldListsEnd() {
+  using namespace proxy::engine;
+  const bool profile = profileWorldLists();
   proxy::engine::marker("openremix:world_lists 0");
+  const auto patchStarted = profile ? WorldListClock::now() : WorldListClock::time_point{};
   proxy::engine_patches::endWorldLists();
+  if (profile) {
+    const auto now = WorldListClock::now();
+    proxy::frame_profile::recordWorldLists(microseconds(now - worldListsStarted),
+        worldPatchMicroseconds + microseconds(now - patchStarted));
+  }
 }
 void openremix_drawWorldLists();
 }
