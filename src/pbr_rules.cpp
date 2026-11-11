@@ -60,6 +60,7 @@ Material convert(const Inputs &given) {
     in.baseAlphaPhongMask = false;
   }
 
+  // Strata-style PBR materials use metal/rough/AO rather than ExoPBR ARM.
   if (in.shader == "pbr") {
     out.active = true;
     out.normal = in.bump;
