@@ -8500,7 +8500,11 @@ void onPresent() {
     tracked = std::move(nextTracked);
     {
       Timer bspTimer(g_usBsp, &g_totalUs[3]);
-      bsp::submit(materialForHash);
+      float eye[3];
+      for (int i = 0; i < 3; ++i)
+        eye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
+                   main->view[14] * main->view[i * 4 + 2]);
+      bsp::submit(materialForHash, eye);
     }
 #ifdef PROXY_GAME_PORTAL2
     {

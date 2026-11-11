@@ -837,6 +837,25 @@ struct DetailStatistics {
   float textureRatio = 1; // texture width / height (Source stretches V by it)
   // Engine draws dropped (render thread): sprite draws, detail model draws.
   uint64_t droppedSprites = 0, droppedModels = 0;
+  // The distance cut (detailCut): cl_detaildist and cl_detailfade as used,
+  // whether an env_detail_controller lowered them, and the cut they give.
+  float dist = 1200, fade = 400, cut = 0;
+  bool controller = false;
+  // Units shown at the last frame; visibility changes and the frames with any
+  // (since the last dump), and change calls the runtime refused.
+  uint32_t shown = 0;
+  uint64_t changes = 0, changeFrames = 0, refused = 0;
+};
+
+// One detail sprite cell or detail model: what the distance cut shows or
+// hides as a whole (submit). Its scene instances while the map's are kept.
+struct DetailUnit {
+  float center[3] = {};
+  bool group = false;
+  std::array<int32_t, 3> key{}; // detailGroups key (group)
+  uint32_t prop = 0;            // props index (a model)
+  bool shown = true;
+  std::vector<uint64_t> scene;
 };
 
 // info_overlay decals, clipped onto their faces; merged per cell and blend.
@@ -996,6 +1015,7 @@ struct World {
   std::unordered_map<uint64_t, std::vector<uint32_t>> detailModelCells;
   DetailStatistics detail;
   uint32_t detailMeshes = 0; // detail sprite meshes built (submit)
+  std::vector<DetailUnit> detailUnits;
   // Point location at runtime (the camera of a view): BSP tree and leaf areas.
   std::vector<Node> nodes;
   std::vector<Plane> planes;
@@ -2876,7 +2896,8 @@ template <typename InSky> void loadDetail(const Bsp &bsp, const InSky &inSky) {
       stats.state = "built (the sprite material has no texture: sprites left to the engine)";
     }
   }
-  constexpr float kCell = 1024;
+  // Small cells: the distance cut (submit) shows and hides whole cells.
+  constexpr float kCell = 256;
   for (int32_t i = 0; i < objectCount; ++i) {
     DetailObject o;
     std::memcpy(&o, lump.data() + at + size_t(i) * sizeof(DetailObject), sizeof(o));
@@ -3036,8 +3057,67 @@ template <typename InSky> void loadDetail(const Bsp &bsp, const InSky &inSky) {
     group.alphaRef = m.alphaRef;
     group.categories = m.categories;
     group.id = XXH3_64bits_withSeed(it->first.data(), sizeof(it->first), 0x6474616cull) | 1;
+    DetailUnit unit;
+    unit.group = true;
+    unit.key = it->first;
+    float lo[3] = {FLT_MAX, FLT_MAX, FLT_MAX}, hi[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (const auto &[index, geometry] : group.surfaces)
+      for (const auto &v : geometry.vertices)
+        for (int k = 0; k < 3; ++k) {
+          lo[k] = std::min(lo[k], v.position[k]);
+          hi[k] = std::max(hi[k], v.position[k]);
+        }
+    for (int k = 0; k < 3; ++k)
+      unit.center[k] = (lo[k] + hi[k]) / 2;
+    g_world.detailUnits.push_back(unit);
     ++it;
   }
+  for (const auto &[cell, indices] : g_world.detailModelCells)
+    for (uint32_t index : indices) {
+      DetailUnit unit;
+      unit.prop = index;
+      for (int k = 0; k < 3; ++k)
+        unit.center[k] = g_world.props[index].transform[k][3];
+      g_world.detailUnits.push_back(unit);
+    }
+  // The distance the engine shows them to. Its detail object system fades
+  // them out with the camera's squared distance d2, from (cl_detaildist -
+  // cl_detailfade)^2 to cl_detaildist^2 (BuildDetailObjectRenderLists; 800
+  // and 1200 units by default), and an env_detail_controller lowers both
+  // (LevelInitPostEntity: cl_detailfade = min(cl_detailfade, fademindist),
+  // cl_detaildist = min(cl_detaildist, fademaxdist)). Fixed geometry cannot
+  // fade, so it is cut where that fade is half way (alpha 0.5, d2 midway):
+  // 1020 units by default. Cut by whole cells (by their centre) it is a band
+  // about as wide as the engine's fade. OPENREMIX_PROXY_DETAIL_DIST and
+  // OPENREMIX_PROXY_DETAIL_FADE stand in for the console variables, which the
+  // proxy does not read; a distance of 0 shows everything.
+  auto setting = [](const char *name, float fallback) {
+    char v[32] = {};
+    return GetEnvironmentVariableA(name, v, sizeof(v)) ? float(std::atof(v)) : fallback;
+  };
+  stats.dist = setting("OPENREMIX_PROXY_DETAIL_DIST", 1200);
+  stats.fade = setting("OPENREMIX_PROXY_DETAIL_FADE", 400);
+  {
+    const auto [text, length] = bsp.lump<char>(kEntities);
+    const std::string entities = text ? std::string(text, length) : std::string();
+    for (size_t open = entities.find('{'); open != std::string::npos; open = entities.find('{', open + 1)) {
+      const size_t close = entities.find('}', open);
+      if (close == std::string::npos)
+        break;
+      KeyValues kv;
+      if (!parseKeyValues("entity " + entities.substr(open, close - open + 1), kv) ||
+          lower(kv.values["classname"]) != "env_detail_controller")
+        continue;
+      stats.controller = true;
+      if (kv.values.count("fademindist"))
+        stats.fade = std::min(stats.fade, float(std::atof(kv.values["fademindist"].c_str())));
+      if (kv.values.count("fademaxdist"))
+        stats.dist = std::min(stats.dist, float(std::atof(kv.values["fademaxdist"].c_str())));
+      break;
+    }
+  }
+  const float fadeStart = std::max(stats.dist - stats.fade, 0.0f);
+  stats.cut = stats.dist > 0 ? std::sqrt((stats.dist * stats.dist + fadeStart * fadeStart) / 2) : 0;
   for (auto &[key, model] : g_world.propModels)
     for (auto &part : model.parts)
       std::vector<remixapi_HardcodedVertex>().swap(part.loadVertices);
@@ -4786,7 +4866,184 @@ static bool updateCubemapReceivers() {
   return bindingsChanged;
 }
 
-void submit(MaterialLookup lookup) {
+// What the camera does not see of the map, as in Source: back faces (except
+// $nocull materials) and what lies in clusters outside the camera cluster's
+// potentially visible set (the runtime locates the camera and each surface
+// point in the partition sendPartition() gave it; the 3D skybox, drawn by
+// Source whatever the PVS says, is exempt). Camera rays only: shadows,
+// bounces and reflections still meet every instance from both sides, so
+// lighting is what it was. OPENREMIX_PROXY_BSP_CULL_BACKFACES=0 and
+// OPENREMIX_PROXY_BSP_CULL_PVS=0 switch each off.
+uint32_t cameraCullFlags() {
+  static const uint32_t flags = [] {
+    char v[8] = {};
+    uint32_t flags = REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT | REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT;
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_CULL_BACKFACES", v, sizeof(v)) && v[0] == '0')
+      flags &= ~uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT);
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_CULL_PVS", v, sizeof(v)) && v[0] == '0')
+      flags &= ~uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT);
+    return flags;
+  }();
+  return flags;
+}
+
+// Chains camera culling (flags) in front of info.pNext.
+void chainCulling(remixapi_InstanceInfo &info, remixapi_InstanceInfoCameraCullingEXT &culling, uint32_t flags) {
+  culling = {};
+  culling.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_CAMERA_CULLING_EXT;
+  culling.flags = flags;
+  if (!flags)
+    return;
+  culling.pNext = info.pNext;
+  info.pNext = &culling;
+}
+
+// A prop's part as an instance, handed to emit(info, material), which may
+// chain more in front of info.pNext before drawing it.
+template <typename Emit> void describePropPart(const Prop &prop, const PropPart &part, Emit &&emit) {
+  const auto &m = g_world.materials[part.material];
+  remixapi_InstanceInfoMaterialEXT material = {};
+  material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_EXT;
+  material.material = m.ref.handle;
+  remixapi_InstanceInfoBlendEXT blend = {};
+  blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+  blend.pNext = m.ref.handle ? &material : nullptr;
+  blend.alphaTestEnabled = m.alphaTest;
+  blend.alphaTestReferenceValue = m.alphaRef;
+  blend.alphaTestCompareOp = m.alphaTest ? 6 : 7;
+  if (m.blended) {
+    blend.alphaBlendEnabled = 1;
+    blend.srcColorBlendFactor = blend.srcAlphaBlendFactor = 6;
+    blend.dstColorBlendFactor = blend.dstAlphaBlendFactor = 7;
+    blend.writeMask = 15;
+    blend.tFactor = 0x00ffffffu | (uint32_t(m.opacity * 255 + .5f) << 24);
+    blend.textureAlphaOperation = 3; // modulate texture alpha by constant opacity
+    blend.textureAlphaArg1Source = 1;
+    blend.textureAlphaArg2Source = 3;
+  }
+  remixapi_InstanceInfoReplacementHashEXT replacement = {};
+  replacement.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_REPLACEMENT_HASH_EXT;
+  replacement.pNext = &blend;
+  replacement.meshHash = part.replacementHash;
+  remixapi_InstanceIdentityEXT identity = {};
+  identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
+  identity.pNext = &replacement;
+  identity.instanceId = prop.id ^ part.replacementHash;
+  identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
+  identity.rasterVisible = 1;
+  remixapi_InstanceInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+  info.pNext = &identity;
+  info.mesh = part.mesh;
+  info.categoryFlags = m.categories;
+  std::memcpy(info.transform.matrix, prop.transform, sizeof(info.transform.matrix));
+  info.doubleSided = m.blended ? m.noCull : 1;
+  // (A prop is hidden per point like the map, not per leaf list as Source
+  // draws it: see the runtime's VISIBILITY flag.)
+  emit(info, m);
+}
+
+// A detail unit's instances, handed to emit(info) ready to draw: a sprite
+// cell alpha-tested like the map's foliage and not double-sided (each quad
+// is in the mesh once per face, with its own normal); a model as its parts.
+template <typename Emit> void describeDetail(const DetailUnit &unit, Emit &&emit) {
+  if (!unit.group) {
+    const Prop &prop = g_world.props[unit.prop];
+    for (const auto &part : prop.model->parts)
+      describePropPart(prop, part, [&](remixapi_InstanceInfo &info, const Material &m) {
+        remixapi_InstanceInfoCameraCullingEXT culling;
+        chainCulling(info, culling,
+                     cameraCullFlags() & ~(m.noCull ? uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT) : 0u));
+        emit(info);
+      });
+    return;
+  }
+  const auto found = g_world.detailGroups.find(unit.key);
+  if (found == g_world.detailGroups.end() || !found->second.mesh)
+    return;
+  const Group &group = found->second;
+  remixapi_InstanceInfoBlendEXT blend = {};
+  blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+  blend.alphaTestEnabled = 1;
+  blend.alphaTestReferenceValue = group.alphaRef;
+  blend.alphaTestCompareOp = 6; // VK_COMPARE_OP_GREATER_OR_EQUAL
+  remixapi_InstanceIdentityEXT identity = {};
+  identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
+  identity.pNext = &blend;
+  identity.instanceId = group.id;
+  identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
+  identity.rasterVisible = 1;
+  remixapi_InstanceInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+  info.pNext = &identity;
+  info.mesh = group.mesh;
+  info.categoryFlags = group.categories;
+  info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
+  info.doubleSided = 0;
+  remixapi_InstanceInfoCameraCullingEXT culling;
+  chainCulling(info, culling, cameraCullFlags());
+  emit(info);
+}
+
+// The distance cut (loadDetail's detail.cut) at the camera: which detail
+// units are shown, by the distance to their centre, with a margin either way
+// so that a camera standing at the cut does not flip a cell every frame.
+// changed: the units whose state changed. Without a camera everything shows.
+void cutDetail(const float *eye, std::vector<uint32_t> &changed) {
+  constexpr float kMargin = 32;
+  const float cut = g_world.detail.cut;
+  uint32_t shown = 0;
+  for (uint32_t i = 0; i < g_world.detailUnits.size(); ++i) {
+    auto &unit = g_world.detailUnits[i];
+    bool show = true;
+    if (eye && cut > 0) {
+      float d2 = 0;
+      for (int k = 0; k < 3; ++k)
+        d2 += (unit.center[k] - eye[k]) * (unit.center[k] - eye[k]);
+      const float edge = unit.shown ? cut + kMargin : cut - kMargin;
+      show = d2 < edge * edge;
+    }
+    shown += show;
+    if (show != unit.shown) {
+      unit.shown = show;
+      changed.push_back(i);
+    }
+  }
+  g_world.detail.shown = shown;
+  g_world.detail.changes += changed.size();
+  g_world.detail.changeFrames += !changed.empty();
+}
+
+// Shows or hides kept detail units' scene instances (the units in `only`,
+// else every hidden one: just added, all visible), leaving the map's other
+// scene instances, and so the scene version and its static set, as they are.
+void showDetail(const std::vector<uint32_t> *only) {
+  static const auto change =
+      sceneFunction<PFN_remixapi_ChangeSceneInstancesEXT>("remixapi_ChangeSceneInstancesEXT");
+  std::vector<remixapi_SceneInstanceChangeEXT> changes;
+  auto add = [&](const DetailUnit &unit) {
+    for (uint64_t handle : unit.scene) {
+      remixapi_SceneInstanceChangeEXT c = {};
+      c.instance = handle;
+      c.fields = REMIXAPI_SCENE_INSTANCE_VISIBLE_EXT;
+      c.visible = unit.shown;
+      changes.push_back(c);
+    }
+  };
+  if (only) {
+    for (uint32_t i : *only)
+      add(g_world.detailUnits[i]);
+  } else {
+    for (const auto &unit : g_world.detailUnits)
+      if (!unit.shown)
+        add(unit);
+  }
+  if (!changes.empty() &&
+      (!change || change(changes.data(), uint32_t(changes.size())) != REMIXAPI_ERROR_CODE_SUCCESS))
+    ++g_world.detail.refused;
+}
+
+void submit(MaterialLookup lookup, const float *eye) {
   if (!g_active || !g_world.api)
     return;
   const auto &api = *g_world.api;
@@ -4903,6 +5160,17 @@ void submit(MaterialLookup lookup) {
     build(group, true);
     g_world.detailMeshes += group.mesh != nullptr;
   }
+  // The detail props within the cut. They come and go as the camera moves
+  // without changing the instances' version: a kept scene shows and hides
+  // their instances (showDetail), a recorded batch leaves them out and they
+  // are drawn after it (drawDetail).
+  std::vector<uint32_t> detailChanged;
+  cutDetail(eye, detailChanged);
+  const auto drawDetail = [&] {
+    for (const auto &unit : g_world.detailUnits)
+      if (unit.shown)
+        describeDetail(unit, [&](const remixapi_InstanceInfo &info) { api.DrawInstance(&info); });
+  };
   // The instances below change rarely: once the submission has been stable
   // for a while it is recorded as a bridge batch (openremix_bridge_*) and
   // replayed with one command per frame instead of thousands of DrawInstance
@@ -4930,6 +5198,7 @@ void submit(MaterialLookup lookup) {
   }
   if (g_world.batchValid && g_world.batchVersion == g_world.submitVersion && replayBatch &&
       replayBatch(kBatchId) == REMIXAPI_ERROR_CODE_SUCCESS) {
+    drawDetail();
     ++g_world.replayedFrames;
     return;
   }
@@ -4941,10 +5210,13 @@ void submit(MaterialLookup lookup) {
   static const auto addScene =
       batchEnabled ? sceneFunction<PFN_remixapi_AddSceneInstancesEXT>("remixapi_AddSceneInstancesEXT") : nullptr;
   static const auto drawScene = sceneFunction<PFN_remixapi_DrawSceneInstancesEXT>("remixapi_DrawSceneInstancesEXT");
-  if (g_world.sceneValid && g_world.sceneVersion == g_world.submitVersion && drawScene &&
-      drawScene(nullptr) == REMIXAPI_ERROR_CODE_SUCCESS) {
-    ++g_world.replayedFrames;
-    return;
+  if (g_world.sceneValid && g_world.sceneVersion == g_world.submitVersion && drawScene) {
+    if (!detailChanged.empty())
+      showDetail(&detailChanged);
+    if (drawScene(nullptr) == REMIXAPI_ERROR_CODE_SUCCESS) {
+      ++g_world.replayedFrames;
+      return;
+    }
   }
   dropSceneInstances();
   const bool keep = addScene && drawScene && frame - g_world.stableSince >= 30 &&
@@ -4978,23 +5250,8 @@ void submit(MaterialLookup lookup) {
       ++surfaceIndex;
     }
   };
-  // What the camera does not see of the map, as in Source: back faces (except
-  // $nocull materials) and what lies in clusters outside the camera cluster's
-  // potentially visible set (the runtime locates the camera and each surface
-  // point in the partition sendPartition() gave it; the 3D skybox, drawn by
-  // Source whatever the PVS says, is exempt). Camera rays only: shadows,
-  // bounces and reflections still meet every instance from both sides, so
-  // lighting is what it was. OPENREMIX_PROXY_BSP_CULL_BACKFACES=0 and
-  // OPENREMIX_PROXY_BSP_CULL_PVS=0 switch each off.
-  static const uint32_t cullEnabled = [] {
-    char v[8] = {};
-    uint32_t flags = REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT | REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT;
-    if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_CULL_BACKFACES", v, sizeof(v)) && v[0] == '0')
-      flags &= ~uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT);
-    if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_CULL_PVS", v, sizeof(v)) && v[0] == '0')
-      flags &= ~uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT);
-    return flags;
-  }();
+  // What the camera does not see of the map (cameraCullFlags).
+  const uint32_t cullEnabled = cameraCullFlags();
   auto &cullStats = g_world.cull;
   cullStats.backFaces = cullStats.visibility = cullStats.twoSided = cullStats.skybox = cullStats.instances = 0;
   // Chains the camera culling of an instance in front of info.pNext.
@@ -5111,80 +5368,27 @@ void submit(MaterialLookup lookup) {
     const auto retained = draw(info);
     captureCharts(retained, group);
   }
-  // Detail sprites (loadDetail): alpha-tested like the map's foliage. Not
-  // double-sided: each quad is in the mesh once per face, with its own normal.
-  for (auto &[key, group] : g_world.detailGroups) {
-    if (!group.mesh)
-      continue;
-    remixapi_InstanceInfoBlendEXT blend = {};
-    blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
-    blend.alphaTestEnabled = 1;
-    blend.alphaTestReferenceValue = group.alphaRef;
-    blend.alphaTestCompareOp = 6; // VK_COMPARE_OP_GREATER_OR_EQUAL
-    remixapi_InstanceIdentityEXT identity = {};
-    identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
-    identity.pNext = &blend;
-    identity.instanceId = group.id;
-    identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
-    identity.rasterVisible = 1;
-    remixapi_InstanceInfo info = {};
-    info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    info.pNext = &identity;
-    info.mesh = group.mesh;
-    info.categoryFlags = group.categories;
-    info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
-    info.doubleSided = 0;
-    remixapi_InstanceInfoCameraCullingEXT culling;
-    cameraCulling(info, culling, false, false);
-    draw(info);
-  }
-  for (const auto &prop : g_world.props) {
-    if (prop.skybox)
-      continue;
-    for (const auto &part : prop.model->parts) {
-      const auto &m = g_world.materials[part.material];
-      remixapi_InstanceInfoMaterialEXT material = {};
-      material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_EXT;
-      material.material = m.ref.handle;
-      remixapi_InstanceInfoBlendEXT blend = {};
-      blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
-      blend.pNext = m.ref.handle ? &material : nullptr;
-      blend.alphaTestEnabled = m.alphaTest;
-      blend.alphaTestReferenceValue = m.alphaRef;
-      blend.alphaTestCompareOp = m.alphaTest ? 6 : 7;
-      if (m.blended) {
-        blend.alphaBlendEnabled = 1;
-        blend.srcColorBlendFactor = blend.srcAlphaBlendFactor = 6;
-        blend.dstColorBlendFactor = blend.dstAlphaBlendFactor = 7;
-        blend.writeMask = 15;
-        blend.tFactor = 0x00ffffffu | (uint32_t(m.opacity * 255 + .5f) << 24);
-        blend.textureAlphaOperation = 3; // modulate texture alpha by constant opacity
-        blend.textureAlphaArg1Source = 1;
-        blend.textureAlphaArg2Source = 3;
-      }
-      remixapi_InstanceInfoReplacementHashEXT replacement = {};
-      replacement.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_REPLACEMENT_HASH_EXT;
-      replacement.pNext = &blend;
-      replacement.meshHash = part.replacementHash;
-      remixapi_InstanceIdentityEXT identity = {};
-      identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
-      identity.pNext = &replacement;
-      identity.instanceId = prop.id ^ part.replacementHash;
-      identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
-      identity.rasterVisible = 1;
-      remixapi_InstanceInfo info = {};
-      info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-      info.pNext = &identity;
-      info.mesh = part.mesh;
-      info.categoryFlags = m.categories;
-      std::memcpy(info.transform.matrix, prop.transform, sizeof(info.transform.matrix));
-      info.doubleSided = m.blended ? m.noCull : 1;
-      // (A prop is hidden per point like the map, not per leaf list as Source
-      // draws it: see the runtime's VISIBILITY flag.)
-      remixapi_InstanceInfoCameraCullingEXT culling;
-      cameraCulling(info, culling, m.noCull, prop.skyTraced);
-      draw(info);
+  // Detail props: a kept scene gets them all and hides those beyond the cut
+  // (below); a recording leaves them out; else those within it are drawn.
+  if (!record)
+    for (auto &unit : g_world.detailUnits) {
+      unit.scene.clear();
+      if (!keep && !unit.shown)
+        continue;
+      describeDetail(unit, [&](const remixapi_InstanceInfo &info) {
+        if (const uint64_t handle = draw(info))
+          unit.scene.push_back(handle);
+      });
     }
+  for (const auto &prop : g_world.props) {
+    if (prop.skybox || prop.detail)
+      continue;
+    for (const auto &part : prop.model->parts)
+      describePropPart(prop, part, [&](remixapi_InstanceInfo &info, const Material &m) {
+        remixapi_InstanceInfoCameraCullingEXT culling;
+        cameraCulling(info, culling, m.noCull, prop.skyTraced);
+        draw(info);
+      });
   }
   if (keep) {
     // Attempted once per version: a refused instance leaves the map to
@@ -5192,6 +5396,7 @@ void submit(MaterialLookup lookup) {
     g_world.sceneVersion = g_world.submitVersion;
     g_world.sceneValid = kept;
     ++g_world.recordings;
+    showDetail(nullptr);
     drawScene(nullptr);
     if (!kept)
       dropSceneInstances();
@@ -5201,6 +5406,7 @@ void submit(MaterialLookup lookup) {
     g_world.batchVersion = g_world.submitVersion;
     g_world.batchValid = endRecording(kBatchId) == REMIXAPI_ERROR_CODE_SUCCESS;
     ++g_world.recordings;
+    drawDetail();
   }
 }
 
@@ -5572,12 +5778,17 @@ void dumpStatistics(FILE *out) {
             "as crossed quads), shape cross %u, shape tri %u, models %u | left out: 3D skybox %u, unknown type %u, "
             "invalid %u, models not loaded or partly translucent %u | %u triangles (both faces) in %zu groups, %u "
             "meshes built%s | texture aspect %.2f | engine draws dropped per frame: detail sprite draws %.1f, detail "
-            "model draws %.1f\n",
+            "model draws %.1f\n"
+            "   BSP detail distance cut: %.0f units (cl_detaildist %.0f, cl_detailfade %.0f%s; OPENREMIX_PROXY_DETAIL_DIST "
+            "/ _FADE) | units (sprite cells and models) %zu, shown %u | shown/hidden changes %llu in %llu of %.0f "
+            "frames | change calls refused %llu\n",
             d.version, d.state, d.objects, d.sprites, d.screenAligned, d.crosses, d.tris, d.models, d.skippedSky,
             d.skippedType, d.skippedInvalid, d.skippedModels, d.triangles, g_world.detailGroups.size(),
             g_world.detailMeshes, waiting ? " (waiting for the sprite texture)" : "", d.textureRatio,
-            double(d.droppedSprites) / frames, double(d.droppedModels) / frames);
-    d.droppedSprites = d.droppedModels = 0;
+            double(d.droppedSprites) / frames, double(d.droppedModels) / frames, d.cut, d.dist, d.fade,
+            d.controller ? ", lowered by env_detail_controller" : "", g_world.detailUnits.size(), d.shown,
+            (unsigned long long)d.changes, (unsigned long long)d.changeFrames, frames, (unsigned long long)d.refused);
+    d.droppedSprites = d.droppedModels = d.changes = d.changeFrames = 0;
   }
   {
     const auto &l = g_world.layers;

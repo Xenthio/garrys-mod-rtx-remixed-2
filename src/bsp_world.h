@@ -104,7 +104,9 @@ bool active();
 bool overlaysActive();
 
 // Resolves materials, builds pending meshes and draws this frame's instances.
-void submit(MaterialLookup lookup);
+// eye: the main view's camera, for the detail props' distance cut (null:
+// no cut).
+void submit(MaterialLookup lookup, const float *eye = nullptr);
 
 // Publish the complete retained BSP scene for load-time baking. Static map
 // lights and the captured sky use ordinary handles. Stationary styled lights
