@@ -817,6 +817,26 @@ struct Prop {
   bool skybox = false;
   // A 3D skybox prop baked into world space (path-traced skybox).
   bool skyTraced = false;
+  // A detail model (loadDetail), not a static prop: matched against the
+  // engine's draws by World::detailModelCells, not propCells.
+  bool detail = false;
+};
+
+// What loadDetail made of the map's detail props (game lump "dprp").
+struct DetailStatistics {
+  const char *state = "no detail lump";
+  uint32_t version = 0, objects = 0;
+  // By type: sprites (by orientation: fixed, screen-aligned made two crossed
+  // quads), SHAPE_CROSS, SHAPE_TRI, models.
+  uint32_t sprites = 0, screenAligned = 0, crosses = 0, tris = 0, models = 0;
+  // Left out: in the 3D skybox, of an unknown type, with an index past the
+  // dictionaries or no size, models that did not load.
+  uint32_t skippedSky = 0, skippedType = 0, skippedInvalid = 0, skippedModels = 0;
+  uint32_t triangles = 0;
+  int material = -1; // g_world.materials index of the sprite material
+  float textureRatio = 1; // texture width / height (Source stretches V by it)
+  // Engine draws dropped (render thread): sprite draws, detail model draws.
+  uint64_t droppedSprites = 0, droppedModels = 0;
 };
 
 // info_overlay decals, clipped onto their faces; merged per cell and blend.
@@ -970,6 +990,12 @@ struct World {
   std::map<std::pair<std::string, int>, PropModel> propModels; // by model path and skin
   std::vector<std::unique_ptr<PropModel>> clippedSkyModels; // stable per-placement ownership
   std::vector<Prop> props;
+  // Detail props (loadDetail): sprites by 1024-unit cell, two-faced, one
+  // mesh each; the detail models are props, their placements' cells here.
+  std::map<std::array<int32_t, 3>, Group> detailGroups;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> detailModelCells;
+  DetailStatistics detail;
+  uint32_t detailMeshes = 0; // detail sprite meshes built (submit)
   // Point location at runtime (the camera of a view): BSP tree and leaf areas.
   std::vector<Node> nodes;
   std::vector<Plane> planes;
@@ -1238,14 +1264,16 @@ std::string cstring(const std::vector<uint8_t> &b, size_t at) {
 }
 
 int materialByName(const std::string &name, bool brush = false);
+int litMaterial(int material);
 } // namespace
 int areaAt(const float p[3]);
 namespace {
 
 // A static prop's model: body 0 of every body part at LOD 0, a part per VTX
 // strip (vertices in strip-group order from the VVD, indices rebased), each
-// with the dxvk mesh hash of the engine's draw of it.
-bool loadPropModel(const std::string &path, int skin, PropModel &out) {
+// with the dxvk mesh hash of the engine's draw of it. lit: the model is a
+// detail prop (loadDetail), whose unlit materials are lit by the path tracer.
+bool loadPropModel(const std::string &path, int skin, PropModel &out, bool lit = false) {
   std::vector<uint8_t> mdl, vvd, vtx;
   const std::string base = path.substr(0, path.size() - 4);
   if (!fs::read(path, mdl) || !fs::read(base + ".vvd", vvd) || !fs::read(base + ".dx90.vtx", vtx) ||
@@ -1333,6 +1361,8 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
         uint64_t bytes;
         if (fs::size("materials/" + name + ".vmt", bytes)) {
           material = materialByName(name);
+          if (lit)
+            material = litMaterial(material);
           sourceMaterial = name;
           found = true;
           break;
@@ -1444,7 +1474,8 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
           surface.indices_count = partIndices.size();
           remixapi_MeshInfo info = {};
           info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-          info.hash = geometry ^ textureHash;
+          // A lit copy is another mesh than the static prop's of the same model.
+          info.hash = (geometry ^ textureHash) ^ (lit ? 0x6c6974ull : 0);
           info.surfaces_values = &surface;
           info.surfaces_count = 1;
           PropPart part;
@@ -2113,6 +2144,28 @@ int materialByName(const std::string &name, bool brush) {
   return slot;
 }
 
+// A material lit by the path tracer whatever its shader. Detail props are
+// UnlitGeneric only because the engine lights them itself (their lighting
+// baked at each object by the map compiler); as emitters they glowed in the
+// dark. Other materials are returned as they are.
+int litMaterial(int material) {
+  if (material < 0 || g_world.materials[size_t(material)].shading.mode != engine_materials::Shading::Unlit)
+    return material;
+  const std::string key = "\x02" + lower(g_world.materials[size_t(material)].name);
+  if (auto it = g_world.materialIndex.find(key); it != g_world.materialIndex.end())
+    return it->second;
+  Material m = g_world.materials[size_t(material)];
+  m.shading = {};
+  m.shading.base = m.baseTexture;
+  m.maskCandidates.clear();
+  m.resolved = m.owned = false;
+  m.ref = {};
+  const int slot = int(g_world.materials.size());
+  g_world.materials.push_back(std::move(m));
+  g_world.materialIndex[key] = slot;
+  return slot;
+}
+
 // Whether a world material (by its g_world.materials index) has a second
 // layer; `use`: one of its displacements blends it in, so its material and
 // its blend modulation are needed too.
@@ -2293,6 +2346,9 @@ void destroyMeshes() {
     if (group.mesh && g_world.api)
       g_world.api->DestroyMesh(group.mesh);
   for (auto &[key, group] : g_world.layerGroups)
+    if (group.mesh && g_world.api)
+      g_world.api->DestroyMesh(group.mesh);
+  for (auto &[key, group] : g_world.detailGroups)
     if (group.mesh && g_world.api)
       g_world.api->DestroyMesh(group.mesh);
   for (auto &[key, model] : g_world.propModels)
@@ -2576,6 +2632,412 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
   }
   // The API copied vertices at CreateMesh. Retain only the existing compact
   // position/index occluders; full attributes were needed solely during loading.
+  for (auto &[key, model] : g_world.propModels)
+    for (auto &part : model.parts)
+      std::vector<remixapi_HardcodedVertex>().swap(part.loadVertices);
+}
+
+// --- Detail props (game lump "dprp") ------------------------------------------
+// The map's grass, bushes and small plants: sprites cut from the detail
+// material's texture, and small models. The client's detail object system
+// rebuilds the sprites every frame as quads turned to face the camera, in a
+// dynamic buffer: traced, that was thousands of new alpha-tested quads a frame
+// (an acceleration structure rebuild each time, and no history for the
+// denoisers: flicker). Here they are built once per map as fixed world-space
+// geometry, static instances like the map's own, and the engine's draws of
+// them are dropped (providesDetailSprites, isDetailModel).
+// OPENREMIX_PROXY_BSP_DETAIL=0 leaves them to the engine.
+#pragma pack(push, 1)
+// DetailObjectLump_t of dprp version 4, the only version Source SDK 2013's
+// client reads (HL2, GMod): 52 bytes.
+struct DetailObject {
+  float origin[3], angles[3];
+  uint16_t detailModel, leaf; // a model or sprite dictionary index, by type
+  uint8_t lighting[4];        // ColorRGBExp32: the map compiler's lighting at the object
+  uint32_t lightStyles;
+  uint8_t lightStyleCount, swayAmount, shapeAngle, shapeSize, orientation, padding2[3], type, padding3[3];
+  float scale; // of sprites
+};
+// DetailSpriteDictLump_t: the sprite's extent about its origin (x along its
+// right, y up) and its corners in the detail texture.
+struct DetailSprite {
+  float ul[2], lr[2], texUL[2], texLR[2];
+};
+#pragma pack(pop)
+static_assert(sizeof(DetailObject) == 52 && sizeof(DetailSprite) == 32, "detail lump layouts");
+// DetailPropType_t.
+enum : uint8_t { kDetailModel = 0, kDetailSprite = 1, kDetailShapeCross = 2, kDetailShapeTri = 3 };
+
+bool detailEnabled() {
+  static const bool enabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_DETAIL", v, sizeof(v)) && v[0] == '0');
+  }();
+  return enabled;
+}
+
+// A game lump by its id ("dprp" read as a little-endian int), decoded when
+// compressed, and its version. False: the map has none.
+bool gameLump(const Bsp &bsp, uint32_t wanted, std::vector<uint8_t> &out, uint16_t &version) {
+  const auto &file = bsp.data;
+  const auto [directory, bytes] = bsp.lump<uint8_t>(kGameLump);
+  if (!directory || bytes < 4)
+    return false;
+  int32_t count;
+  std::memcpy(&count, directory, 4);
+  for (int32_t i = 0; i < count && size_t(4 + (i + 1) * 16) <= bytes; ++i) {
+    int32_t id, offset, size;
+    uint16_t flags, lumpVersion;
+    std::memcpy(&id, directory + 4 + i * 16, 4);
+    std::memcpy(&flags, directory + 8 + i * 16, 2);
+    std::memcpy(&lumpVersion, directory + 10 + i * 16, 2);
+    std::memcpy(&offset, directory + 12 + i * 16, 4);
+    std::memcpy(&size, directory + 16 + i * 16, 4);
+    if (uint32_t(id) != wanted || offset <= 0 || size <= 0 || size_t(offset) >= file.size())
+      continue;
+    version = lumpVersion;
+    // Flag 1: compressed (an LZMA blob there), as loadProps reads "sprp".
+    if (flags & 1)
+      return lzma::decodeSource(file.data() + offset, file.size() - size_t(offset), out);
+    if (size_t(offset) + size_t(size) > file.size())
+      return false;
+    out.assign(file.begin() + offset, file.begin() + offset + size);
+    return true;
+  }
+  return false;
+}
+
+// The detail sprite material (the one isDetailSpriteMaterial names), as the
+// path tracer draws it. Its VMT is UnlitGeneric, translucent, with vertex
+// colour and alpha: the engine lights each sprite with the lighting the map
+// compiler baked there and fades it out with distance through the vertex
+// alpha. Here it is lit by the path tracer and alpha-tested (GMod's VMT
+// dropped $alphatest only because it broke that fade, which fixed geometry
+// does not have): at its $alphatestreference, else half way, which keeps the
+// blades about as wide as the blended sprites looked. -1: no texture.
+int detailSpriteMaterial() {
+  KeyValues kv;
+  if (!loadMaterial(g_detailMaterial, kv) || kv.values["$basetexture"].empty())
+    return -1;
+  Material m;
+  m.name = g_detailMaterial;
+  m.baseTexture = lower(kv.values["$basetexture"]);
+  m.candidates = textureHashes(m.baseTexture);
+  if (m.candidates.empty())
+    return -1;
+  m.alphaTest = true;
+  m.alphaRef = 128;
+  if (kv.values.count("$alphatestreference")) {
+    const float r = float(std::atof(kv.values["$alphatestreference"].c_str()));
+    if (r > 0)
+      m.alphaRef = uint8_t(std::clamp(r, 0.0f, 1.0f) * 255 + 0.5f);
+  }
+  m.noCull = true;
+  m.pointSample = std::atoi(kv.values["$pointsample"].c_str()) != 0 || texturePointSample(m.baseTexture);
+  m.shading.base = m.baseTexture;
+  for (uint64_t h : m.candidates)
+    m.categories |= categories::lookup(h);
+  if (m.categories & (REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE | REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN))
+    return -1;
+  const int slot = int(g_world.materials.size());
+  g_world.materials.push_back(std::move(m));
+  return slot;
+}
+
+// A texture's width over its height (VTF header), 1 when unknown. Source
+// stretches the sprites' V coordinates by it for a texture wider than tall
+// (CDetailObjectSystem::LevelInitPreEntity: "non-square textures (cropped)").
+float textureAspect(const std::string &texture) {
+  std::vector<uint8_t> vtf;
+  uint16_t width = 0, height = 0;
+  if (!fs::read(vtfPath(texture), vtf) || vtf.size() < 20 || std::memcmp(vtf.data(), "VTF", 3) != 0 ||
+      !get(vtf, 16, width) || !get(vtf, 18, height) || !width || !height)
+    return 1;
+  return float(width) / float(height);
+}
+
+// Source's AngleVectors: forward, right and up of a QAngle.
+void angleVectors(const float angles[3], float forward[3], float right[3], float up[3]) {
+  const float zero[3] = {};
+  float m[3][4];
+  angleMatrix(angles, zero, m);
+  for (int k = 0; k < 3; ++k) {
+    forward[k] = m[k][0];
+    right[k] = -m[k][1]; // the matrix's second column is left
+    up[k] = m[k][2];
+  }
+}
+
+// One detail quad laid out as Source's DrawSwayingQuad lays it out (corners
+// o, o + h, o + h + w, o + w; texcoords t0 at o, t1 across), once per face:
+// each face wound clockwise seen from its side (the map's convention: see
+// PropPart), for an instance that is not double-sided. Two faces because of
+// their normals: they point mostly up, tilted towards their own side,
+// normalize(up + 0.5 n) (63 degrees above the horizon), so the blades light
+// like the ground they stand on (a sun from above lights both sides of a
+// clump) instead of as thin vertical cards, black on the side away from the
+// light. One two-sided quad cannot carry that: the path tracer turns a
+// shading normal to the side the ray comes from, and an upward normal turned
+// to the far side points down.
+void detailQuad(Geometry &g, const float o[3], const float w[3], const float h[3], const float t0[2], const float t1[2]) {
+  float n[3] = {w[1] * h[2] - w[2] * h[1], w[2] * h[0] - w[0] * h[2], w[0] * h[1] - w[1] * h[0]};
+  const float length = std::sqrt(dot(n, n));
+  if (!(length > 1e-6f))
+    return;
+  for (float &x : n)
+    x /= length;
+  const float corners[4][3] = {{o[0], o[1], o[2]},
+                               {o[0] + h[0], o[1] + h[1], o[2] + h[2]},
+                               {o[0] + h[0] + w[0], o[1] + h[1] + w[1], o[2] + h[2] + w[2]},
+                               {o[0] + w[0], o[1] + w[1], o[2] + w[2]}};
+  const float uv[4][2] = {{t0[0], t0[1]}, {t0[0], t1[1]}, {t1[0], t1[1]}, {t1[0], t0[1]}};
+  for (int side = 0; side < 2; ++side) {
+    const float s = side ? -1.0f : 1.0f;
+    const float face[3] = {n[0] * s, n[1] * s, n[2] * s};
+    float shade[3] = {.5f * face[0], .5f * face[1], .5f * face[2] + 1};
+    const float shadeLength = std::sqrt(dot(shade, shade));
+    for (float &x : shade)
+      x /= shadeLength;
+    // A quad lying (nearly) flat: its face's own normal on its underside.
+    if (dot(shade, face) < .1f)
+      std::memcpy(shade, face, sizeof(shade));
+    const uint32_t base = uint32_t(g.vertices.size());
+    for (int c = 0; c < 4; ++c) {
+      remixapi_HardcodedVertex v = {};
+      std::memcpy(v.position, corners[c], sizeof(v.position));
+      std::memcpy(v.normal, shade, sizeof(v.normal));
+      v.texcoord[0] = uv[c][0];
+      v.texcoord[1] = uv[c][1];
+      v.color = 0xffffffff;
+      g.vertices.push_back(v);
+    }
+    // cross(h, w) is -n: (0, 1, 2) is clockwise seen from n's side.
+    if (!side)
+      g.indices.insert(g.indices.end(), {base, base + 1, base + 2, base, base + 2, base + 3});
+    else
+      g.indices.insert(g.indices.end(), {base, base + 2, base + 1, base, base + 3, base + 2});
+  }
+  g_world.detail.triangles += 4;
+}
+
+template <typename InSky> void loadDetail(const Bsp &bsp, const InSky &inSky) {
+  auto &stats = g_world.detail;
+  if (!detailEnabled()) {
+    stats.state = "off (OPENREMIX_PROXY_BSP_DETAIL=0)";
+    return;
+  }
+  std::vector<uint8_t> lump;
+  uint16_t version = 0;
+  if (!gameLump(bsp, 0x64707270, lump, version))
+    return;
+  stats.version = version;
+  // Older versions the client ignores ("Map uses old detail prop file
+  // format"); newer ones (other branches' maps) are left to their engine.
+  if (version != 4) {
+    stats.state = "lump version not 4: left to the engine";
+    return;
+  }
+  stats.state = "malformed lump: left to the engine";
+  size_t at = 0;
+  const int32_t names = i32(lump, at);
+  at += 4;
+  if (names < 0 || lump.size() < at || size_t(names) > (lump.size() - at) / 128)
+    return;
+  std::vector<std::string> models;
+  for (int32_t m = 0; m < names; ++m, at += 128) {
+    const auto *name = reinterpret_cast<const char *>(lump.data() + at);
+    models.push_back(lower(std::string(name, strnlen(name, 128))));
+  }
+  const int32_t spriteCount = i32(lump, at);
+  at += 4;
+  if (spriteCount < 0 || at > lump.size() || size_t(spriteCount) > (lump.size() - at) / sizeof(DetailSprite))
+    return;
+  std::vector<DetailSprite> sprites{size_t(spriteCount)};
+  if (spriteCount)
+    std::memcpy(sprites.data(), lump.data() + at, sprites.size() * sizeof(DetailSprite));
+  at += sprites.size() * sizeof(DetailSprite);
+  const int32_t objectCount = i32(lump, at);
+  at += 4;
+  // The objects end the lump: a branch whose version 4 records differ in size
+  // is not read as this one.
+  if (objectCount < 0 || at > lump.size() || lump.size() - at != size_t(objectCount) * sizeof(DetailObject))
+    return;
+  stats.objects = uint32_t(objectCount);
+  stats.state = "built";
+  // The sprites' material and its texture's aspect (V stretch, as Source).
+  int material = -1;
+  float stretch = 1;
+  if (!sprites.empty()) {
+    material = stats.material = detailSpriteMaterial();
+    if (material >= 0) {
+      stats.textureRatio = textureAspect(g_world.materials[size_t(material)].baseTexture);
+      stretch = stats.textureRatio > 1 ? stats.textureRatio : 1;
+    } else {
+      stats.state = "built (the sprite material has no texture: sprites left to the engine)";
+    }
+  }
+  constexpr float kCell = 1024;
+  for (int32_t i = 0; i < objectCount; ++i) {
+    DetailObject o;
+    std::memcpy(&o, lump.data() + at + size_t(i) * sizeof(DetailObject), sizeof(o));
+    // Source alternates the sprites' horizontal flip over every object,
+    // starting unflipped (CDetailObjectSystem::UnserializeModels).
+    const bool flipped = (i & 1) != 0;
+    bool finite = std::isfinite(o.scale);
+    for (int k = 0; k < 3; ++k)
+      finite &= std::isfinite(o.origin[k]) && std::isfinite(o.angles[k]);
+    if (o.type > kDetailShapeTri) {
+      ++stats.skippedType;
+      continue;
+    }
+    if (!finite) {
+      ++stats.skippedInvalid;
+      continue;
+    }
+    // What the 3D skybox shows stays with the engine's sky view.
+    if (inSky(o.origin)) {
+      ++stats.skippedSky;
+      continue;
+    }
+    if (o.type == kDetailModel) {
+      if (o.detailModel >= models.size()) {
+        ++stats.skippedInvalid;
+        continue;
+      }
+      // As a static prop, its materials lit (litMaterial). A model the engine
+      // still draws part of (translucent meshes) stays with the engine whole:
+      // its draws are matched by placement and dropped as one.
+      const std::string &path = models[o.detailModel];
+      auto [it, fresh] = g_world.propModels.try_emplace({path, -2});
+      if (fresh && !loadPropModel(path, 0, it->second, true))
+        g_world.failedModels.push_back(path);
+      if (it->second.parts.empty() || it->second.engineParts) {
+        ++stats.skippedModels;
+        continue;
+      }
+      Prop prop;
+      angleMatrix(o.angles, o.origin, prop.transform);
+      prop.model = &it->second;
+      prop.detail = true;
+      prop.id = XXH3_64bits_withSeed(&i, sizeof(i), 0x6470726f70ull) | 1;
+      g_world.detailModelCells[propCell(o.origin)].push_back(uint32_t(g_world.props.size()));
+      g_world.props.push_back(prop);
+      ++stats.models;
+      continue;
+    }
+    if (o.detailModel >= sprites.size() || !(o.scale > 0)) {
+      ++stats.skippedInvalid;
+      continue;
+    }
+    if (material < 0)
+      continue;
+    const DetailSprite &sprite = sprites[o.detailModel];
+    const float ul[2] = {sprite.ul[0] * o.scale, sprite.ul[1] * o.scale};
+    const float lr[2] = {sprite.lr[0] * o.scale, sprite.lr[1] * o.scale};
+    float texUL[2] = {sprite.texUL[0], sprite.texUL[1] * stretch};
+    float texLR[2] = {sprite.texLR[0], sprite.texLR[1] * stretch};
+    if (!flipped)
+      std::swap(texUL[0], texLR[0]);
+    const std::array<int32_t, 3> key = {int32_t(std::floor(o.origin[0] / kCell)),
+                                        int32_t(std::floor(o.origin[1] / kCell)),
+                                        int32_t(std::floor(o.origin[2] / kCell))};
+    Geometry &g = g_world.detailGroups[key].surfaces[uint32_t(material)];
+    auto along = [](const float *p, const float *a, float s, const float *b, float t, float out[3]) {
+      for (int k = 0; k < 3; ++k)
+        out[k] = p[k] + a[k] * s + b[k] * t;
+    };
+    float forward[3], right[3], up[3], corner[3], width[3], height[3];
+    angleVectors(o.angles, forward, right, up);
+    if (o.type == kDetailSprite && o.orientation == 0) {
+      // DrawTypeSprite: in the plane of the object's angles.
+      along(o.origin, right, ul[0], up, ul[1], corner);
+      for (int k = 0; k < 3; ++k) {
+        width[k] = right[k] * (lr[0] - ul[0]);
+        height[k] = up[k] * (lr[1] - ul[1]);
+      }
+      detailQuad(g, corner, width, height, texUL, texLR);
+      ++stats.sprites;
+    } else if (o.type == kDetailSprite) {
+      // Screen-aligned (ComputeAngles: 1 turned towards the camera, 2 about
+      // the vertical axis, nearly all of HL2's grass), which fixed geometry
+      // cannot be: two upright quads crossed at the object's origin, each the
+      // whole sprite, turned by a hash of the object so the field does not
+      // line up.
+      const uint64_t hash = XXH3_64bits_withSeed(o.origin, sizeof(o.origin), uint64_t(i));
+      const float yaw = float(hash % 3600) * (3.14159265f / 1800);
+      const float vertical[3] = {0, 0, 1};
+      for (int q = 0; q < 2; ++q) {
+        const float a = yaw + float(q) * 1.57079633f;
+        const float r[3] = {std::cos(a), std::sin(a), 0};
+        along(o.origin, r, ul[0], vertical, ul[1], corner);
+        for (int k = 0; k < 3; ++k) {
+          width[k] = r[k] * (lr[0] - ul[0]);
+          height[k] = vertical[k] * (lr[1] - ul[1]);
+        }
+        detailQuad(g, corner, width, height, texUL, texLR);
+      }
+      ++stats.sprites;
+      ++stats.screenAligned;
+    } else if (o.type == kDetailShapeCross) {
+      // DrawTypeShapeCross: four half-width quads out from the object's
+      // vertical axis, along its back, left, forward and right (south, west,
+      // north, east), each half of the sprite.
+      const float halfWidth = (lr[0] - ul[0]) / 2, tall = lr[1] - ul[1];
+      float base[3];
+      along(o.origin, up, ul[1], up, 0, base);
+      const float middle[2] = {(texUL[0] + texLR[0]) / 2, texUL[1]};
+      const float lowerLeft[2] = {texUL[0], texLR[1]};
+      const float directions[4] = {-1, -1, 1, 1};
+      for (int b = 0; b < 4; ++b) {
+        const float *axis = b == 0 || b == 2 ? forward : right;
+        for (int k = 0; k < 3; ++k) {
+          width[k] = axis[k] * halfWidth * directions[b];
+          height[k] = up[k] * tall;
+        }
+        detailQuad(g, base, width, height, middle, b == 0 || b == 3 ? texLR : lowerLeft);
+      }
+      ++stats.crosses;
+    } else {
+      // DrawTypeShapeTri: three quads at 120 degrees about the object's up,
+      // each tilted by shapeAngle and pushed out by shapeSize of its width.
+      float rotation[3][4];
+      angleMatrix(o.angles, o.origin, rotation);
+      const float flWidth = lr[0] - ul[0], flHeight = lr[1] - ul[1];
+      for (int side = 0; side < 3; ++side) {
+        const float rotated[3] = {float(o.shapeAngle), float(side * 120), 0};
+        float f0[3], r0[3], u0[3], f[3], r[3], u[3];
+        angleVectors(rotated, f0, r0, u0);
+        for (int k = 0; k < 3; ++k) {
+          f[k] = rotation[k][0] * f0[0] + rotation[k][1] * f0[1] + rotation[k][2] * f0[2];
+          r[k] = rotation[k][0] * r0[0] + rotation[k][1] * r0[1] + rotation[k][2] * r0[2];
+          u[k] = rotation[k][0] * u0[0] + rotation[k][1] * u0[1] + rotation[k][2] * u0[2];
+        }
+        along(o.origin, r, ul[0], u, ul[1], corner);
+        for (int k = 0; k < 3; ++k) {
+          corner[k] += f[k] * (float(o.shapeSize) / 255) * flWidth;
+          width[k] = r[k] * flWidth;
+          height[k] = u[k] * flHeight;
+        }
+        detailQuad(g, corner, width, height, texUL, texLR);
+      }
+      ++stats.tris;
+    }
+  }
+  for (auto it = g_world.detailGroups.begin(); it != g_world.detailGroups.end();) {
+    for (auto s = it->second.surfaces.begin(); s != it->second.surfaces.end();)
+      s = s->second.indices.empty() ? it->second.surfaces.erase(s) : std::next(s);
+    if (it->second.surfaces.empty()) {
+      it = g_world.detailGroups.erase(it);
+      continue;
+    }
+    Group &group = it->second;
+    const Material &m = g_world.materials[size_t(material)];
+    group.alphaTest = true;
+    group.alphaRef = m.alphaRef;
+    group.categories = m.categories;
+    group.id = XXH3_64bits_withSeed(it->first.data(), sizeof(it->first), 0x6474616cull) | 1;
+    ++it;
+  }
   for (auto &[key, model] : g_world.propModels)
     for (auto &part : model.parts)
       std::vector<remixapi_HardcodedVertex>().swap(part.loadVertices);
@@ -3767,6 +4229,8 @@ bool build(const Bsp &bsp) {
   loadOverlays(bsp, inSky);
   loadLights(bsp, inSky);
   unsealLights(bsp);
+  // After unsealLights: a light is never sealed in a tuft of grass.
+  loadDetail(bsp, inSky);
   return !g_world.groups.empty();
 }
 
@@ -4432,6 +4896,13 @@ void submit(MaterialLookup lookup) {
     build(group);
   for (auto &[key, group] : g_world.layerGroups)
     build(group, true);
+  // Detail sprites wait for their texture (untextured, they were white
+  // cards): until then the engine's draws of them stay (providesDetailSprites).
+  g_world.detailMeshes = 0;
+  for (auto &[key, group] : g_world.detailGroups) {
+    build(group, true);
+    g_world.detailMeshes += group.mesh != nullptr;
+  }
   // The instances below change rarely: once the submission has been stable
   // for a while it is recorded as a bridge batch (openremix_bridge_*) and
   // replayed with one command per frame instead of thousands of DrawInstance
@@ -4640,6 +5111,33 @@ void submit(MaterialLookup lookup) {
     const auto retained = draw(info);
     captureCharts(retained, group);
   }
+  // Detail sprites (loadDetail): alpha-tested like the map's foliage. Not
+  // double-sided: each quad is in the mesh once per face, with its own normal.
+  for (auto &[key, group] : g_world.detailGroups) {
+    if (!group.mesh)
+      continue;
+    remixapi_InstanceInfoBlendEXT blend = {};
+    blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+    blend.alphaTestEnabled = 1;
+    blend.alphaTestReferenceValue = group.alphaRef;
+    blend.alphaTestCompareOp = 6; // VK_COMPARE_OP_GREATER_OR_EQUAL
+    remixapi_InstanceIdentityEXT identity = {};
+    identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
+    identity.pNext = &blend;
+    identity.instanceId = group.id;
+    identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
+    identity.rasterVisible = 1;
+    remixapi_InstanceInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+    info.pNext = &identity;
+    info.mesh = group.mesh;
+    info.categoryFlags = group.categories;
+    info.transform.matrix[0][0] = info.transform.matrix[1][1] = info.transform.matrix[2][2] = 1;
+    info.doubleSided = 0;
+    remixapi_InstanceInfoCameraCullingEXT culling;
+    cameraCulling(info, culling, false, false);
+    draw(info);
+  }
   for (const auto &prop : g_world.props) {
     if (prop.skybox)
       continue;
@@ -4815,6 +5313,67 @@ bool isStaticProp(const float *modelRows, const float eye[3]) {
     }
   }
   return remember(false);
+}
+
+// Whether a view's camera is inside the 3D skybox (its camera's area); the
+// tree walk is done once per camera position.
+static bool skyView(const float eye[3]) {
+  static float lastEye[3] = {NAN, NAN, NAN};
+  static bool last = false;
+  if (std::memcmp(lastEye, eye, sizeof(lastEye)) != 0) {
+    std::memcpy(lastEye, eye, sizeof(lastEye));
+    last = g_world.skyArea >= 0 && areaAt(eye) == g_world.skyArea;
+  }
+  return last;
+}
+
+bool providesDetailSprites(const float eye[3]) {
+  // The sky view's sprites are the 3D skybox's, which loadDetail leaves out.
+  if (!g_active || !g_world.detailMeshes || skyView(eye))
+    return false;
+  ++g_world.detail.droppedSprites;
+  return true;
+}
+
+bool isDetailModel(const float *modelRows, const float eye[3]) {
+  if (!g_active || g_world.detailModelCells.empty() || skyView(eye))
+    return false;
+  // A model is several consecutive draws at one placement.
+  static float lastRows[12] = {NAN};
+  static bool lastResult = false;
+  if (std::memcmp(lastRows, modelRows, sizeof(lastRows)) == 0) {
+    g_world.detail.droppedModels += lastResult;
+    return lastResult;
+  }
+  std::memcpy(lastRows, modelRows, sizeof(lastRows));
+  lastResult = false;
+  const float origin[3] = {modelRows[3], modelRows[7], modelRows[11]};
+  uint64_t checked[8];
+  int n = 0;
+  for (int corner = 0; corner < 8 && !lastResult; ++corner) {
+    const float probe[3] = {origin[0] + (corner & 1 ? .5f : -.5f), origin[1] + (corner & 2 ? .5f : -.5f),
+                            origin[2] + (corner & 4 ? .5f : -.5f)};
+    const uint64_t cell = propCell(probe);
+    if (std::find(checked, checked + n, cell) != checked + n)
+      continue;
+    checked[n++] = cell;
+    const auto it = g_world.detailModelCells.find(cell);
+    if (it == g_world.detailModelCells.end())
+      continue;
+    for (uint32_t index : it->second) {
+      const auto &t = g_world.props[index].transform;
+      bool same = true;
+      for (int r = 0; r < 3 && same; ++r)
+        for (int c = 0; c < 4 && same; ++c)
+          same = std::fabs(t[r][c] - modelRows[r * 4 + c]) < (c == 3 ? .1f : 2e-3f);
+      if (same) {
+        lastResult = true;
+        break;
+      }
+    }
+  }
+  g_world.detail.droppedModels += lastResult;
+  return lastResult;
 }
 
 const Occluders &occluders() {
@@ -5001,6 +5560,25 @@ void dumpStatistics(FILE *out) {
           g_world.waterDownFaces,
           g_world.surfaceNormalFailure.empty() ? "" : " | not loaded: ", g_world.surfaceNormalFailure.c_str(),
           g_world.mirrorMaterials, g_world.mirrorDraws, mirrorsEnabled() ? "" : " (off: OPENREMIX_PROXY_MIRRORS=0)");
+  {
+    // The engine's draws dropped since the last dump, per frame submitted.
+    auto &d = g_world.detail;
+    static uint64_t lastFrames = 0;
+    const double frames = g_world.frames > lastFrames ? double(g_world.frames - lastFrames) : 1.0;
+    lastFrames = g_world.frames;
+    const bool waiting = d.material >= 0 && !g_world.materials[size_t(d.material)].resolved;
+    fprintf(out,
+            "   BSP detail props (dprp v%u, OPENREMIX_PROXY_BSP_DETAIL): %s | %u objects: sprites %u (%u screen-aligned, "
+            "as crossed quads), shape cross %u, shape tri %u, models %u | left out: 3D skybox %u, unknown type %u, "
+            "invalid %u, models not loaded or partly translucent %u | %u triangles (both faces) in %zu groups, %u "
+            "meshes built%s | texture aspect %.2f | engine draws dropped per frame: detail sprite draws %.1f, detail "
+            "model draws %.1f\n",
+            d.version, d.state, d.objects, d.sprites, d.screenAligned, d.crosses, d.tris, d.models, d.skippedSky,
+            d.skippedType, d.skippedInvalid, d.skippedModels, d.triangles, g_world.detailGroups.size(),
+            g_world.detailMeshes, waiting ? " (waiting for the sprite texture)" : "", d.textureRatio,
+            double(d.droppedSprites) / frames, double(d.droppedModels) / frames);
+    d.droppedSprites = d.droppedModels = 0;
+  }
   {
     const auto &l = g_world.layers;
     uint32_t meshes = 0, waiting = 0;

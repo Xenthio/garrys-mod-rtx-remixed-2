@@ -193,6 +193,17 @@ bool mirrorsOn();
 // each sprite. Render thread (the map is read when its marker arrives).
 bool isDetailSpriteMaterial(const char *materialName);
 
+// The BSP world draws the map's detail props itself, built once from its
+// detail lump (OPENREMIX_PROXY_BSP_DETAIL, default on), and the engine's
+// per-frame draws of them go: providesDetailSprites for a draw with the
+// detail sprite material (true once the sprites' meshes are built), and
+// isDetailModel for a draw whose model-to-world rows place one of its detail
+// models. eye: the view's camera; from inside the 3D skybox both are false
+// (that view's detail props are left out and stay with the engine). Render
+// thread.
+bool providesDetailSprites(const float eye[3]);
+bool isDetailModel(const float *modelRows, const float eye[3]);
+
 void dumpStatistics(FILE *out);
 
 } // namespace proxy::bsp

@@ -6421,6 +6421,10 @@ void onDraw(const Draw &d) {
       left.dstBlend = d.dstBlend;
     }
   }
+  // Detail models the BSP world draws (bsp::isDetailModel), blended or not:
+  // the engine fades them out with distance.
+  if (bsp::isDetailModel(d.vsConstants + kRegModel * 4, eye))
+    return;
 #if defined(PROXY_GAME_EZ2)
   if (!skinnedDraw && !d.blend && bsp::isStaticProp(d.vsConstants + kRegModel * 4, eye)) {
 #else
@@ -6587,7 +6591,9 @@ void onDraw(const Draw &d) {
   // left the denoisers no history (flicker). They are rasterized over the
   // traced image instead, in those baked colours, as the game drew them.
   // OPENREMIX_PROXY_DETAIL_TRACED=1: lit as surfaces by the path tracer
-  // (those colours dropped).
+  // (those colours dropped). Where the BSP world builds them from the map's
+  // detail lump (bsp::providesDetailSprites), fixed and path traced, the
+  // engine's draws go.
   static const bool detailTraced = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_DETAIL_TRACED", v, sizeof(v)) == 1 && v[0] == '1';
@@ -6595,6 +6601,8 @@ void onDraw(const Draw &d) {
   bool detailRaster = false;
   if (shading.mode == engine_materials::Shading::Unlit &&
       bsp::isDetailSpriteMaterial(engine_materials::currentName())) {
+    if (bsp::providesDetailSprites(eye))
+      return;
     if (detailTraced) {
       shading = {};
       shading.base = engine_materials::current().base;
