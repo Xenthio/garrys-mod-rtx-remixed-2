@@ -96,6 +96,7 @@ Material convert(const Inputs &given) {
   out.active = true;
   out.normal = in.bump;
   out.ssbump = in.ssbump && !in.bump.empty();
+  out.directSpecular = in.phong || in.mwb;
   // An unmasked sphere map in mode 1 is how Source draws chrome.
   if (in.envmap && in.envmapSphere && in.envmapMode) {
     out.roughness = 0.05f;

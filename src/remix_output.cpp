@@ -1427,7 +1427,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     key.normal = pbr.normal;
     key.pbr[0] = p.roughness;
     key.pbr[1] = p.metallic;
-    key.pbrBits[0] = uint8_t(1 | p.ssbump << 1);
+    key.pbrBits[0] = uint8_t(1 | p.ssbump << 1 | !p.directSpecular << 2);
     for (int i = 0; i < 2; ++i) {
       const auto &m = p.maps[i];
       key.maps[i] = pbr.maps[i];
@@ -1500,7 +1500,11 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   remixapi_MaterialInfoOpaqueEXT opaque = {};
   opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
   opaque.roughnessConstant = 1; // PBR conversion below overrides this diffuse fallback.
+  remixapi_MaterialDirectSpecularEXT directSpecular{
+      REMIXAPI_STRUCT_TYPE_MATERIAL_DIRECT_SPECULAR_EXT, chain, 0};
   if (pbr.use) {
+    if (!s.pbr.directSpecular)
+      chain = &directSpecular;
     remap.pNext = chain;
     enable.pNext = &remap;
     chain = &enable;

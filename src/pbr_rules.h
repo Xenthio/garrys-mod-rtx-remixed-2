@@ -49,6 +49,7 @@ struct Map {
 // convert (no normal map, Phong or reflection) and keeps diffuse shading.
 struct Material {
   bool active = false;
+  bool directSpecular = true; // Legacy cubemaps alone do not author a direct lobe.
   std::string normal; // its normal map
   bool ssbump = false;
   Map maps[2]; // roughness, metallic
