@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <iterator>
 
 // How this build decides what to draw, and what is changed (engine.dll and
 // client.dll of one build; every address below is an RVA checked at install):
@@ -42,6 +43,18 @@
 //    that thread, the three answer "visible". Everything else that asks the
 //    engine (beams, temporary entities, the shadow list) is answered as
 //    before.
+//  * Brush entities (func_breakable, func_door, func_brush, ...): R_DrawBrushModel
+//    (0xf5e20) hands their opaque faces to CBrushBatchRender::
+//    DrawOpaqueBrushModel (0xf1f80), which marks each plane of the model the
+//    view origin is behind (dot < -0.01, BACKFACE_EPSILON) unless it draws
+//    shadow depth, and leaves out the faces on those planes; and their
+//    translucent faces to a walk of the model's nodes (0xf0d80) that lists a
+//    node's faces only on the side of its plane the view is on (unless
+//    SURFDRAW_NOCULL). The path tracer lost every face turned away from the
+//    camera (shadows, reflections, light through them), and the mesh changed
+//    as the camera moved. Both tests are taken out, for every view and for
+//    good (the GPU's own culling still drops those faces in raster views).
+//    OPENREMIX_PROXY_NOCULL_BRUSHES=0 keeps them.
 //
 // Which views: those that render to the back buffer (the render context's
 // current render target is null: what the proxy takes world views from) and
@@ -193,6 +206,37 @@ struct CodePatch {
 };
 // mov r9d,[rdx] -> xor al,al; ret
 CodePatch g_worldFrustum{"WorldFrustum", 0x135f20, 3, {0x44, 0x8B, 0x0A}, {0x32, 0xC0, 0xC3}};
+
+// Brush entities' back faces (applied once, for good).
+constexpr Expected kBrushFacesCode[] = {
+    // DrawOpaqueBrushModel: movss xmm6,[BACKFACE_EPSILON]; ...; test r13d,r13d
+    // (shadow depth: no test); jne
+    {0xf212c, "F3 0F 10 35 78 64 2D 00", "DrawOpaqueBrushModel epsilon"},
+    {0xf2164, "45 85 ED 75 37", "DrawOpaqueBrushModel shadow depth test"},
+    // the five plane tests, unrolled: comiss xmm2,xmm6; jae facing; then
+    // planes[i] = 1 (left out) or 0
+    {0xf218d, "0F 2F D6 73 0E 48 8B 42 F8 C6 84 0D 90 02 00 00 01", "plane test 1"},
+    {0xf21d5, "0F 2F D6 73 0D 48 8B 02 C6 84 0D 91 02 00 00 01", "plane test 2"},
+    {0xf221b, "0F 2F D6 73 0E 48 8B 42 08 C6 84 0D 92 02 00 00 01", "plane test 3"},
+    {0xf2263, "0F 2F D6 73 04 B0 01 EB 02 33 C0 88 84 0D 93 02 00 00", "plane test 4"},
+    {0xf22d9, "0F 2F D6 73 04 B0 01 EB 02 33 C0 41 88 00", "plane test 5"},
+    // the translucent walk: bt eax,9 (SURFDRAW_NOCULL); jb list; shr eax,6
+    // (SURFDRAW_PLANEBACK); and eax,1; cmp eax,r14d (the view's side); jne next
+    {0xf0eaa, "0F BA E0 09 72 0F C1 E8 06 83 E0 01 41 3B C6 0F 85 B9 00 00 00", "translucent side test"},
+};
+// jae facing -> jmp facing; jne next -> 6-byte nop
+CodePatch g_brushFaces[] = {
+    {"BrushPlane1", 0xf2190, 1, {0x73}, {0xEB}},
+    {"BrushPlane2", 0xf21d8, 1, {0x73}, {0xEB}},
+    {"BrushPlane3", 0xf221e, 1, {0x73}, {0xEB}},
+    {"BrushPlane4", 0xf2266, 1, {0x73}, {0xEB}},
+    {"BrushPlane5", 0xf22dc, 1, {0x73}, {0xEB}},
+    {"BrushTranslucentSide",
+     0xf0eb9,
+     6,
+     {0x0F, 0x85, 0xB9, 0x00, 0x00, 0x00},
+     {0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00}},
+};
 // The three of R_FlowThroughArea go together.
 CodePatch g_areaFlow[] = {
     // g_AreaStack (0x7e45b0) -> g_RenderAreaBits (0x7e4210) in the test's displacement
@@ -660,6 +704,29 @@ bool install(void *materials, void *renderView) {
              reinterpret_cast<void *>(&isOccluded));
   }
 
+  // Brush entities' back faces: all or none, before the first map draws one.
+  if (GetEnvironmentVariableA("OPENREMIX_PROXY_NOCULL_BRUSHES", v, sizeof(v)) && v[0] == '0') {
+    for (CodePatch &patch : g_brushFaces)
+      patch.state = "off (OPENREMIX_PROXY_NOCULL_BRUSHES=0)";
+  } else if (const char *what = mismatch(g_engine, kBrushFacesCode)) {
+    for (CodePatch &patch : g_brushFaces)
+      patch.state = what;
+  } else {
+    bool all = true;
+    for (CodePatch &patch : g_brushFaces) {
+      arm(patch);
+      all &= patch.usable;
+    }
+    for (CodePatch &patch : g_brushFaces)
+      if (!all) {
+        patch.usable = false;
+        if (std::strcmp(patch.state.load(), "ok") == 0)
+          patch.state = "off (another brush patch failed)";
+      } else if (!flip(patch, true)) {
+        patch.state = "cannot apply";
+      }
+  }
+
   g_ready.store(true, std::memory_order_release);
   if (!renderView || !g_engine.has(kRenderViewVtable, (kSlotBuildWorldLists + 1) * sizeof(void *)) ||
       *static_cast<uintptr_t *>(renderView) != g_engine.base + kRenderViewVtable) {
@@ -684,6 +751,10 @@ void dumpStatistics(FILE *out) {
           (unsigned long long)g_worldFrustum.rva);
   for (const CodePatch &patch : g_areaFlow)
     fprintf(out, "   %s: %s (engine+0x%llX)\n", patch.name, patch.state.load(), (unsigned long long)patch.rva);
+  fprintf(out, "   brush entity back faces kept:");
+  for (const CodePatch &patch : g_brushFaces)
+    fprintf(out, " %s %s%s", patch.name, patch.applied ? "applied" : patch.state.load(),
+            &patch == &g_brushFaces[std::size(g_brushFaces) - 1] ? "\n" : ",");
   for (const VtableHook *hook :
        {&g_buildWorldListsHook, &g_cullBoxHook, &g_areaFrustumHook, &g_isOccludedHook, &g_buildRenderablesHook})
     fprintf(out, "   %s: %s (slot at %s+0x%llX)\n", hook->name, hook->state.load(), hook->module,
