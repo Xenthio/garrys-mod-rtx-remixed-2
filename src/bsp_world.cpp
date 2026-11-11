@@ -28,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -1038,6 +1039,8 @@ struct World {
   uint64_t replayedFrames = 0;
   uint32_t recordings = 0;
   uint32_t styledLights = 0, skyboxLights = 0, otherLights = 0, surfaceLights = 0;
+  uint32_t unsealedLights = 0, sealedLights = 0; // unsealLights
+  std::string unsealExamples;
   uint32_t styleDrivenLights = 0; // of lights: scaled by their lightstyle
   // func_lod brushes, baked like world faces (lodModels): the server stops
   // sending one outside the player's PVS, and the engine no longer draws it
@@ -2900,6 +2903,7 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     l.type = w.type == kEmitSurface ? lighting::kSurface : w.type == kEmitPoint ? 1 : w.type == kEmitSpot ? 3 : 2;
     std::memcpy(l.color, w.intensity, 12);
     std::memcpy(l.position, w.origin, 12);
+    std::memcpy(l.sourcePosition, w.origin, 12);
     std::memcpy(l.direction, w.normal, 12);
     l.attenuation[0] = w.constantAttn;
     l.attenuation[1] = w.linearAttn;
@@ -2920,6 +2924,154 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
       ++g_world.styleDrivenLights;
     }
     g_world.lights.push_back(l);
+  }
+}
+
+// Lights a mapper sealed inside a static prop: a lamp's light_spot inside its
+// housing (d2_prison_03's combine_light002a). Source never traced them (model
+// lighting and VRAD's prop shadows let them out), but every path-traced
+// shadow ray ends on the housing, so the light lit nothing. A light with the
+// prop's opaque triangles all around it moves just past them: a spot along
+// its direction, a point out through the housing's thinnest side, provided
+// that lands in the playable map. OPENREMIX_PROXY_UNSEAL_LIGHTS=0 keeps them.
+namespace {
+// Two-sided ray/triangle distance (Moller-Trumbore), or -1.
+float rayTriangle(const float o[3], const float d[3], const float *a, const float *b, const float *c) {
+  const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+  const float p[3] = {d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]};
+  const float det = dot(e1, p);
+  if (std::fabs(det) < 1e-9f)
+    return -1;
+  const float inv = 1 / det, s[3] = {o[0] - a[0], o[1] - a[1], o[2] - a[2]};
+  const float u = dot(s, p) * inv;
+  if (u < 0 || u > 1)
+    return -1;
+  const float q[3] = {s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0]};
+  const float v = dot(d, q) * inv;
+  if (v < 0 || u + v > 1)
+    return -1;
+  const float t = dot(e2, q) * inv;
+  return t > 1e-4f ? t : -1;
+}
+
+// The farthest hit of a model-space ray on the model's opaque parts, or -1.
+float lastHit(const PropModel &model, const float o[3], const float d[3]) {
+  float last = -1;
+  for (const auto &part : model.parts)
+    for (size_t i = 0; i + 2 < part.indices.size(); i += 3) {
+      const float *a = &part.positions[3 * size_t(part.indices[i])];
+      const float *b = &part.positions[3 * size_t(part.indices[i + 1])];
+      const float *c = &part.positions[3 * size_t(part.indices[i + 2])];
+      last = std::max(last, rayTriangle(o, d, a, b, c));
+    }
+  return last;
+}
+} // namespace
+
+std::vector<Leaf> leafsOf(const Bsp &bsp);
+
+void unsealLights(const Bsp &bsp) {
+  static const bool enabled = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_UNSEAL_LIGHTS", v, sizeof(v)) && v[0] == '0');
+  }();
+  if (!enabled || g_world.lights.empty() || g_world.props.empty())
+    return;
+  const std::vector<Leaf> leafs = leafsOf(bsp);
+  auto playable = [&](const float p[3]) {
+    const int leaf = leafAt(bsp, p);
+    return leaf > 0 && size_t(leaf) < leafs.size() && !(leafs[size_t(leaf)].contents & 1) &&
+           leafs[size_t(leaf)].cluster >= 0;
+  };
+  // Model-space bounds of each model's opaque parts.
+  std::map<const PropModel *, std::array<float, 6>> bounds;
+  for (const auto &prop : g_world.props) {
+    if (!prop.model || prop.skyTraced || bounds.count(prop.model))
+      continue;
+    std::array<float, 6> box = {FLT_MAX, FLT_MAX, FLT_MAX, -FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (const auto &part : prop.model->parts)
+      for (size_t i = 0; i + 2 < part.positions.size(); i += 3)
+        for (int k = 0; k < 3; ++k) {
+          box[k] = std::min(box[k], part.positions[i + k]);
+          box[3 + k] = std::max(box[3 + k], part.positions[i + k]);
+        }
+    bounds[prop.model] = box;
+  }
+  // Directions spread evenly over the sphere (a Fibonacci spiral).
+  constexpr int kRays = 64;
+  float rays[kRays][3];
+  for (int i = 0; i < kRays; ++i) {
+    const float z = 1 - (2 * i + 1) / float(kRays), r = std::sqrt(std::max(0.f, 1 - z * z));
+    const float phi = 2.39996323f * float(i);
+    rays[i][0] = r * std::cos(phi), rays[i][1] = r * std::sin(phi), rays[i][2] = z;
+  }
+  for (auto &light : g_world.lights) {
+    if (light.type != 1 && light.type != 3) // points and spots
+      continue;
+    for (const auto &prop : g_world.props) {
+      if (!prop.model || prop.skyTraced)
+        continue;
+      const auto &t = prop.transform;
+      // Static props are rotations: model space is the transpose.
+      const float rel[3] = {light.position[0] - t[0][3], light.position[1] - t[1][3], light.position[2] - t[2][3]};
+      float o[3];
+      for (int k = 0; k < 3; ++k)
+        o[k] = t[0][k] * rel[0] + t[1][k] * rel[1] + t[2][k] * rel[2];
+      const auto &box = bounds[prop.model];
+      if (o[0] < box[0] || o[1] < box[1] || o[2] < box[2] || o[0] > box[3] || o[1] > box[4] || o[2] > box[5])
+        continue;
+      // Sealed: (nearly) every direction ends on the prop.
+      float out[kRays];
+      int open = 0;
+      for (int i = 0; i < kRays; ++i)
+        open += (out[i] = lastHit(*prop.model, o, rays[i])) < 0;
+      if (open > kRays / 32)
+        continue;
+      // Out along the spot's direction, else through the thinnest side, a
+      // unit past the prop's last surface, into the playable map.
+      float candidates[kRays][3], lengths[kRays];
+      int order[kRays], count = 0;
+      if (light.type == 3) {
+        float d[3];
+        for (int k = 0; k < 3; ++k)
+          d[k] = t[0][k] * light.direction[0] + t[1][k] * light.direction[1] + t[2][k] * light.direction[2];
+        std::memcpy(candidates[count], d, 12);
+        lengths[count++] = std::max(lastHit(*prop.model, o, d), 0.f);
+      } else {
+        for (int i = 0; i < kRays; ++i)
+          if (out[i] >= 0) {
+            std::memcpy(candidates[count], rays[i], 12);
+            lengths[count++] = out[i];
+          }
+      }
+      for (int i = 0; i < count; ++i)
+        order[i] = i;
+      std::sort(order, order + count, [&](int a, int b) { return lengths[a] < lengths[b]; });
+      bool moved = false;
+      for (int n = 0; n < count && !moved; ++n) {
+        const float *d = candidates[order[n]];
+        const float step = lengths[order[n]] + 1;
+        float p[3];
+        for (int k = 0; k < 3; ++k)
+          p[k] = light.position[k] + step * (t[k][0] * d[0] + t[k][1] * d[1] + t[k][2] * d[2]);
+        if (!playable(p))
+          continue;
+        std::memcpy(light.position, p, 12);
+        moved = true;
+      }
+      ++(moved ? g_world.unsealedLights : g_world.sealedLights);
+      if (g_world.unsealExamples.size() < 600) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "%s %s at %.0f %.0f %.0f by %.1f; ", light.type == 3 ? "spot" : "point",
+                      moved ? "moved" : "kept (no playable way out)", light.sourcePosition[0],
+                      light.sourcePosition[1], light.sourcePosition[2],
+                      std::sqrt((light.position[0] - light.sourcePosition[0]) * (light.position[0] - light.sourcePosition[0]) +
+                                (light.position[1] - light.sourcePosition[1]) * (light.position[1] - light.sourcePosition[1]) +
+                                (light.position[2] - light.sourcePosition[2]) * (light.position[2] - light.sourcePosition[2])));
+        g_world.unsealExamples += line;
+      }
+      break;
+    }
   }
 }
 
@@ -3614,6 +3766,7 @@ bool build(const Bsp &bsp) {
   loadProps(bsp, inSky);
   loadOverlays(bsp, inSky);
   loadLights(bsp, inSky);
+  unsealLights(bsp);
   return !g_world.groups.empty();
 }
 
@@ -4732,8 +4885,9 @@ bool providesLight(int type, const float position[3], const float direction[3]) 
     if ((l.type == 2) != (type == 2))
       continue;
     if (type == 2 ? dot(l.direction, direction) > 0.9999f
-                  : std::fabs(l.position[0] - position[0]) < .01f && std::fabs(l.position[1] - position[1]) < .01f &&
-                        std::fabs(l.position[2] - position[2]) < .01f)
+                  : std::fabs(l.sourcePosition[0] - position[0]) < .01f &&
+                        std::fabs(l.sourcePosition[1] - position[1]) < .01f &&
+                        std::fabs(l.sourcePosition[2] - position[2]) < .01f)
       return true;
   }
   return false;
@@ -4965,6 +5119,8 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   BSP lights: %zu static, %u of them styled, %u surface (texture) lights (left to the engine: styled %u, 3D skybox %u, other types %u)\n",
           g_world.lights.size(), g_world.styleDrivenLights, g_world.surfaceLights, g_world.styledLights,
           g_world.skyboxLights, g_world.otherLights);
+  fprintf(out, "   BSP lights sealed inside static props: %u moved out, %u kept (%s)\n", g_world.unsealedLights,
+          g_world.sealedLights, g_world.unsealExamples.c_str());
   fprintf(out, "   BSP authored reflection seeds: %zu (validated playable env_cubemap positions)\n",
           g_world.reflectionSeeds.size());
   size_t captureReferences = 0, authoredMatches = 0;

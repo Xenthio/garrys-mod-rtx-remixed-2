@@ -129,6 +129,9 @@ bool isBakedBrushEntity(const float *a, const float *b, const float *c);
 struct Light {
   int type = 0;
   float color[3] = {}, position[3] = {}, direction[3] = {};
+  // Where the map compiled it (the engine passes it to models from there);
+  // position differs when the light was moved out of a prop (unsealLights).
+  float sourcePosition[3] = {};
   float attenuation[3] = {}; // constant, linear, quadratic
   float thetaDot = 0, phiDot = 0; // spot inner and outer cone cosines
   float forwardCutoff = 0; // compiled cutoff for point/spot lights
