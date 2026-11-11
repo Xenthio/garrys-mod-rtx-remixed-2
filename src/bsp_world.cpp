@@ -996,6 +996,23 @@ struct SurfaceNormal {
   int shown = 0;
 };
 
+// A brush entity's model (a submodel of the map, "*N"): its opaque faces in
+// model space, a group (one mesh) per draw state: {noCull, alphaRef + 1 or
+// 0 without alpha test, categories}.
+struct BrushModel {
+  int32_t firstFace = 0, numFaces = 0;
+  std::map<std::array<int32_t, 3>, Group> groups;
+};
+// An entity drawing a brush model: a scene instance per group mesh, moved
+// and shown or hidden as the engine draws the entity (placeBrushEntities).
+struct BrushInstance {
+  int32_t model = -1;
+  std::vector<uint64_t> scene;
+  std::vector<remixapi_MeshHandle> meshes; // what `scene` was added with
+  float transform[3][4] = {};
+  bool visible = false;
+  uint64_t seen = 0; // the view generation it was last drawn at
+};
 struct World {
   const remixapi_Interface *api = nullptr;
   std::vector<std::unique_ptr<SurfaceNormal>> surfaceNormals; // shared by source name and playback rate
@@ -1094,6 +1111,18 @@ struct World {
   // their baked faces' corners identify the engine's draws of them.
   std::unordered_set<uint64_t> lodCorners;
   uint32_t lodEntities = 0, lodFaces = 0, lodLeft = 0;
+  // Brush entities' models (loadBrushModels), by model index, and the
+  // entities placing them (placeBrushEntities), by entity and model.
+  std::map<int32_t, BrushModel> brushModels;
+  std::unordered_map<uint64_t, BrushInstance> brushInstances;
+  uint32_t brushFaces = 0, brushTriangles = 0, brushTranslucentFaces = 0;
+  // Models left to the engine: in the 3D skybox, with displacements or water.
+  uint32_t brushLeftSky = 0, brushLeftOther = 0;
+  // Since the last dump: instances added, moved or shown, hidden, removed;
+  // runtime calls refused. Shown at the last frame.
+  uint64_t brushAdded = 0, brushChanged = 0, brushHidden = 0, brushRemoved = 0, brushRefused = 0;
+  uint32_t brushShown = 0;
+  uint64_t sceneDrawnFrame = ~0ull; // the frame DrawSceneInstancesEXT last ran
 } g_world;
 bool g_active = false;
 // Why the BSP world is inactive, for the statistics (a literal).
@@ -1108,6 +1137,32 @@ struct PropIndex {
 };
 std::shared_ptr<const PropIndex> g_propIndex;
 std::mutex g_propIndexLock;
+
+// Brush entities, shared with the thread that renders views
+// (takeBrushEntity), all under g_brushLock: the map's brush models by first
+// face (model index and face count; ready once every group has its mesh),
+// and the entities drawn, by entity and model, with the view generation
+// they were last drawn at.
+struct BrushIndex {
+  struct Entry {
+    int32_t model = 0, numFaces = 0;
+    bool ready = false;
+  };
+  std::unordered_map<int32_t, Entry> byFirstFace;
+};
+struct BrushSeen {
+  int32_t model = 0;
+  float transform[3][4] = {};
+  uint64_t generation = 0;
+};
+std::mutex g_brushLock;
+std::unique_ptr<BrushIndex> g_brushIndex;
+std::unordered_map<uint64_t, BrushSeen> g_brushSeen;
+std::atomic<uint64_t> g_brushGeneration{0};
+// When the render thread last placed brush entities (GetTickCount64): none
+// is taken from the engine unless they are being placed.
+std::atomic<uint64_t> g_brushPlacedTick{0};
+std::atomic<uint64_t> g_brushTaken{0}; // draws taken, since the last dump
 
 void publishPropIndex(std::shared_ptr<const PropIndex> index) {
   std::lock_guard<std::mutex> lock(g_propIndexLock);
@@ -1254,6 +1309,35 @@ std::vector<int32_t> lodModels(const Bsp &bsp, size_t modelCount) {
       continue;
     }
     out.push_back(index);
+  }
+  return out;
+}
+
+// Brush entities' models (indices into the models lump; not the func_lod
+// models baked into the world) with their entity's origin, where the model
+// stands in the map (its faces are in model space).
+std::map<int32_t, std::array<float, 3>> brushEntityModels(const Bsp &bsp, size_t modelCount,
+                                                          const std::vector<int32_t> &baked) {
+  std::map<int32_t, std::array<float, 3>> out;
+  const auto [text, length] = bsp.lump<char>(kEntities);
+  if (!text)
+    return out;
+  const std::string entities(text, length);
+  for (size_t open = entities.find('{'); open != std::string::npos; open = entities.find('{', open + 1)) {
+    const size_t close = entities.find('}', open);
+    if (close == std::string::npos)
+      break;
+    KeyValues kv;
+    if (!parseKeyValues("entity " + entities.substr(open, close - open + 1), kv))
+      continue;
+    const std::string &model = kv.values["model"];
+    const int index = model.size() > 1 && model[0] == '*' ? std::atoi(model.c_str() + 1) : 0;
+    if (index <= 0 || size_t(index) >= modelCount || out.count(index) ||
+        std::find(baked.begin(), baked.end(), index) != baked.end())
+      continue;
+    std::array<float, 3> origin = {};
+    std::sscanf(kv.values["origin"].c_str(), "%f %f %f", &origin[0], &origin[1], &origin[2]);
+    out[index] = origin;
   }
   return out;
 }
@@ -2345,6 +2429,25 @@ void destroyMeshes() {
     publish(nullptr);
   dropSceneInstances();
   g_world.sceneVersion = ~0ull;
+  // Brush entities: the engine draws them again, their instances go before
+  // their meshes.
+  {
+    std::lock_guard<std::mutex> lock(g_brushLock);
+    g_brushIndex.reset();
+    g_brushSeen.clear();
+  }
+  static const auto removeScene =
+      sceneFunction<PFN_remixapi_RemoveSceneInstancesEXT>("remixapi_RemoveSceneInstancesEXT");
+  for (auto &[key, instance] : g_world.brushInstances)
+    if (removeScene && !instance.scene.empty())
+      removeScene(instance.scene.data(), uint32_t(instance.scene.size()));
+  g_world.brushInstances.clear();
+  for (auto &[index, model] : g_world.brushModels)
+    for (auto &[key, group] : model.groups)
+      if (group.mesh && g_world.api) {
+        g_world.api->DestroyMesh(group.mesh);
+        group.mesh = nullptr;
+      }
   if (g_world.batchValid && g_world.api) {
     using BatchFn = remixapi_ErrorCode(REMIXAPI_CALL *)(uint64_t);
     if (auto drop = reinterpret_cast<BatchFn>(
@@ -3908,7 +4011,8 @@ bool build(const Bsp &bsp) {
   for (int32_t f = world.firstFace; f < world.firstFace + world.numFaces && size_t(f) < faceCount; ++f)
     faceList.push_back(f);
   const size_t worldFaces = faceList.size();
-  for (int32_t index : lodModels(bsp, modelCount)) {
+  const std::vector<int32_t> lodList = lodModels(bsp, modelCount);
+  for (int32_t index : lodList) {
     ++g_world.lodEntities;
     const Model &lod = models[index];
     for (int32_t f = lod.firstFace; f < lod.firstFace + lod.numFaces && size_t(f) < faceCount; ++f)
@@ -4305,6 +4409,123 @@ bool build(const Bsp &bsp) {
       ++g_world.faces;
     }
   }
+  // Brush entities' models: their opaque faces in model space, one group per
+  // draw state, placed where the engine draws the entity (takeBrushEntity,
+  // placeBrushEntities). Translucent faces stay the engine's (it draws them
+  // whether or not the rest is taken). A model with a displacement or water,
+  // or whose entity stands in the 3D skybox, is left to the engine whole.
+  // OPENREMIX_PROXY_BSP_BRUSH_ENTITIES=0: all of them.
+  static const bool brushEntities = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_BRUSH_ENTITIES", v, sizeof(v)) && v[0] == '0');
+  }();
+  for (const auto &[index, origin] : brushEntities ? brushEntityModels(bsp, modelCount, lodList)
+                                                   : std::map<int32_t, std::array<float, 3>>()) {
+    const Model &source = models[index];
+    BrushModel brush;
+    brush.firstFace = source.firstFace;
+    brush.numFaces = source.numFaces;
+    bool usable = source.numFaces > 0, sky = false;
+    uint32_t faceTotal = 0, triangleTotal = 0, translucent = 0;
+    for (int32_t f = source.firstFace; usable && f < source.firstFace + source.numFaces && size_t(f) < faceCount; ++f) {
+      const Face &face = faces[f];
+      if (face.texInfo < 0 || size_t(face.texInfo) >= texInfoCount || face.numEdges < 3 ||
+          size_t(face.plane) >= planeCount)
+        continue;
+      const TexInfo &ti = texInfos[face.texInfo];
+      if (ti.flags & (kSurfSky2D | kSurfSky | kSurfNoDraw | kSurfHint | kSurfSkip))
+        continue;
+      if (ti.flags & kSurfTrans) {
+        ++translucent;
+        continue;
+      }
+      const int m = material(ti.texData);
+      if (m < 0)
+        continue;
+      if (face.dispInfo >= 0 || g_world.materials[size_t(m)].waterBody) {
+        usable = false;
+        break;
+      }
+      const TexData &td = texDatas[ti.texData];
+      float normal[3];
+      std::memcpy(normal, planes[face.plane].normal, sizeof(normal));
+      std::vector<std::array<float, 3>> corners;
+      for (int e = 0; e < face.numEdges; ++e) {
+        const size_t se = size_t(face.firstEdge + e);
+        if (se >= surfEdgeCount)
+          break;
+        const int32_t edge = surfEdges[se];
+        const size_t ei = size_t(edge < 0 ? -edge : edge);
+        if (ei >= edgeCount)
+          break;
+        const uint16_t vi = edges[ei][edge < 0 ? 1 : 0];
+        if (vi >= vertexCount)
+          break;
+        corners.push_back(vertexes[vi]);
+      }
+      if (corners.size() != size_t(face.numEdges))
+        continue;
+      float winding = 0, centroid[3] = {};
+      for (size_t k = 1; k + 1 < corners.size(); ++k) {
+        const float *a = corners[0].data(), *b = corners[k].data(), *c = corners[k + 1].data();
+        const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        winding += dot(n, normal);
+      }
+      for (const auto &c : corners)
+        for (int k = 0; k < 3; ++k)
+          centroid[k] += c[k] / float(corners.size());
+      const float placed[3] = {centroid[0] + origin[0] + normal[0], centroid[1] + origin[1] + normal[1],
+                               centroid[2] + origin[2] + normal[2]};
+      if (inSky(placed)) {
+        usable = false;
+        sky = true;
+        break;
+      }
+      const auto &mat = g_world.materials[size_t(m)];
+      const std::array<int32_t, 3> key = {int32_t(mat.noCull), mat.alphaTest ? mat.alphaRef + 1 : 0,
+                                          int32_t(mat.categories)};
+      Group &group = brush.groups[key];
+      if (!group.id) {
+        group.noCull = mat.noCull;
+        group.alphaTest = mat.alphaTest;
+        group.alphaRef = mat.alphaRef;
+        group.categories = mat.categories;
+        const int32_t named[4] = {index, key[0], key[1], key[2]};
+        group.id = XXH3_64bits_withSeed(named, sizeof(named), 0x6272757368ull) | 1;
+      }
+      Geometry &g = group.surfaces[uint32_t(m)];
+      const uint32_t base = uint32_t(g.vertices.size());
+      for (size_t e = 0; e < corners.size(); ++e) {
+        const float *n = normal;
+        if (!normalStart.empty()) {
+          const uint16_t at = vertNormalIndices[normalStart[size_t(f)] + e];
+          if (at < vertNormalCount) {
+            const float *smooth = vertNormals[at].data();
+            if (dot(smooth, normal) > 0.1f && std::fabs(dot(smooth, smooth) - 1) < 0.01f)
+              n = smooth;
+          }
+        }
+        g.vertices.push_back(vertex(corners[e].data(), n, ti, td));
+      }
+      for (uint32_t k = 1; k + 1 < corners.size(); ++k) {
+        if (winding > 0)
+          g.indices.insert(g.indices.end(), {base, base + k + 1, base + k});
+        else
+          g.indices.insert(g.indices.end(), {base, base + k, base + k + 1});
+      }
+      ++faceTotal;
+      triangleTotal += uint32_t(corners.size() - 2);
+    }
+    if (!usable || brush.groups.empty()) {
+      ++(sky ? g_world.brushLeftSky : g_world.brushLeftOther);
+      continue;
+    }
+    g_world.brushFaces += faceTotal;
+    g_world.brushTriangles += triangleTotal;
+    g_world.brushTranslucentFaces += translucent;
+    g_world.brushModels[index] = std::move(brush);
+  }
   loadProps(bsp, inSky);
   loadOverlays(bsp, inSky);
   loadLights(bsp, inSky);
@@ -4652,6 +4873,14 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, LoadOp
       index->transforms.push_back(t);
     }
     publishPropIndex(std::move(index));
+  }
+  if (g_active && !g_world.brushModels.empty()) {
+    auto index = std::make_unique<BrushIndex>();
+    for (const auto &[model, brush] : g_world.brushModels)
+      index->byFirstFace[brush.firstFace] = {model, brush.numFaces, false};
+    std::lock_guard<std::mutex> lock(g_brushLock);
+    g_brushIndex = std::move(index);
+    g_brushSeen.clear();
   }
   if (g_active && options.decodeSkybox && !g_world.skyboxImages.name.empty()) {
     // Decode while the map pakfile is mounted, just like ordinary BSP assets.
@@ -5043,6 +5272,183 @@ void showDetail(const std::vector<uint32_t> *only) {
     ++g_world.detail.refused;
 }
 
+// A brush entity's group at a transform, as a scene instance description
+// handed to emit(info): like the map's groups (two-sided, back faces and
+// alpha test from the group), dynamic, and not hidden by the map's cluster
+// visibility (the entity moves).
+template <typename Emit>
+void describeBrushGroup(const Group &group, uint64_t entity, const float (&transform)[3][4], Emit &&emit) {
+  remixapi_InstanceInfoBlendEXT blend = {};
+  blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+  blend.alphaTestEnabled = group.alphaTest;
+  blend.alphaTestReferenceValue = group.alphaRef;
+  blend.alphaTestCompareOp = group.alphaTest ? 6 : 7;
+  remixapi_InstanceIdentityEXT identity = {};
+  identity.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_IDENTITY_EXT;
+  identity.pNext = &blend;
+  identity.instanceId = (group.id ^ entity) | 1;
+  identity.classification = REMIXAPI_INSTANCE_DYNAMIC_EXT;
+  identity.rasterVisible = 1;
+  remixapi_InstanceInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+  info.pNext = &identity;
+  info.mesh = group.mesh;
+  info.categoryFlags = group.categories;
+  std::memcpy(info.transform.matrix, transform, sizeof(info.transform.matrix));
+  info.doubleSided = 1;
+  remixapi_InstanceInfoCameraCullingEXT culling;
+  chainCulling(info, culling,
+               cameraCullFlags() & ~(uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_VISIBILITY_EXT) |
+                                     (group.noCull ? uint32_t(REMIXAPI_INSTANCE_CAMERA_CULL_BACK_FACES_EXT) : 0u)));
+  emit(info);
+}
+
+// Removes the scene instances of every entity drawing a brush model (before
+// its meshes are rebuilt); placeBrushEntities adds them again.
+void unplaceBrushModel(int32_t model) {
+  static const auto remove = sceneFunction<PFN_remixapi_RemoveSceneInstancesEXT>("remixapi_RemoveSceneInstancesEXT");
+  for (auto &[key, instance] : g_world.brushInstances)
+    if (instance.model == model && !instance.scene.empty()) {
+      if (remove)
+        remove(instance.scene.data(), uint32_t(instance.scene.size()));
+      g_world.brushRemoved += instance.scene.size();
+      instance.scene.clear();
+      instance.meshes.clear();
+      instance.visible = false;
+    }
+}
+
+// The brush entities the engine drew lately (takeBrushEntity), as scene
+// instances: added when an entity is first drawn, moved when it moves,
+// hidden when the engine has not drawn it for a few views (broken, removed,
+// out of the views' reach) and removed after a while. A model is taken
+// from the engine only once its meshes are built (BrushIndex ready).
+void placeBrushEntities() {
+  if (g_world.brushModels.empty())
+    return;
+  static const auto add = sceneFunction<PFN_remixapi_AddSceneInstancesEXT>("remixapi_AddSceneInstancesEXT");
+  static const auto change =
+      sceneFunction<PFN_remixapi_ChangeSceneInstancesEXT>("remixapi_ChangeSceneInstancesEXT");
+  static const auto remove = sceneFunction<PFN_remixapi_RemoveSceneInstancesEXT>("remixapi_RemoveSceneInstancesEXT");
+  static const auto drawScene = sceneFunction<PFN_remixapi_DrawSceneInstancesEXT>("remixapi_DrawSceneInstancesEXT");
+  if (!add || !change || !remove || !drawScene)
+    return; // never placed: the engine keeps drawing them
+  // Drawn within this many views (generations); removed after kForget.
+  constexpr uint64_t kRecent = 8, kForget = 2000;
+  std::vector<std::pair<uint64_t, BrushSeen>> seen;
+  uint64_t generation;
+  {
+    std::lock_guard<std::mutex> lock(g_brushLock);
+    if (!g_brushIndex)
+      return;
+    for (auto &[first, entry] : g_brushIndex->byFirstFace) {
+      bool ready = false;
+      if (const auto found = g_world.brushModels.find(entry.model); found != g_world.brushModels.end()) {
+        ready = true;
+        for (const auto &[key, group] : found->second.groups)
+          ready &= group.mesh != nullptr;
+      }
+      entry.ready = ready;
+    }
+    generation = g_brushGeneration.load();
+    for (auto it = g_brushSeen.begin(); it != g_brushSeen.end();) {
+      if (generation - it->second.generation > kForget) {
+        it = g_brushSeen.erase(it);
+        continue;
+      }
+      if (generation - it->second.generation <= kRecent)
+        seen.emplace_back(it->first, it->second);
+      ++it;
+    }
+  }
+  g_brushPlacedTick = GetTickCount64();
+  std::vector<remixapi_SceneInstanceChangeEXT> changes;
+  auto changeAll = [&](BrushInstance &instance, bool visible, bool moved) {
+    for (uint64_t handle : instance.scene) {
+      remixapi_SceneInstanceChangeEXT c = {};
+      c.instance = handle;
+      c.fields = REMIXAPI_SCENE_INSTANCE_VISIBLE_EXT | (moved ? REMIXAPI_SCENE_INSTANCE_TRANSFORM_EXT : 0u);
+      c.visible = visible;
+      std::memcpy(c.transform.matrix, instance.transform, sizeof(c.transform.matrix));
+      changes.push_back(c);
+    }
+  };
+  uint32_t shown = 0;
+  for (const auto &[key, drawn] : seen) {
+    const auto found = g_world.brushModels.find(drawn.model);
+    if (found == g_world.brushModels.end())
+      continue;
+    BrushInstance &instance = g_world.brushInstances[key];
+    instance.seen = generation;
+    std::vector<remixapi_MeshHandle> meshes;
+    for (const auto &[groupKey, group] : found->second.groups)
+      if (group.mesh)
+        meshes.push_back(group.mesh);
+    if (instance.model != drawn.model || instance.meshes != meshes) {
+      if (!instance.scene.empty()) {
+        remove(instance.scene.data(), uint32_t(instance.scene.size()));
+        g_world.brushRemoved += instance.scene.size();
+      }
+      instance.scene.clear();
+      instance.meshes.clear();
+      instance.model = drawn.model;
+      std::memcpy(instance.transform, drawn.transform, sizeof(instance.transform));
+      bool all = true;
+      for (const auto &[groupKey, group] : found->second.groups) {
+        if (!group.mesh)
+          continue;
+        describeBrushGroup(group, key, instance.transform, [&](const remixapi_InstanceInfo &info) {
+          uint64_t handle = 0;
+          if (add(&info, 1, &handle) == REMIXAPI_ERROR_CODE_SUCCESS) {
+            instance.scene.push_back(handle);
+            ++g_world.brushAdded;
+          } else {
+            all = false;
+            ++g_world.brushRefused;
+          }
+        });
+      }
+      instance.meshes = all ? meshes : std::vector<remixapi_MeshHandle>(); // retried next frame
+      instance.visible = true;
+      shown += !instance.scene.empty();
+      continue;
+    }
+    const bool moved = std::memcmp(instance.transform, drawn.transform, sizeof(instance.transform)) != 0;
+    if (moved)
+      std::memcpy(instance.transform, drawn.transform, sizeof(instance.transform));
+    if (moved || !instance.visible) {
+      changeAll(instance, true, moved);
+      g_world.brushChanged += instance.scene.size();
+    }
+    instance.visible = true;
+    shown += !instance.scene.empty();
+  }
+  for (auto it = g_world.brushInstances.begin(); it != g_world.brushInstances.end();) {
+    BrushInstance &instance = it->second;
+    if (instance.seen == generation) {
+      ++it;
+      continue;
+    }
+    if (generation - instance.seen > kForget) {
+      if (!instance.scene.empty()) {
+        remove(instance.scene.data(), uint32_t(instance.scene.size()));
+        g_world.brushRemoved += instance.scene.size();
+      }
+      it = g_world.brushInstances.erase(it);
+      continue;
+    }
+    if (instance.visible) {
+      changeAll(instance, false, false);
+      g_world.brushHidden += instance.scene.size();
+      instance.visible = false;
+    }
+    ++it;
+  }
+  if (!changes.empty() && change(changes.data(), uint32_t(changes.size())) != REMIXAPI_ERROR_CODE_SUCCESS)
+    ++g_world.brushRefused;
+  g_world.brushShown = shown;
+}
+
 void submit(MaterialLookup lookup, const float *eye) {
   if (!g_active || !g_world.api)
     return;
@@ -5149,6 +5555,21 @@ void submit(MaterialLookup lookup, const float *eye) {
   };
   for (auto &[key, group] : g_world.groups)
     build(group);
+  // Brush entities' meshes: a rebuild (a late material) first takes away
+  // the instances of the old mesh.
+  for (auto &[index, brush] : g_world.brushModels) {
+    bool rebuild = false;
+    for (auto &[key, group] : brush.groups) {
+      uint32_t resolved = 0;
+      for (auto &[material, geometry] : group.surfaces)
+        resolved += g_world.materials[material].resolved;
+      rebuild |= group.mesh && resolved != group.builtResolved;
+    }
+    if (rebuild)
+      unplaceBrushModel(index);
+    for (auto &[key, group] : brush.groups)
+      build(group);
+  }
   for (auto &[key, group] : g_world.overlayGroups)
     build(group);
   for (auto &[key, group] : g_world.layerGroups)
@@ -5166,6 +5587,20 @@ void submit(MaterialLookup lookup, const float *eye) {
   // are drawn after it (drawDetail).
   std::vector<uint32_t> detailChanged;
   cutDetail(eye, detailChanged);
+  // Brush entities are scene instances whatever happens to the map's below:
+  // DrawSceneInstancesEXT runs once every frame while there are any.
+  placeBrushEntities();
+  struct SceneDrawn {
+    uint64_t frame;
+    ~SceneDrawn() {
+      static const auto drawScene =
+          sceneFunction<PFN_remixapi_DrawSceneInstancesEXT>("remixapi_DrawSceneInstancesEXT");
+      if (drawScene && !g_world.brushInstances.empty() && g_world.sceneDrawnFrame != frame) {
+        drawScene(nullptr);
+        g_world.sceneDrawnFrame = frame;
+      }
+    }
+  } sceneDrawn{frame};
   const auto drawDetail = [&] {
     for (const auto &unit : g_world.detailUnits)
       if (unit.shown)
@@ -5214,6 +5649,7 @@ void submit(MaterialLookup lookup, const float *eye) {
     if (!detailChanged.empty())
       showDetail(&detailChanged);
     if (drawScene(nullptr) == REMIXAPI_ERROR_CODE_SUCCESS) {
+      g_world.sceneDrawnFrame = frame;
       ++g_world.replayedFrames;
       return;
     }
@@ -5398,6 +5834,7 @@ void submit(MaterialLookup lookup, const float *eye) {
     ++g_world.recordings;
     showDetail(nullptr);
     drawScene(nullptr);
+    g_world.sceneDrawnFrame = frame;
     if (!kept)
       dropSceneInstances();
   }
@@ -5451,6 +5888,41 @@ bool isBakedBrushEntity(const float *a, const float *b, const float *c) {
       return false;
   return true;
 }
+
+bool takeBrushEntity(const void *entity, int firstFace, int numFaces, const float origin[3], const float angles[3],
+                     bool place) {
+  // Nothing placed lately (no map, the BSP world off, no scene instances):
+  // the engine keeps drawing them.
+  if (GetTickCount64() - g_brushPlacedTick.load(std::memory_order_relaxed) > 500)
+    return false;
+  for (int k = 0; k < 3; ++k)
+    if (!std::isfinite(origin[k]) || !std::isfinite(angles[k]))
+      return false;
+  std::lock_guard<std::mutex> lock(g_brushLock);
+  if (!g_brushIndex)
+    return false;
+  const auto found = g_brushIndex->byFirstFace.find(firstFace);
+  if (found == g_brushIndex->byFirstFace.end() || found->second.numFaces != numFaces || !found->second.ready)
+    return false;
+  const struct {
+    const void *entity;
+    int64_t model;
+  } named = {entity, found->second.model};
+  const uint64_t key = XXH3_64bits(&named, sizeof(named));
+  if (!place) {
+    const auto drawn = g_brushSeen.find(key);
+    return drawn != g_brushSeen.end() &&
+           g_brushGeneration.load(std::memory_order_relaxed) - drawn->second.generation <= 2;
+  }
+  BrushSeen &seen = g_brushSeen[key];
+  seen.model = found->second.model;
+  angleMatrix(angles, origin, seen.transform);
+  seen.generation = g_brushGeneration.load(std::memory_order_relaxed);
+  g_brushTaken.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+void brushViewBegan() { g_brushGeneration.fetch_add(1, std::memory_order_relaxed); }
 
 bool isStaticProp(const float *modelRows, const float eye[3]) {
   if (!g_active || g_world.props.empty())
@@ -5910,6 +6382,18 @@ void dumpStatistics(FILE *out) {
           g_world.skyboxLights, g_world.otherLights);
   fprintf(out, "   BSP lights sealed inside static props: %u moved out, %u kept (%s)\n", g_world.unsealedLights,
           g_world.sealedLights, g_world.unsealExamples.c_str());
+  fprintf(out,
+          "   BSP brush entities (OPENREMIX_PROXY_BSP_BRUSH_ENTITIES): %zu models built (%u faces, %u triangles; "
+          "translucent faces left to the engine %u) | models left to the engine: 3D skybox %u, displacement or water %u "
+          "| entities placed %zu, shown %u | engine draws taken %llu | instances added %llu, moved or shown %llu, "
+          "hidden %llu, removed %llu, refused %llu\n",
+          g_world.brushModels.size(), g_world.brushFaces, g_world.brushTriangles, g_world.brushTranslucentFaces,
+          g_world.brushLeftSky, g_world.brushLeftOther, g_world.brushInstances.size(), g_world.brushShown,
+          (unsigned long long)g_brushTaken.exchange(0), (unsigned long long)std::exchange(g_world.brushAdded, 0),
+          (unsigned long long)std::exchange(g_world.brushChanged, 0),
+          (unsigned long long)std::exchange(g_world.brushHidden, 0),
+          (unsigned long long)std::exchange(g_world.brushRemoved, 0),
+          (unsigned long long)std::exchange(g_world.brushRefused, 0));
   fprintf(out, "   BSP authored reflection seeds: %zu (validated playable env_cubemap positions)\n",
           g_world.reflectionSeeds.size());
   size_t captureReferences = 0, authoredMatches = 0;

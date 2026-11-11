@@ -126,6 +126,20 @@ bool isStaticProp(const float *modelRows, const float eye[3]);
 // brushes the BSP world bakes: the engine's draw of one, which goes.
 bool isBakedBrushEntity(const float *a, const float *b, const float *c);
 
+// Brush entities (func_breakable, func_physbox, doors, ...): their opaque
+// faces built from the BSP once per map and placed where the engine draws
+// the entity, in place of the engine's own draws of those faces.
+// takeBrushEntity (the thread that renders views): whether the BSP world
+// draws this brush model (model_t's first face and face count) for this
+// entity at origin/angles this frame; then the engine draws only its
+// translucent faces. Thread-safe. place false (another view: a water
+// reflection, a monitor's camera): taken when a main view placed the entity
+// just before; the path tracer's own rays see it there.
+bool takeBrushEntity(const void *entity, int firstFace, int numFaces, const float origin[3], const float angles[3],
+                     bool place = true);
+// A main view began (that thread): entities not drawn for a few views are hidden.
+void brushViewBegan();
+
 // A static light of the map, in the engine's LightDesc_t terms (type 1 point,
 // 2 directional, 3 spot, internal 4 surface; color in Source intensity units).
 struct Light {

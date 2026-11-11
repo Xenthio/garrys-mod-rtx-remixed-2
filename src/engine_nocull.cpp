@@ -1,5 +1,7 @@
 #include "engine_nocull.h"
 
+#include "bsp_world.h"
+
 #include <windows.h>
 
 #include <atomic>
@@ -304,6 +306,7 @@ struct VtableHook {
   uintptr_t slotRva = 0;
   std::atomic<const char *> state{"not installed"};
 };
+VtableHook g_drawBrushModelHook{"DrawBrushModel", "engine"}, g_drawBrushModelExHook{"DrawBrushModelEx", "engine"};
 VtableHook g_buildWorldListsHook{"BuildWorldLists", "engine"}, g_cullBoxHook{"CullBox", "engine"},
     g_areaFrustumHook{"DoesBoxTouchAreaFrustum", "engine"}, g_isOccludedHook{"IsOccluded", "engine"},
     g_buildRenderablesHook{"BuildRenderablesList", "client"};
@@ -502,6 +505,130 @@ void buildRenderablesList(void *self, const uint8_t *info) {
     g_stats.other += uint64_t(counts[group] > 0 ? counts[group] : 0);
 }
 
+// ---- brush entities ----
+//
+// IVRenderView::DrawBrushModel (slot 0) and DrawBrushModelEx (slot 51, its
+// mode 0 both, 1 translucent only, 2 opaque only) are thin calls of
+// R_DrawBrushModel(entity, model, origin, angles, depthMode, bDrawOpaque,
+// bDrawTranslucent) (0xf5e20), which the client's brush entities draw
+// through. In a view of the back buffer, an entity at full blend and white
+// colour modulation whose model the BSP world built (bsp::takeBrushEntity)
+// is drawn there instead: the engine draws only its translucent faces (no
+// face loop, batches or draw calls for the rest). The shadow depth variant
+// (slot 44) and every other view are left alone.
+constexpr uintptr_t kDrawBrushModel = 0x152540, kDrawBrushModelEx = 0x152580, kRDrawBrushModel = 0xf5e20,
+                    kGetBlend = 0x1526a0, kGetColorModulation = 0x152710;
+constexpr unsigned kSlotDrawBrushModel = 0, kSlotDrawBrushModelEx = 51, kSlotGetBlend = 5,
+                   kSlotGetColorModulation = 7; // IVRenderView
+// model_t: brush.firstmodelsurface +0x68, brush.nummodelsurfaces +0x6c.
+constexpr size_t kModelFirstSurface = 0x68, kModelSurfaceCount = 0x6c;
+constexpr Expected kBrushDrawCode[] = {
+    // DrawBrushModel: depthMode 0, both passes; call R_DrawBrushModel
+    {0x152547, "C6 44 24 30 01 4C 8B 4C 24 70", "DrawBrushModel"},
+    {0x15256a, "E8 B1 38 FA FF", "DrawBrushModel calls R_DrawBrushModel"},
+    // DrawBrushModelEx: bDrawOpaque = mode != 1, bDrawTranslucent = mode != 2
+    {0x152586, "83 7C 24 78 01", "DrawBrushModelEx opaque test"},
+    {0x15259c, "83 7C 24 78 02", "DrawBrushModelEx translucent test"},
+    {0x1525bd, "E8 5E 38 FA FF", "DrawBrushModelEx calls R_DrawBrushModel"},
+    {0xf5e20, "48 89 6C 24 20 57 41 54 41 57 48 83 EC 40", "R_DrawBrushModel"},
+    // DrawOpaqueBrushModel reads model->brush.firstmodelsurface
+    {0xf1f9e, "48 63 43 68", "firstmodelsurface"},
+    // GetBlend: movss xmm0,[r_blend]; ret. GetColorModulation: three floats out
+    {0x1526a0, "F3 0F 10 05 88 93 6C 00 C3", "GetBlend"},
+    {0x152710, "F3 0F 10 05 F0 2B 38 00 F3 0F 11 02", "GetColorModulation"},
+};
+
+using DrawBrushModelFn = void (*)(void *self, void *entity, const uint8_t *model, const float *origin,
+                                  const float *angles, bool sort);
+using DrawBrushModelExFn = void (*)(void *self, void *entity, const uint8_t *model, const float *origin,
+                                    const float *angles, int mode);
+using RDrawBrushModelFn = void (*)(void *entity, const uint8_t *model, const float *origin, const float *angles,
+                                   int depthMode, bool opaque, bool translucent);
+using GetBlendFn = float (*)(void *self);
+using GetColorModulationFn = void (*)(void *self, float *color);
+DrawBrushModelFn g_drawBrushModel = nullptr;
+DrawBrushModelExFn g_drawBrushModelEx = nullptr;
+RDrawBrushModelFn g_rDrawBrushModel = nullptr;
+GetBlendFn g_getBlend = nullptr;
+GetColorModulationFn g_getColorModulation = nullptr;
+
+struct BrushStatistics {
+  std::atomic<uint64_t> taken{0}, takenOther{0}, faded{0}, tinted{0}, offTarget{0}, notBuilt{0};
+} g_brushStats;
+
+bool takeBrush(void *self, void *entity, const uint8_t *model, const float *origin, const float *angles) {
+  if (!model || !origin || !angles)
+    return false;
+  if (g_getBlend(self) < 1.0f) {
+    ++g_brushStats.faded;
+    return false;
+  }
+  float color[3];
+  g_getColorModulation(self, color);
+  if (color[0] != 1.0f || color[1] != 1.0f || color[2] != 1.0f) {
+    ++g_brushStats.tinted;
+    return false;
+  }
+  const bool main = backBufferView();
+  int32_t first, count;
+  std::memcpy(&first, model + kModelFirstSurface, sizeof(first));
+  std::memcpy(&count, model + kModelSurfaceCount, sizeof(count));
+  if (!bsp::takeBrushEntity(entity, first, count, origin, angles, main)) {
+    ++(main ? g_brushStats.notBuilt : g_brushStats.offTarget);
+    return false;
+  }
+  ++(main ? g_brushStats.taken : g_brushStats.takenOther);
+  return true;
+}
+
+void drawBrushModel(void *self, void *entity, const uint8_t *model, const float *origin, const float *angles,
+                    bool sort) {
+  if (takeBrush(self, entity, model, origin, angles)) {
+    g_rDrawBrushModel(entity, model, origin, angles, 0, false, true);
+    return;
+  }
+  g_drawBrushModel(self, entity, model, origin, angles, sort);
+}
+
+void drawBrushModelEx(void *self, void *entity, const uint8_t *model, const float *origin, const float *angles,
+                      int mode) {
+  if (mode != 1 && takeBrush(self, entity, model, origin, angles)) {
+    if (mode != 2)
+      g_rDrawBrushModel(entity, model, origin, angles, 0, false, true);
+    return;
+  }
+  g_drawBrushModelEx(self, entity, model, origin, angles, mode);
+}
+
+void installBrushDraws(void *renderView) {
+  char v[8] = {};
+  if (GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_BRUSH_ENTITIES", v, sizeof(v)) && v[0] == '0') {
+    g_drawBrushModelHook.state = g_drawBrushModelExHook.state = "off (OPENREMIX_PROXY_BSP_BRUSH_ENTITIES=0)";
+    return;
+  }
+  void **vtable = g_engine.at<void *>(kRenderViewVtable);
+  if (!g_engine.has(kRenderViewVtable, (kSlotDrawBrushModelEx + 1) * sizeof(void *)) ||
+      reinterpret_cast<uintptr_t>(vtable[kSlotGetBlend]) != g_engine.base + kGetBlend ||
+      reinterpret_cast<uintptr_t>(vtable[kSlotGetColorModulation]) != g_engine.base + kGetColorModulation) {
+    g_drawBrushModelHook.state = g_drawBrushModelExHook.state = "vtable mismatch";
+    return;
+  }
+  if (const char *what = mismatch(g_engine, kBrushDrawCode)) {
+    g_drawBrushModelHook.state = g_drawBrushModelExHook.state = what;
+    return;
+  }
+  (void)renderView;
+  g_drawBrushModel = reinterpret_cast<DrawBrushModelFn>(g_engine.base + kDrawBrushModel);
+  g_drawBrushModelEx = reinterpret_cast<DrawBrushModelExFn>(g_engine.base + kDrawBrushModelEx);
+  g_rDrawBrushModel = reinterpret_cast<RDrawBrushModelFn>(g_engine.base + kRDrawBrushModel);
+  g_getBlend = reinterpret_cast<GetBlendFn>(g_engine.base + kGetBlend);
+  g_getColorModulation = reinterpret_cast<GetColorModulationFn>(g_engine.base + kGetColorModulation);
+  hookSlot(g_drawBrushModelHook, g_engine, vtable, kSlotDrawBrushModel, kDrawBrushModel, kBrushDrawCode,
+           reinterpret_cast<void *>(&drawBrushModel));
+  hookSlot(g_drawBrushModelExHook, g_engine, vtable, kSlotDrawBrushModelEx, kDrawBrushModelEx, kBrushDrawCode,
+           reinterpret_cast<void *>(&drawBrushModelEx));
+}
+
 // ---- client.dll ----
 
 constexpr uintptr_t kLeafSystemVtable = 0x6c4708, kBuildRenderablesList = 0x210800, kClientEnginePointer = 0x952418;
@@ -577,6 +704,8 @@ void openremix_buildWorldListsBegin(int shadowDepth) {
   g_buildThread.store(0, std::memory_order_relaxed);
   const bool keep = !(shadowDepth & 0xff) && backBufferView();
   ++((shadowDepth & 0xff) ? g_stats.worldShadow : keep ? g_stats.worldKept : g_stats.worldOffTarget);
+  if (keep)
+    proxy::bsp::brushViewBegan();
   flip(g_worldFrustum, keep);
   flipAreaFlow(keep);
 }
@@ -705,9 +834,9 @@ bool install(void *materials, void *renderView) {
   }
 
   // Brush entities' back faces: all or none, before the first map draws one.
-  if (GetEnvironmentVariableA("OPENREMIX_PROXY_NOCULL_BRUSHES", v, sizeof(v)) && v[0] == '0') {
+  if (!(GetEnvironmentVariableA("OPENREMIX_PROXY_NOCULL_BRUSHES", v, sizeof(v)) && v[0] == '1')) {
     for (CodePatch &patch : g_brushFaces)
-      patch.state = "off (OPENREMIX_PROXY_NOCULL_BRUSHES=0)";
+      patch.state = "off (the BSP world draws brush entities; OPENREMIX_PROXY_NOCULL_BRUSHES=1 for these)";
   } else if (const char *what = mismatch(g_engine, kBrushFacesCode)) {
     for (CodePatch &patch : g_brushFaces)
       patch.state = what;
@@ -735,6 +864,7 @@ bool install(void *materials, void *renderView) {
     openremix_buildWorldListsOriginal = g_engine.at<void>(kBuildWorldLists);
     hookSlot(g_buildWorldListsHook, g_engine, g_engine.at<void *>(kRenderViewVtable), kSlotBuildWorldLists,
              kBuildWorldLists, kBuildWorldListsCode, reinterpret_cast<void *>(&openremix_buildWorldLists));
+    installBrushDraws(renderView);
   }
   g_status = "installed";
   return true;
@@ -756,13 +886,21 @@ void dumpStatistics(FILE *out) {
     fprintf(out, " %s %s%s", patch.name, patch.applied ? "applied" : patch.state.load(),
             &patch == &g_brushFaces[std::size(g_brushFaces) - 1] ? "\n" : ",");
   for (const VtableHook *hook :
-       {&g_buildWorldListsHook, &g_cullBoxHook, &g_areaFrustumHook, &g_isOccludedHook, &g_buildRenderablesHook})
+       {&g_buildWorldListsHook, &g_cullBoxHook, &g_areaFrustumHook, &g_isOccludedHook, &g_buildRenderablesHook,
+        &g_drawBrushModelHook, &g_drawBrushModelExHook})
     fprintf(out, "   %s: %s (slot at %s+0x%llX)\n", hook->name, hook->state.load(), hook->module,
             (unsigned long long)hook->slotRva);
   static ULONGLONG last = GetTickCount64();
   const ULONGLONG now = GetTickCount64();
   const double seconds = now > last ? double(now - last) / 1000 : 1;
   last = now;
+  fprintf(out,
+          "   brush entity draws per second: drawn by the BSP world %.1f (in other views %.1f) | left to the engine: "
+          "faded %.1f, tinted %.1f, other views (not placed by a main view) %.1f, model not built %.1f\n",
+          double(g_brushStats.taken.exchange(0)) / seconds, double(g_brushStats.takenOther.exchange(0)) / seconds,
+          double(g_brushStats.faded.exchange(0)) / seconds,
+          double(g_brushStats.tinted.exchange(0)) / seconds, double(g_brushStats.offTarget.exchange(0)) / seconds,
+          double(g_brushStats.notBuilt.exchange(0)) / seconds);
   const uint64_t builds = g_stats.buildsKept.exchange(0);
   const double views = builds ? double(builds) : 1;
   fprintf(out,
