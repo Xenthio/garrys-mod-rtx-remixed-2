@@ -136,6 +136,7 @@ struct Stats {
 #else
       decalVertexColors{0}, decalModulateFade{0}, decalOtherBlend{0}, decalNotItsBlend{0}, decalNoMesh{0};
 #endif
+  std::atomic<uint32_t> decalAdditivePaint{0}; // lit $decal $additive draws painted as alpha decals
   // Winding of the meshes built with vertex normals under D3DCULL_CCW: their
   // first triangle's e1 x e2 along / against its vertex normals (since launch).
   std::atomic<uint32_t> windingAlong{0}, windingAgainst{0};
@@ -5888,6 +5889,31 @@ void onFixedFunctionDraw(const Draw &d) {
 void onDraw(const Draw &d) {
   if (d.fixedFunction && !d.fixedFunctionConverted)
     return onFixedFunctionDraw(d);
+  // Paint drawn additively: a lit surface material with $decal, $translucent
+  // and $additive (road lines and worn paint on gm_construct_remaster's
+  // models/const2/polos_*: SRCALPHA / ONE, the lit texture added where its
+  // alpha says). Over a lit receiver that brightens it towards the paint, as
+  // paint would; as an additive draw it was rasterized unlit, glowing in the
+  // dark. It is painted as an alpha decal instead: covered by texture alpha,
+  // coloured by the texture, lit by the path tracer. Unlit additive decals
+  // (glows) stay additive. OPENREMIX_PROXY_ADDITIVE_PAINT=0: additive.
+  static const bool additivePaint = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_ADDITIVE_PAINT", v, sizeof(v)) && v[0] == '0');
+  }();
+  if (additivePaint && d.blend && d.blendOp == D3DBLENDOP_ADD && d.srcBlend == D3DBLEND_SRCALPHA &&
+      d.dstBlend == D3DBLEND_ONE) {
+    const engine_materials::Bound &b = engine_materials::bound();
+    if (b.known && b.decal && b.additive && b.translucent &&
+        (b.lightmapped || nameStarts(b.shader, "vertexlitgeneric"))) {
+      Draw paint = d;
+      paint.dstBlend = D3DBLEND_INVSRCALPHA;
+      if (paint.separateAlpha && paint.dstBlendAlpha == D3DBLEND_ONE)
+        paint.dstBlendAlpha = D3DBLEND_INVSRCALPHA;
+      ++g_stats.decalAdditivePaint;
+      return onDraw(paint);
+    }
+  }
   // A screen camera's monitor (screenSlot): an opaque surface the runtime
   // traces the camera's view on, however the engine blends the texture.
   if (d.texture0Target && d.mainTarget && (d.blend || d.alphaTest) && screenSlot(d.texture0) >= 0) {
@@ -9998,6 +10024,8 @@ void dumpStatistics(FILE *out) {
             "$decal %.1f, Decal* shader %.1f, depth bias %.1f, rtx.conf %.1f (depth bias alone %.1f, material without "
             "depth bias %.1f) | in world lists %.1f, on models (skinned) %.1f | lifted along vertex normals %.1f, face "
             "normals %.1f | with vertex colours %.1f\n"
+            "     additive paint (lit $decal $translucent $additive) painted as alpha decals %.1f "
+            "(OPENREMIX_PROXY_ADDITIVE_PAINT)\n"
             "     not painted: decal material with another blend state (additive, ...) %.1f, draw under a "
             "DecalModulate material that is not mod2x %.1f, no mesh %.1f | DecalModulate with vertex-alpha fade (not "
             "applied) %.1f | winding of meshes with normals (since launch): e1 x e2 along the normal %u, against %u -> "
@@ -10009,7 +10037,8 @@ void dumpStatistics(FILE *out) {
             g_stats.decalBiasOnly.exchange(0) / f, g_stats.decalMaterialOnly.exchange(0) / f,
             g_stats.decalWorld.exchange(0) / f, g_stats.decalSkinned.exchange(0) / f,
             g_stats.decalVertexNormals.exchange(0) / f, g_stats.decalFaceNormals.exchange(0) / f,
-            g_stats.decalVertexColors.exchange(0) / f, g_stats.decalOtherBlend.exchange(0) / f,
+            g_stats.decalVertexColors.exchange(0) / f, g_stats.decalAdditivePaint.exchange(0) / f,
+            g_stats.decalOtherBlend.exchange(0) / f,
             g_stats.decalNotItsBlend.exchange(0) / f, g_stats.decalNoMesh.exchange(0) / f,
             g_stats.decalModulateFade.exchange(0) / f, along, against, faceNormalSign(D3DCULL_CCW));
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
