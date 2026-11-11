@@ -103,7 +103,7 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, contentNamed{0}, contentRefreshSkipped{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, tracedEnergy{0}, energyLit{0}, energyTriangles{0}, energyMeshes{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, contentNamed{0}, contentRefreshSkipped{0}, brushContentDraws{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, tracedEnergy{0}, energyLit{0}, energyTriangles{0}, energyMeshes{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
@@ -215,8 +215,10 @@ uint64_t fnv(const void *data, size_t size, uint64_t h = 1469598103934665603ull)
 // indices relative to the first vertex they use, and the bytes of the
 // vertices from that one to the last they use in every stream its layout
 // reads. (The declared range may be the whole dynamic buffer: Source names
-// its batches so.) 0 when the draw cannot be read.
-uint64_t contentHash(const Draw &d) {
+// its batches so.) 0 when the draw cannot be read. brushIndices: a brush
+// entity's draw (static vertices): its indices and which vertex buffers, at
+// which versions, it reads from where.
+uint64_t contentHash(const Draw &d, bool brushIndices = false) {
   const uint32_t indexCount = d.type == D3DPT_TRIANGLELIST ? d.primCount * 3
                               : d.type == D3DPT_TRIANGLESTRIP || d.type == D3DPT_TRIANGLEFAN ? d.primCount + 2
                                                                                                : 0;
@@ -242,6 +244,23 @@ uint64_t contentHash(const Draw &d) {
     const uint32_t v = index(k);
     low = std::min(low, v);
     high = std::max(high, v);
+  }
+  if (brushIndices) {
+    // Static vertices: named by which buffer, at which version, from where.
+    uint64_t h = fnv(at, size_t(indexCount) * size, 0x6272757368ull);
+    for (const D3DVERTEXELEMENT9 *e = d.elements; e && e->Stream != 0xff; ++e) {
+      if (e->Stream >= 4)
+        continue;
+      const auto &st = d.streams[e->Stream];
+      const struct {
+        const void *buffer;
+        uint32_t version, offset, stride;
+        int32_t baseVertex;
+        uint32_t stream;
+      } id = {st.buffer, st.version, st.offset, st.stride, d.baseVertex, e->Stream};
+      h = fnv(&id, sizeof(id), h);
+    }
+    return h ? h : 1;
   }
   uint64_t h = 1469598103934665603ull;
   bool streams[4] = {};
@@ -6833,8 +6852,20 @@ void onDraw(const Draw &d) {
 #else
   constexpr bool energyDraw = false;
 #endif
-  if ((contentCache || energyDraw) && dynamicBuffers && flex == 0 && !g_ffGenerated && particle == kNotParticle) {
-    if (const uint64_t content = contentHash(d)) {
+  // Brush entities (func_breakable, doors, func_brush, ...): the world's
+  // static vertices, an index buffer the engine rebuilds every frame, outside
+  // the world lists. With their back faces kept (engine_nocull) a model's
+  // indices are the same every frame: named by their contents, each is one
+  // cached mesh (a moving door changes only its instance's transform), not a
+  // mesh built, uploaded and given a new acceleration structure every frame.
+  // OPENREMIX_PROXY_BRUSH_CONTENT_CACHE=0: per frame.
+  static const bool brushContentCache = envScale("OPENREMIX_PROXY_BRUSH_CONTENT_CACHE", 1) > 0;
+  const bool brushDraw = brushContentCache && !ps.dynamic && d.indices.dynamic && !d.blend && !lifted &&
+                         g_worldLists == 0 && bonesPerVertex == 0;
+  g_stats.brushContentDraws += brushDraw;
+  if ((contentCache || energyDraw || brushDraw) && dynamicBuffers && flex == 0 && !g_ffGenerated &&
+      particle == kNotParticle) {
+    if (const uint64_t content = contentHash(d, brushDraw && !contentCache && !energyDraw)) {
       if (dynamicModel) {
         flexContent = content;
       } else if (transientDraw) {
@@ -9854,6 +9885,10 @@ void dumpStatistics(FILE *out) {
               cache.queryAttempts ? 100.0 * cache.queryHits / cache.queryAttempts : 0.0,
               static_cast<unsigned long long>(cache.resets), static_cast<unsigned long long>(cache.renderedFrames));
   }
+  if (!game::kFixedFunction)
+    fprintf(out, "   brush entity draws per frame %.1f, named by their contents %.1f "
+                 "(OPENREMIX_PROXY_BRUSH_CONTENT_CACHE)\n",
+            g_stats.brushContentDraws.exchange(0) / f, g_stats.contentNamed.exchange(0) / f);
   if (game::kFixedFunction)
     fprintf(out, "   dynamic-buffer draws named by their contents per frame %.1f, CPU-deformed models rewritten unchanged "
                  "(no refresh) %.1f (OPENREMIX_PROXY_CONTENT_CACHE)\n",
