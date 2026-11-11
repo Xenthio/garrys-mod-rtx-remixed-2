@@ -1902,6 +1902,7 @@ struct Instance {
   // its blend state, whatever that is (rasterOnly), unless particles are
   // traced; its depth state is the draw's.
   bool particle = false, rasterOnly = false;
+  bool particleSceneDepth = false;
   // Drawn as its triangles' edges (D3DFILL_WIREFRAME: the Wireframe shader,
   // $wireframe): a raster-only overlay of lines (remixapi_InstanceInfoWireframeEXT).
   bool wireframe = false;
@@ -4408,7 +4409,7 @@ bool particleTriangles(const Draw &d, std::vector<uint32_t> &indices, uint32_t &
 }
 
 // Dev aid (OPENREMIX_PROXY_DUMP_PARTICLES=1): everything about a particle
-// draw, once per (declaration, vertex shader, material shader, kind), to
+// draw, once per (declaration, vertex shader, material, kind), to
 // bin/particles.txt.
 void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, const char *failure, bool cameraSpace,
                       uint32_t spriteFlags, const float *spriteSoft, bool softConfirmed,
@@ -4566,6 +4567,17 @@ void dumpParticleDraw(const Draw &d, ParticleKind kind, const char *outcome, con
   }
   fprintf(f, "\n");
   fclose(f);
+}
+
+// These no-Z variants belong to spatial effects and should disappear behind
+// opaque scene geometry. Other materials retain their authored depth state.
+bool particleNeedsSceneDepth(const char *name) {
+  constexpr char prefix[] = "effects/muzzleflash";
+  if (nameStarts(name, prefix)) {
+    const char variant = name[sizeof(prefix) - 1];
+    return variant >= '1' && variant <= '4' && _stricmp(name + sizeof(prefix), "_noz") == 0;
+  }
+  return _stricmp(name, "effects/yellowflare_noz") == 0;
 }
 
 // Builds and queues a particle draw (see above). False: the draw is not
@@ -4916,6 +4928,8 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
 #endif
     }
     inst.particle = true;
+    inst.particleSceneDepth = inst.rasterOnly && additive && !d.depthTest &&
+                              particleNeedsSceneDepth(engine_materials::currentName());
     if (inst.rasterOnly) {
       inst.spriteFlags = spriteFlags;
       std::memcpy(inst.spriteSoft, spriteSoft, sizeof(spriteSoft));
@@ -4935,7 +4949,7 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     inst.firstIndex = d.startIndex;
     // (sets the depth state of stencil draws; a portal view's are not emulated)
     const bool marks = g_views[viewKey].portal || stencilRole(d, inst);
-    inst.depthTest = d.depthTest && inst.depthTest;
+    inst.depthTest = (d.depthTest || inst.particleSceneDepth) && inst.depthTest;
     inst.depthWrite = d.zWrite && !d.blend;
     if (!marks) {
       outcome = kParticleStencil;
@@ -8057,9 +8071,10 @@ void onPresent() {
     const bool rasterViewModel = !worldViewModel; // sent with its own camera
     View world = *main;
     float viewModelTransform[3][4] = {};
-    if (viewModel && !rasterViewModel) {
+    if (viewModel)
       viewScaleTransform(main->view, viewModel->projection[0] / main->projection[0],
                          viewModel->projection[5] / main->projection[5], viewModelTransform);
+    if (viewModel && !rasterViewModel) {
       // Move only the near plane: p10 and p14 together define both planes
       // (LH, depth 0..1: n = -p14/p10, f = p14/(1-p10)); changing p14 alone
       // also pulled the far plane in (~35000 -> ~5000 units), clipping
@@ -8275,7 +8290,10 @@ void onPresent() {
       if ((role == Role::ViewModel && &g_views[inst.view] != viewModel) ||
           (role == Role::Sky && (&g_views[inst.view] != sky || skyTraced)))
         continue;
-      if (role == Role::ViewModel && !rasterViewModel) {
+      // Keep the flash's viewmodel framing, but project its depth into the
+      // same range as the opaque world it is tested against.
+      const bool worldDepthParticle = role == Role::ViewModel && inst.particleSceneDepth;
+      if (role == Role::ViewModel && (!rasterViewModel || worldDepthParticle)) {
         if (inst.bones.empty())
           premultiply(viewModelTransform, inst.transform);
         else
@@ -8440,7 +8458,7 @@ void onPresent() {
       // only reflection-only receivers).
       if (role == Role::Screen || portalBody)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY;
-      if (role == Role::ViewModel && rasterViewModel)
+      if (role == Role::ViewModel && rasterViewModel && !worldDepthParticle)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
       else if (role == Role::Sky)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_SKY;
