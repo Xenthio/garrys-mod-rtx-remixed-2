@@ -1904,6 +1904,9 @@ struct Instance {
   // Drawn as its triangles' edges (D3DFILL_WIREFRAME: the Wireframe shader,
   // $wireframe): a raster-only overlay of lines (remixapi_InstanceInfoWireframeEXT).
   bool wireframe = false;
+  // A detail sprite drawn as the engine lit it (onDraw): a raster-only
+  // overlay with the draw's depth state.
+  bool detail = false;
   // What its pixel shader does beyond texture x colour, for the runtime's
   // sprite overlays (remixapi_InstanceInfoSpriteEXT flags; 0: nothing).
   uint32_t spriteFlags = 0;
@@ -6579,11 +6582,25 @@ void onDraw(const Draw &d) {
   // Detail sprites (the map's grass, bushes, ...): UnlitGeneric only because
   // the engine lights them itself, with the lighting the map compiler baked at
   // each sprite as its vertex colours. Emitted, that light glowed in the dark.
-  // Lit as surfaces, those colours dropped: the path tracer lights them.
+  // The engine rebuilds them every frame, turned to face the camera: traced,
+  // thousands of new alpha-tested quads a frame cost a rebuild each time and
+  // left the denoisers no history (flicker). They are rasterized over the
+  // traced image instead, in those baked colours, as the game drew them.
+  // OPENREMIX_PROXY_DETAIL_TRACED=1: lit as surfaces by the path tracer
+  // (those colours dropped).
+  static const bool detailTraced = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_DETAIL_TRACED", v, sizeof(v)) == 1 && v[0] == '1';
+  }();
+  bool detailRaster = false;
   if (shading.mode == engine_materials::Shading::Unlit &&
       bsp::isDetailSpriteMaterial(engine_materials::currentName())) {
-    shading = {};
-    shading.base = engine_materials::current().base;
+    if (detailTraced) {
+      shading = {};
+      shading.base = engine_materials::current().base;
+    } else {
+      detailRaster = true;
+    }
     ++g_stats.detailSpriteDraws;
   }
   // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
@@ -7309,6 +7326,13 @@ void onDraw(const Draw &d) {
     inst.categories &= ~(REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC |
                          REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET);
     ++g_stats.wireframeDraws;
+  }
+  if (detailRaster) {
+    inst.detail = inst.rasterOnly = true;
+    inst.material = d.texture0 ? materialFor(d.texture0, 0, nearest) : inst.material;
+    inst.persistent = false;
+    inst.depthTest = d.depthTest && inst.depthTest;
+    inst.depthWrite = d.zWrite;
   }
 #ifdef PROXY_GAME_PORTAL2
   // Portal 2's light bridges (SolidEnergy, effects/projected_wall): additive,
@@ -8418,7 +8442,7 @@ void onPresent() {
         info.pNext = &wireframe;
       }
       remixapi_InstanceRasterStateEXT overlayState = {};
-      if ((inst.particle || inst.wireframe) && inst.rasterOnly) {
+      if ((inst.particle || inst.wireframe || inst.detail) && inst.rasterOnly) {
         overlayState.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_RASTER_STATE_EXT;
         overlayState.pNext = info.pNext;
         overlayState.depthTest = inst.depthTest;
@@ -9638,7 +9662,7 @@ void dumpStatistics(FILE *out) {
           g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f,
           g_stats.bspBrushEntitiesDropped.exchange(0) / f);
   vb_origins::write(out, f);
-  fprintf(out, "   Lua meshes lit as surfaces per frame: %.1f (OPENREMIX_PROXY_LUA_MESHES_LIT); detail sprite draws "
+  fprintf(out, "   Lua meshes lit as surfaces per frame: %.1f (OPENREMIX_PROXY_LUA_MESHES_LIT); detail sprite draws (rasterized unless OPENREMIX_PROXY_DETAIL_TRACED=1) "
                "lit as surfaces %.1f\n",
           g_stats.luaLitDraws.exchange(0) / f, g_stats.detailSpriteDraws.exchange(0) / f);
   bsp::dumpStatistics(out);
