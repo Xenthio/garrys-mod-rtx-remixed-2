@@ -29,6 +29,8 @@ struct Inputs {
   float color2[3] = {1, 1, 1};
   float phongBoost = 1;
   // ExoPBR (screenspace_general_8tex)
+  std::string mrao;     // PBR shader $mraotexture (R=Metal, G=Rough, B=AO)
+  float mraoScale[3] = {1, 1, 1};
   std::string arm;      // ExoPBR $texture1 (R=AO, G=Rough, B=Metal)
   bool isExoPbr = false;
   // $surfaceprop (lowercase), and the base texture's mean luminance (-1

@@ -361,7 +361,7 @@ struct Entry {
           envmap = -1, envmapTint = -1, phongAlbedoTint = -1, blendTintByBaseAlpha = -1, phongBoost = -1,
           surfaceProp = -1;
   // ExoPBR.
-  int16_t tex1 = -1, tex2 = -1;
+  int16_t tex1 = -1, tex2 = -1, mrao = -1, mraoScale = -1, normal = -1;
   int16_t model = -1;
   bool isExoPbr = false;
   bool pbrCapable = false;
@@ -372,7 +372,7 @@ struct Entry {
     void *texture = nullptr;
     std::string name;
   } maskTexture, baseTexture, bumpTexture, exponentTexture, envmapMaskTexture,
-    tex1Texture, tex2Texture;
+    tex1Texture, tex2Texture, mraoTexture, normalTexture;
 };
 std::unordered_map<void *, Entry> g_entries; // render thread
 Shading g_current;                           // render thread
@@ -506,6 +506,9 @@ void resolve(Entry &e, void *material) {
       {"$blendtintbybasealpha", &Entry::blendTintByBaseAlpha},
       {"$phongboost", &Entry::phongBoost},
       {"$surfaceprop", &Entry::surfaceProp},
+      {"$mraotexture", &Entry::mrao},
+      {"$mraoscale", &Entry::mraoScale},
+      {"$normaltexture", &Entry::normal},
       {"$texture1", &Entry::tex1},
       {"$texture2", &Entry::tex2},
       {"$model", &Entry::model},
@@ -606,6 +609,9 @@ void readPbr(Entry &e, int flags, Shading &out) {
   in.isExoPbr = e.isExoPbr;
   in.base = out.base;
   in.bump = textureName(e.bumpTexture, paramAt(e, e.bump));
+  if (in.bump.empty()) in.bump = textureName(e.normalTexture, paramAt(e, e.normal));
+  in.mrao = textureName(e.mraoTexture, paramAt(e, e.mrao));
+  vec3(e, e.mraoScale, in.mraoScale);
   in.envmapMask = textureName(e.envmapMaskTexture, paramAt(e, e.envmapMask));
   in.phongExponentTexture = textureName(e.exponentTexture, paramAt(e, e.phongExponentTexture));
 

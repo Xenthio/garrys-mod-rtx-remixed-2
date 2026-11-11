@@ -703,6 +703,9 @@ pbr::Material materialPbr(KeyValues &kv) {
 
   in.base = text("$basetexture");
   in.bump = text("$bumpmap");
+  if (in.bump.empty()) in.bump = text("$normaltexture");
+  in.mrao = text("$mraotexture");
+  if (kv.values.count("$mraoscale")) parseColor(kv.values["$mraoscale"], in.mraoScale);
 
   if (in.isExoPbr) {
     in.arm = text("$texture1");

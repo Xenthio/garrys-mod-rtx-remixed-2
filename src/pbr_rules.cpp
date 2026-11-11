@@ -35,6 +35,7 @@ float phongRoughness(float exponent, float boost) {
 } // namespace
 
 bool capable(const std::string &shader) {
+  if (shader == "pbr") return true;
   for (const char *name : {"vertexlitgeneric", "lightmappedgeneric", "worldvertextransition", "screenspace_general"})
     if (shader.rfind(name, 0) == 0)
       return true;
@@ -57,6 +58,22 @@ Material convert(const Inputs &given) {
     in.phong = false;
     in.phongExponentTexture.clear();
     in.baseAlphaPhongMask = false;
+  }
+
+  if (in.shader == "pbr") {
+    out.active = true;
+    out.normal = in.bump;
+    if (!in.mrao.empty()) {
+      out.maps[0].texture = in.mrao;
+      out.maps[0].channel = 1;
+      out.maps[0].scale = in.mraoScale[1];
+      out.maps[1].texture = in.mrao;
+      out.maps[1].channel = 0;
+      out.maps[1].scale = in.mraoScale[0];
+    } else {
+      out.roughness = .5f;
+    }
+    return out;
   }
 
   // --- ExoPBR: ARM texture (Red = AO, Green = Roughness, Blue = Metalness) ---
